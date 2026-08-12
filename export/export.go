@@ -115,7 +115,9 @@ func ComputeSummary(rows []storage.MetricRow, period string) Summary {
 		DiskTotalGB:   rows[0].DiskTotalGB,
 	}
 	var sumCPU, sumMem float64
-	for _, r := range rows {
+	var totalNetSent, totalNetRecv uint64
+
+	for i, r := range rows {
 		sumCPU += r.CPUPct
 		sumMem += r.MemPct
 		if r.CPUPct > s.PeakCPU {
@@ -127,24 +129,30 @@ func ComputeSummary(rows []storage.MetricRow, period string) Summary {
 		if r.DiskFreeGB < s.MinDiskFreeGB {
 			s.MinDiskFreeGB = r.DiskFreeGB
 		}
+
+		// Robustly calculate network consumption by summing deltas row-by-row.
+		// If the counter resets (e.g. system reboot), add the raw new value.
+		if i > 0 {
+			prev := rows[i-1]
+			if r.NetSentBytes >= prev.NetSentBytes {
+				totalNetSent += (r.NetSentBytes - prev.NetSentBytes)
+			} else {
+				totalNetSent += r.NetSentBytes
+			}
+
+			if r.NetRecvBytes >= prev.NetRecvBytes {
+				totalNetRecv += (r.NetRecvBytes - prev.NetRecvBytes)
+			} else {
+				totalNetRecv += r.NetRecvBytes
+			}
+		}
 	}
 	n := float64(len(rows))
 	s.AvgCPU = sumCPU / n
 	s.AvgMem = sumMem / n
 
-	// Calculate network consumption (handle reset by just using last value if less than first)
-	first := rows[0]
-	last := rows[len(rows)-1]
-	if last.NetSentBytes >= first.NetSentBytes {
-		s.TotalNetSentBytes = last.NetSentBytes - first.NetSentBytes
-	} else {
-		s.TotalNetSentBytes = last.NetSentBytes
-	}
-	if last.NetRecvBytes >= first.NetRecvBytes {
-		s.TotalNetRecvBytes = last.NetRecvBytes - first.NetRecvBytes
-	} else {
-		s.TotalNetRecvBytes = last.NetRecvBytes
-	}
+	s.TotalNetSentBytes = totalNetSent
+	s.TotalNetRecvBytes = totalNetRecv
 
 	return s
 }

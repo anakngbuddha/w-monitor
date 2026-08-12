@@ -656,6 +656,24 @@ async function fetchData() {
     const memUsedGB = (latest.mem_pct / 100) * (latest.mem_total_gb || 1);
     const diskUsedGB = (latest.disk_total_gb || 1) - latest.disk_free_gb;
 
+    // Calculate total network consumption across the selected range
+    let totalNetSent = 0;
+    let totalNetRecv = 0;
+    for (let i = 1; i < data.length; i++) {
+        const prev = data[i-1];
+        const curr = data[i];
+        if (curr.net_sent_bytes >= prev.net_sent_bytes) {
+            totalNetSent += (curr.net_sent_bytes - prev.net_sent_bytes);
+        } else {
+            totalNetSent += curr.net_sent_bytes;
+        }
+        if (curr.net_recv_bytes >= prev.net_recv_bytes) {
+            totalNetRecv += (curr.net_recv_bytes - prev.net_recv_bytes);
+        } else {
+            totalNetRecv += curr.net_recv_bytes;
+        }
+    }
+
     // Update KPIs
     document.getElementById('cpuVal').textContent  = vCPUsUsed.toFixed(2) + ' vCPU';
     document.getElementById('cpuSub').textContent  = `of ${latest.cpu_cores || 1} Cores (${latest.cpu_pct.toFixed(1)}%)`;
@@ -669,8 +687,8 @@ async function fetchData() {
     document.getElementById('diskSub').textContent = `of ${(latest.disk_total_gb || 1).toFixed(1)} GB (Used)`;
     document.getElementById('diskBar').style.width = Math.min((diskUsedGB / (latest.disk_total_gb || 1)) * 100, 100) + '%';
 
-    document.getElementById('netVal').textContent  = fmtBytes(latest.net_sent_bytes + latest.net_recv_bytes);
-    document.getElementById('netSub').textContent  = 'Total I/O Consumed (up + down)';
+    document.getElementById('netVal').textContent  = fmtBytes(totalNetSent + totalNetRecv);
+    document.getElementById('netSub').textContent  = `Total I/O in ${currentRange} (up + down)`;
 
     // Compute aggregations for Average and Peak
     let sumCPU = 0, peakCPU = 0;

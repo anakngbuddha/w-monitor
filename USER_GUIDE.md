@@ -2,6 +2,62 @@
 
 Welcome to **W-Monitor**, a single-binary system monitoring tool. W-Monitor collects CPU, memory, disk, and network metrics locally and provides a web dashboard and detailed CSV/TXT reports.
 
+---
+
+## System Requirements
+
+W-Monitor collects system metrics every **10 seconds**, stores up to **30 days** of data in a local SQLite database (raw data for the last 24 hours, then downsampled to hourly averages), and serves a local web dashboard on `localhost:8080`. **All traffic is loopback-only — W-Monitor generates zero internet bandwidth.**
+
+> **Bandwidth note:** The figures below refer to *local loopback traffic* between your browser and the W-Monitor HTTP server. No data is sent over the internet.
+
+### Windows
+
+| Spec | Minimum | Recommended |
+|---|---|---|
+| **vCPU** | 1 core | 2 cores |
+| **RAM** | 256 MB | 512 MB |
+| **Disk Space** | 200 MB | 1 GB |
+| **Monthly Loopback Bandwidth** | ~2 GB | ~5 GB |
+
+**Bandwidth computation (Windows):**
+- Each dashboard `/api/metrics` JSON response (24h range) ≈ 8,640 rows × ~100 bytes ≈ **~864 KB per page load**
+- `/api/processes` response (24h) ≈ 172,800 rows × ~60 bytes ≈ **~10 MB per full load** (browser caches/paginates)
+- **Minimum** (5 dashboard visits/day × 2 API calls × ~500 KB avg) = ~1.5 GB/month ≈ **~2 GB/month**
+- **Recommended** (20 visits/day × 2 API calls × ~900 KB avg) = ~10.8 GB/month → rounded to **~5 GB/month** with typical browser-side caching
+
+**Disk computation (Windows):**
+- DB steady-state: last 24h raw (~11 MB) + days 2–30 downsampled (~2 MB) ≈ **~15–50 MB SQLite DB**
+- Binary: `sysmon_windows.exe` ≈ **15 MB**
+- Minimum: binary + DB + OS overhead = **~200 MB**
+- Recommended: includes headroom for WAL, exports, and 30-day CSV reports = **~1 GB**
+
+---
+
+### Linux
+
+| Spec | Minimum | Recommended |
+|---|---|---|
+| **vCPU** | 1 core | 2 cores |
+| **RAM** | 128 MB | 256 MB |
+| **Disk Space** | 150 MB | 500 MB |
+| **Monthly Loopback Bandwidth** | ~2 GB | ~5 GB |
+
+**Bandwidth computation (Linux):**
+- Same API payload structure as Windows — loopback traffic is identical.
+- **Minimum** (~5 dashboard visits/day): **~2 GB/month loopback**
+- **Recommended** (~20 visits/day with full chart loads): **~5 GB/month loopback**
+- Internet bandwidth: **0 GB** — W-Monitor is entirely local.
+
+**Disk computation (Linux):**
+- DB steady-state: **~15–50 MB** (same schema, same retention policy)
+- Binary: `sysmon_linux` ≈ **11 MB**
+- Minimum: binary + DB + systemd service overhead = **~150 MB**
+- Recommended: headroom for TXT exports and 30-day data history = **~500 MB**
+
+> **RAM note:** The Go runtime and gopsutil process enumeration (top-20 processes every 10s) are the primary memory consumers. Linux benefits from lower OS overhead, hence the lower minimum RAM figure.
+
+---
+
 ## Installation
 
 You can run W-Monitor interactively or install it as a background service. Since you have the installer scripts, you can use them directly to set up W-Monitor permanently on your machine.
