@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>W-Monitor — System Monitor</title>
+  <meta name="description" content="Real-time system monitoring dashboard — CPU, memory, disk, and network metrics with historical graphs." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg-base:    #000000;
+      --bg-card:    #0a0a0a;
+      --bg-card-2:  #111111;
+      --bg-hover:   #1a1a1a;
+      --border:     #222222;
+      --border-glow:#333333;
+      --text-primary: #ededed;
+      --text-secondary: #a0a0a0;
+      --text-muted: #666666;
+      --accent-blue: #3b82f6;
+      --accent-purple: #8b5cf6;
+      --accent-green: #10b981;
+      --accent-orange: #f59e0b;
+      --accent-red: #ef4444;
+      --shadow-card: 0 4px 20px rgba(0,0,0,0.5);
+      --radius: 8px;
+      --radius-sm: 6px;
+      --transition: 0.15s ease;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg-base);
+      color: var(--text-primary);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    .container { max-width: 1400px; margin: 0 auto; padding: 0 32px; position: relative; z-index: 1; }
+
+    /* ── Header ── */
+    header {
+      padding: 28px 0 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo-icon {
+      width: 36px;
+      height: 36px;
+      background: #111;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+    }
+    .logo-text h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
+    .logo-text span { font-size: 12px; color: var(--text-secondary); font-weight: 400; }
+
+    .header-controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-dot {
+      width: 8px; height: 8px;
+      background: var(--accent-green);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--accent-green);
+      animation: pulse 2s ease infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.6; transform: scale(0.85); }
+    }
+    .status-label { font-size: 13px; color: var(--text-secondary); }
+
+    .range-selector {
+      display: flex;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+    }
+    .range-btn {
+      padding: 7px 16px;
+      font-size: 13px;
+      font-family: 'Inter', sans-serif;
+      font-weight: 500;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: var(--transition);
+      letter-spacing: 0.02em;
+    }
+    .range-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
+    .range-btn.active { background: var(--text-primary); color: #000; }
+
+    .btn-export {
+      padding: 7px 16px;
+      font-size: 13px;
+      font-family: 'Inter', sans-serif;
+      font-weight: 500;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: var(--transition);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn-export:hover { background: var(--bg-hover); }
+
+    .last-updated { font-size: 12px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+
+    /* ── KPI Strip ── */
+    .kpi-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      padding: 24px 0 0;
+    }
+    @media (max-width: 900px) { .kpi-strip { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 500px) { .kpi-strip { grid-template-columns: 1fr; } }
+
+    .kpi-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      position: relative;
+      overflow: hidden;
+      transition: var(--transition);
+      box-shadow: var(--shadow-card);
+    }
+    .kpi-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 2px;
+      opacity: 0;
+      transition: opacity var(--transition);
+    }
+    .kpi-card:hover { border-color: var(--border-glow); transform: translateY(-2px); }
+    .kpi-card:hover::before { opacity: 1; }
+    .kpi-card.blue::before  { background: linear-gradient(90deg, var(--accent-blue), transparent); }
+    .kpi-card.purple::before{ background: linear-gradient(90deg, var(--accent-purple), transparent); }
+    .kpi-card.green::before { background: linear-gradient(90deg, var(--accent-green), transparent); }
+    .kpi-card.orange::before{ background: linear-gradient(90deg, var(--accent-orange), transparent); }
+
+    .kpi-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .kpi-label-dot { width: 6px; height: 6px; border-radius: 50%; }
+    .blue .kpi-label-dot  { background: var(--accent-blue); box-shadow: 0 0 6px var(--accent-blue); }
+    .purple .kpi-label-dot{ background: var(--accent-purple); box-shadow: 0 0 6px var(--accent-purple); }
+    .green .kpi-label-dot { background: var(--accent-green); box-shadow: 0 0 6px var(--accent-green); }
+    .orange .kpi-label-dot{ background: var(--accent-orange); box-shadow: 0 0 6px var(--accent-orange); }
+
+    .kpi-value {
+      font-size: 32px;
+      font-weight: 600;
+      letter-spacing: -0.5px;
+      line-height: 1;
+      margin-bottom: 8px;
+      color: var(--text-primary);
+    }
+
+    .kpi-sub { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+    .kpi-avg-peak { font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+
+    /* Gauge bar */
+    .kpi-bar-track {
+      height: 3px;
+      background: var(--border);
+      border-radius: 2px;
+      margin-top: 14px;
+      overflow: hidden;
+    }
+    .kpi-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.6s cubic-bezier(0.4,0,0.2,1);
+    }
+    .blue .kpi-bar-fill   { background: var(--accent-blue); }
+    .purple .kpi-bar-fill { background: var(--accent-purple); }
+    .green .kpi-bar-fill  { background: var(--accent-green); }
+    .orange .kpi-bar-fill { background: var(--accent-orange); }
+
+    /* ── Charts Grid ── */
+    .charts-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      padding: 16px 0;
+    }
+    @media (max-width: 800px) { .charts-grid { grid-template-columns: 1fr; } }
+
+    .chart-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      box-shadow: var(--shadow-card);
+      transition: var(--transition);
+    }
+    .chart-card:hover { border-color: #333; }
+    .chart-card.full { grid-column: 1 / -1; }
+
+    .chart-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+    .chart-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .chart-title-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .chart-badge {
+      font-size: 11px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-weight: 500;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .badge-blue   { background: rgba(99,179,237,0.15); color: var(--accent-blue); }
+    .badge-purple { background: rgba(183,148,244,0.15); color: var(--accent-purple); }
+    .badge-green  { background: rgba(104,211,145,0.15); color: var(--accent-green); }
+    .badge-orange { background: rgba(246,173,85,0.15); color: var(--accent-orange); }
+
+    .chart-wrap { position: relative; height: 220px; }
+    .chart-wrap-tall { position: relative; height: 280px; }
+
+    /* ── Processes Table ── */
+    .processes-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      box-shadow: var(--shadow-card);
+      margin-bottom: 24px;
+    }
+    .processes-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 16px;
+      font-size: 13px;
+    }
+    .processes-table th {
+      text-align: left;
+      padding: 8px 12px;
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      border-bottom: 1px solid var(--border);
+    }
+    .processes-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
+      color: var(--text-secondary);
+      transition: var(--transition);
+    }
+    .processes-table tr:hover td { background: var(--bg-hover); color: var(--text-primary); }
+    .processes-table .proc-name { color: var(--text-primary); font-weight: 500; }
+    .processes-table .mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+    .cpu-bar-mini { display: flex; align-items: center; gap: 8px; }
+    .cpu-bar-track { flex: 1; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+    .cpu-bar-fill-mini { height: 100%; border-radius: 2px; background: var(--accent-blue); transition: width 0.5s ease; }
+
+    /* ── No Data State ── */
+    .no-data {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: 180px; gap: 12px; color: var(--text-muted);
+    }
+    .no-data-icon { font-size: 32px; opacity: 0.4; }
+    .no-data-text { font-size: 13px; }
+
+    /* ── Footer ── */
+    footer {
+      padding: 24px 0;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .footer-text { font-size: 12px; color: var(--text-muted); }
+    .footer-mono { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-muted); }
+
+    /* Skeleton loader */
+    .skeleton {
+      background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-hover) 50%, var(--bg-card) 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+      border-radius: 4px;
+    }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+    /* Fade-in animation */
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .fade-in { animation: fadeInUp 0.4s ease both; }
+    .delay-1 { animation-delay: 0.05s; }
+    .delay-2 { animation-delay: 0.10s; }
+    .delay-3 { animation-delay: 0.15s; }
+    .delay-4 { animation-delay: 0.20s; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <!-- Header -->
+  <header>
+    <div class="logo">
+      <div class="logo-icon">W</div>
+      <div class="logo-text">
+        <h1>W-Monitor</h1>
+        <span>System Monitor</span>
+      </div>
+    </div>
+    <div class="header-controls">
+      <button class="btn-export" onclick="exportCSV()">Export CSV</button>
+      <div class="status-dot" id="statusDot"></div>
+      <span class="status-label" id="statusLabel">Connecting…</span>
+      <div class="range-selector">
+        <button class="range-btn active" id="btn24h" onclick="setRange('24h')">24h</button>
+        <button class="range-btn" id="btn7d" onclick="setRange('7d')">7d</button>
+        <button class="range-btn" id="btn30d" onclick="setRange('30d')">30d</button>
+      </div>
+    </div>
+  </header>
+  <div class="last-updated" style="margin-top:8px" id="lastUpdated">Fetching data…</div>
+
+  <!-- KPI Strip -->
+  <div class="kpi-strip">
+    <div class="kpi-card blue fade-in delay-1" id="cpuCard">
+      <div class="kpi-label"><span class="kpi-label-dot"></span>CPU Usage</div>
+      <div class="kpi-value" id="cpuVal">—</div>
+      <div class="kpi-sub" id="cpuSub">Waiting for data</div>
+      <div class="kpi-bar-track"><div class="kpi-bar-fill" id="cpuBar" style="width:0%"></div></div>
+      <div class="kpi-avg-peak"><span id="cpuAvg">Avg: —</span><span id="cpuPeak">Peak: —</span></div>
+    </div>
+    <div class="kpi-card purple fade-in delay-2" id="memCard">
+      <div class="kpi-label"><span class="kpi-label-dot"></span>Memory</div>
+      <div class="kpi-value" id="memVal">—</div>
+      <div class="kpi-sub" id="memSub">Waiting for data</div>
+      <div class="kpi-bar-track"><div class="kpi-bar-fill" id="memBar" style="width:0%"></div></div>
+      <div class="kpi-avg-peak"><span id="memAvg">Avg: —</span><span id="memPeak">Peak: —</span></div>
+    </div>
+    <div class="kpi-card green fade-in delay-3" id="diskCard">
+      <div class="kpi-label"><span class="kpi-label-dot"></span>Disk Free</div>
+      <div class="kpi-value" id="diskVal">—</div>
+      <div class="kpi-sub" id="diskSub">Waiting for data</div>
+      <div class="kpi-bar-track"><div class="kpi-bar-fill" id="diskBar" style="width:0%"></div></div>
+      <div class="kpi-avg-peak"><span id="diskAvg">Min Free: —</span><span></span></div>
+    </div>
+    <div class="kpi-card orange fade-in delay-4" id="netCard">
+      <div class="kpi-label"><span class="kpi-label-dot"></span>Network I/O</div>
+      <div class="kpi-value" id="netVal">—</div>
+      <div class="kpi-sub" id="netSub">Waiting for data</div>
+      <div class="kpi-bar-track"><div class="kpi-bar-fill" id="netBar" style="width:50%"></div></div>
+      <div class="kpi-avg-peak"><span id="netAvg">Avg: — MB/s</span><span id="netPeak">Peak: — MB/s</span></div>
+    </div>
+  </div>
+
+  <!-- Charts Grid -->
+  <div class="charts-grid" style="margin-top:16px">
+    <div class="chart-card fade-in">
+      <div class="chart-header">
+        <div class="chart-title">
+          <span class="chart-title-dot" style="background:var(--accent-blue)"></span>
+          CPU Utilization
+        </div>
+        <span class="chart-badge badge-blue" id="cpuChartBadge">—%</span>
+      </div>
+      <div class="chart-wrap"><canvas id="cpuChart"></canvas></div>
+    </div>
+    <div class="chart-card fade-in delay-1">
+      <div class="chart-header">
+        <div class="chart-title">
+          <span class="chart-title-dot" style="background:var(--accent-purple)"></span>
+          Memory Usage
+        </div>
+        <span class="chart-badge badge-purple" id="memChartBadge">—%</span>
+      </div>
+      <div class="chart-wrap"><canvas id="memChart"></canvas></div>
+    </div>
+    <div class="chart-card fade-in delay-2">
+      <div class="chart-header">
+        <div class="chart-title">
+          <span class="chart-title-dot" style="background:var(--accent-green)"></span>
+          Disk Free Space
+        </div>
+        <span class="chart-badge badge-green" id="diskChartBadge">— GB</span>
+      </div>
+      <div class="chart-wrap"><canvas id="diskChart"></canvas></div>
+    </div>
+    <div class="chart-card fade-in delay-3">
+      <div class="chart-header">
+        <div class="chart-title">
+          <span class="chart-title-dot" style="background:var(--accent-orange)"></span>
+          Network I/O
+        </div>
+        <span class="chart-badge badge-orange" id="netChartBadge">— MB/s</span>
+      </div>
+      <div class="chart-wrap"><canvas id="netChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Processes Table -->
+  <div class="processes-card fade-in" style="margin-top:0">
+    <div class="chart-header">
+      <div class="chart-title">
+        <span class="chart-title-dot" style="background:var(--accent-red)"></span>
+        Top Processes
+      </div>
+      <span class="chart-badge" style="background:rgba(252,129,129,0.15);color:var(--accent-red)" id="procBadge">Loading…</span>
+    </div>
+    <div id="procContainer">
+      <div class="no-data"><div class="no-data-icon">⏳</div><div class="no-data-text">Loading process data…</div></div>
+    </div>
+  </div>
+
+  <footer>
+    <span class="footer-text">W-Monitor — System Monitor</span>
+    <span class="footer-mono" id="footerStats">—</span>
+  </footer>
+</div>
+
+<script>
+// ── Chart.js theme ──
+Chart.defaults.color = '#8892aa';
+Chart.defaults.borderColor = 'rgba(255,255,255,0.06)';
+Chart.defaults.font.family = "'Inter', sans-serif";
+
+const COLORS = {
+  blue:   '#63b3ed',
+  purple: '#b794f4',
+  green:  '#68d391',
+  orange: '#f6ad55',
+  red:    '#fc8181',
+};
+
+function makeGradient(ctx, color) {
+  const g = ctx.createLinearGradient(0, 0, 0, ctx.canvas.height);
+  g.addColorStop(0, color + '33');
+  g.addColorStop(1, color + '00');
+  return g;
+}
+
+function chartOptions(yLabel, suffix) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 600, easing: 'easeInOutQuart' },
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: '#12141a',
+        borderColor: 'rgba(255,255,255,0.1)',
+        borderWidth: 1,
+        padding: 12,
+        titleFont: { size: 11, weight: '500' },
+        bodyFont: { size: 13, weight: '600' },
+        callbacks: {
+          label: ctx => ` ${ctx.parsed.y.toFixed(2)}${suffix}`,
+        }
+      }
+    },
+    scales: {
+      x: {
+        grid: { color: 'rgba(255,255,255,0.04)' },
+        ticks: { maxTicksLimit: 6, font: { size: 10, family: "'JetBrains Mono'" } },
+      },
+      y: {
+        grid: { color: 'rgba(255,255,255,0.04)' },
+        ticks: { maxTicksLimit: 5, font: { size: 10 }, callback: v => v + suffix },
+        title: { display: false },
+      }
+    }
+  };
+}
+
+function makeChart(id, color, yLabel, suffix) {
+  const canvas = document.getElementById(id);
+  const ctx = canvas.getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        data: [],
+        borderColor: color,
+        backgroundColor: makeGradient(ctx, color),
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        pointHoverBackgroundColor: color,
+        fill: true,
+        tension: 0.4,
+      }]
+    },
+    options: chartOptions(yLabel, suffix),
+  });
+}
+
+function makeNetChart() {
+  const canvas = document.getElementById('netChart');
+  const ctx = canvas.getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        {
+          label: 'Sent',
+          data: [],
+          borderColor: COLORS.orange,
+          backgroundColor: makeGradient(ctx, COLORS.orange),
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: true,
+          tension: 0.4,
+        },
+        {
+          label: 'Recv',
+          data: [],
+          borderColor: COLORS.purple,
+          backgroundColor: makeGradient(ctx, COLORS.purple),
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: true,
+          tension: 0.4,
+        }
+      ]
+    },
+    options: {
+      ...chartOptions('', ' MB'),
+      plugins: {
+        ...chartOptions('', ' MB').plugins,
+        legend: {
+          display: true,
+          labels: { color: '#8892aa', font: { size: 11 }, boxWidth: 12, padding: 16 }
+        }
+      }
+    },
+  });
+}
+
+// ── Initialize charts ──
+const cpuChart  = makeChart('cpuChart',  COLORS.blue,   'CPU %',     '%');
+const memChart  = makeChart('memChart',  COLORS.purple, 'Mem %',     '%');
+const diskChart = makeChart('diskChart', COLORS.green,  'Free GB',   ' GB');
+const netChart  = makeNetChart();
+
+let currentRange = '24h';
+
+function exportCSV() {
+  window.open(`/api/export/csv?range=${currentRange}`, '_blank');
+}
+
+function setRange(r) {
+  currentRange = r;
+  ['24h','7d','30d'].forEach(x => document.getElementById('btn'+x).classList.toggle('active', x === r));
+  fetchData();
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  if (currentRange === '24h') return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
+  return (bytes/1024/1024/1024).toFixed(1) + ' GB';
+}
+
+// Compute delta MB/s between consecutive net samples
+function computeNetDeltas(data) {
+  const sentMB = [], recvMB = [];
+  for (let i = 0; i < data.length; i++) {
+    if (i === 0) { sentMB.push(0); recvMB.push(0); continue; }
+    const dt = (data[i].ts - data[i-1].ts) || 10;
+    sentMB.push(Math.max(0, (data[i].net_sent_bytes - data[i-1].net_sent_bytes)) / (dt * 1024 * 1024));
+    recvMB.push(Math.max(0, (data[i].net_recv_bytes - data[i-1].net_recv_bytes)) / (dt * 1024 * 1024));
+  }
+  return { sentMB, recvMB };
+}
+
+function updateChart(chart, labels, data) {
+  chart.data.labels = labels;
+  chart.data.datasets[0].data = data;
+  chart.update('active');
+}
+
+async function fetchData() {
+  try {
+    // Fetch metrics
+    const mResp = await fetch(`/api/metrics?range=${currentRange}`);
+    if (!mResp.ok) throw new Error('metrics fetch failed');
+    const mJson = await mResp.json();
+    const data = mJson.data || [];
+
+    if (data.length === 0) {
+      showNoData();
+      document.getElementById('statusLabel').textContent = 'No data yet';
+      return;
+    }
+
+    const labels = data.map(d => fmtTime(d.ts));
+    const latest = data[data.length - 1];
+
+    // Calculate absolute consumption
+    const vCPUsUsed = (latest.cpu_pct / 100) * (latest.cpu_cores || 1);
+    const memUsedGB = (latest.mem_pct / 100) * (latest.mem_total_gb || 1);
+    const diskUsedGB = (latest.disk_total_gb || 1) - latest.disk_free_gb;
+
+    // Update KPIs
+    document.getElementById('cpuVal').textContent  = vCPUsUsed.toFixed(2) + ' vCPU';
+    document.getElementById('cpuSub').textContent  = `of ${latest.cpu_cores || 1} Cores (${latest.cpu_pct.toFixed(1)}%)`;
+    document.getElementById('cpuBar').style.width  = Math.min(latest.cpu_pct, 100) + '%';
+
+    document.getElementById('memVal').textContent  = memUsedGB.toFixed(1) + ' GB';
+    document.getElementById('memSub').textContent  = `of ${(latest.mem_total_gb || 1).toFixed(1)} GB (${latest.mem_pct.toFixed(1)}%)`;
+    document.getElementById('memBar').style.width  = Math.min(latest.mem_pct, 100) + '%';
+
+    document.getElementById('diskVal').textContent = diskUsedGB.toFixed(1) + ' GB';
+    document.getElementById('diskSub').textContent = `of ${(latest.disk_total_gb || 1).toFixed(1)} GB (Used)`;
+    document.getElementById('diskBar').style.width = Math.min((diskUsedGB / (latest.disk_total_gb || 1)) * 100, 100) + '%';
+
+    document.getElementById('netVal').textContent  = fmtBytes(latest.net_sent_bytes + latest.net_recv_bytes);
+    document.getElementById('netSub').textContent  = 'Total I/O Consumed (up + down)';
+
+    // Compute aggregations for Average and Peak
+    let sumCPU = 0, peakCPU = 0;
+    let sumMem = 0, peakMem = 0;
+    let minDisk = Infinity;
+    
+    data.forEach(d => {
+      sumCPU += d.cpu_pct;
+      sumMem += d.mem_pct;
+      if (d.cpu_pct > peakCPU) peakCPU = d.cpu_pct;
+      if (d.mem_pct > peakMem) peakMem = d.mem_pct;
+      if (d.disk_free_gb < minDisk) minDisk = d.disk_free_gb;
+    });
+
+    const avgCPU = sumCPU / data.length;
+    const avgMem = sumMem / data.length;
+
+    document.getElementById('cpuAvg').textContent = `Avg: ${avgCPU.toFixed(1)}%`;
+    document.getElementById('cpuPeak').textContent = `Peak: ${peakCPU.toFixed(1)}%`;
+    
+    document.getElementById('memAvg').textContent = `Avg: ${avgMem.toFixed(1)}%`;
+    document.getElementById('memPeak').textContent = `Peak: ${peakMem.toFixed(1)}%`;
+
+    document.getElementById('diskAvg').textContent = `Min Free: ${minDisk === Infinity ? '0' : minDisk.toFixed(1)} GB`;
+
+    // Update chart badges
+    document.getElementById('cpuChartBadge').textContent  = vCPUsUsed.toFixed(2) + ' vCPU';
+    document.getElementById('memChartBadge').textContent  = memUsedGB.toFixed(1) + ' GB';
+    document.getElementById('diskChartBadge').textContent = latest.disk_free_gb.toFixed(1) + ' GB Free';
+
+    // Update charts
+    updateChart(cpuChart,  labels, data.map(d => d.cpu_pct));
+    updateChart(memChart,  labels, data.map(d => d.mem_pct));
+    updateChart(diskChart, labels, data.map(d => d.disk_free_gb));
+
+    const { sentMB, recvMB } = computeNetDeltas(data);
+    netChart.data.labels = labels;
+    netChart.data.datasets[0].data = sentMB;
+    netChart.data.datasets[1].data = recvMB;
+    netChart.update('active');
+    const maxMB = Math.max(...sentMB, ...recvMB);
+    document.getElementById('netChartBadge').textContent = maxMB.toFixed(2) + ' MB/s pk';
+
+    let sumNet = 0;
+    for (let i = 0; i < sentMB.length; i++) {
+        sumNet += sentMB[i] + recvMB[i];
+    }
+    const avgNet = sentMB.length > 0 ? (sumNet / sentMB.length) : 0;
+    document.getElementById('netAvg').textContent = `Avg: ${avgNet.toFixed(2)} MB/s`;
+    document.getElementById('netPeak').textContent = `Peak: ${maxMB.toFixed(2)} MB/s`;
+
+    // Status
+    document.getElementById('statusLabel').textContent = 'Live';
+    document.getElementById('statusDot').style.background = 'var(--accent-green)';
+    document.getElementById('lastUpdated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+    document.getElementById('footerStats').textContent = `${data.length} metric rows · range: ${currentRange}`;
+
+    // Fetch processes
+    const pResp = await fetch(`/api/processes?range=${currentRange}`);
+    if (pResp.ok) {
+      const pJson = await pResp.json();
+      renderProcesses(pJson.data || []);
+    }
+
+  } catch(e) {
+    console.error(e);
+    document.getElementById('statusLabel').textContent = 'Error';
+    document.getElementById('statusDot').style.background = 'var(--accent-red)';
+  }
+}
+
+function showNoData() {
+  ['cpuVal','memVal','diskVal','netVal'].forEach(id => {
+    document.getElementById(id).textContent = '—';
+  });
+  document.getElementById('procContainer').innerHTML =
+    '<div class="no-data"><div class="no-data-icon">📊</div><div class="no-data-text">No data yet — collector starts recording every 10s</div></div>';
+}
+
+function renderProcesses(procs) {
+  if (!procs.length) {
+    document.getElementById('procContainer').innerHTML =
+      '<div class="no-data"><div class="no-data-icon">🔍</div><div class="no-data-text">No process data in range</div></div>';
+    document.getElementById('procBadge').textContent = '0 processes';
+    return;
+  }
+
+  // Aggregate by name: take latest CPU + mem
+  const byName = {};
+  procs.forEach(p => {
+    if (!byName[p.name] || p.ts > byName[p.name].ts) byName[p.name] = p;
+  });
+  const rows = Object.values(byName).sort((a,b) => b.cpu_pct - a.cpu_pct).slice(0, 15);
+
+  const maxCPU = Math.max(...rows.map(r => r.cpu_pct), 0.1);
+  document.getElementById('procBadge').textContent = rows.length + ' processes';
+
+  let html = `<table class="processes-table">
+    <thead><tr>
+      <th>Process</th><th>PID</th><th>CPU</th><th>Memory</th>
+    </tr></thead><tbody>`;
+  rows.forEach(r => {
+    const barW = Math.min((r.cpu_pct / maxCPU) * 100, 100);
+    html += `<tr>
+      <td class="proc-name">${r.name}</td>
+      <td class="mono">${r.pid}</td>
+      <td>
+        <div class="cpu-bar-mini">
+          <div class="cpu-bar-track"><div class="cpu-bar-fill-mini" style="width:${barW}%"></div></div>
+          <span class="mono" style="min-width:48px;text-align:right">${r.cpu_pct.toFixed(1)}%</span>
+        </div>
+      </td>
+      <td class="mono">${r.mem_mb.toFixed(0)} MB</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  document.getElementById('procContainer').innerHTML = html;
+}
+
+// ── Auto-refresh every 15s ──
+fetchData();
+setInterval(fetchData, 15000);
+</script>
+</body>
+</html>
