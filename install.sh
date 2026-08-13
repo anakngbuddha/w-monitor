@@ -5,7 +5,7 @@ set -e
 
 INSTALL_DIR="/usr/local/bin"
 EXE_NAME="sysmon"
-SOURCE_EXE="./sysmon_linux"
+SOURCE_EXE="./wmonitor_linux"
 TARGET_EXE="$INSTALL_DIR/$EXE_NAME"
 
 # 1. Ensure root privileges

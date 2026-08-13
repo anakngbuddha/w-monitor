@@ -19,16 +19,21 @@ type DB struct {
 
 // MetricRow holds a single metrics snapshot.
 type MetricRow struct {
-	ID           int64
-	Timestamp    time.Time
-	CPUPct       float64
-	MemPct       float64
-	DiskFreeGB   float64
-	NetSentBytes uint64
-	NetRecvBytes uint64
-	CPUCores     int
-	MemTotalGB   float64
-	DiskTotalGB  float64
+	ID              int64
+	Timestamp       time.Time
+	CPUPct          float64
+	MemPct          float64
+	DiskFreeGB      float64
+	NetSentBytes    uint64
+	NetRecvBytes    uint64
+	CPUCores        int
+	MemTotalGB      float64
+	DiskTotalGB     float64
+	DiskReadOps     uint64
+	DiskWriteOps    uint64
+	DiskIOPS        float64
+	NetMBps         float64
+	ConcurrentUsers int
 }
 
 // ProcessRow holds a single process snapshot.
@@ -90,16 +95,21 @@ func (db *DB) Close() error {
 func (db *DB) migrate() error {
 	schema := `
 CREATE TABLE IF NOT EXISTS metrics (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp      INTEGER NOT NULL,  -- Unix epoch seconds
-    cpu_pct        REAL    NOT NULL,
-    mem_pct        REAL    NOT NULL,
-    disk_free_gb   REAL    NOT NULL,
-    net_sent_bytes INTEGER NOT NULL,
-    net_recv_bytes INTEGER NOT NULL,
-    cpu_cores      INTEGER DEFAULT 0,
-    mem_total_gb   REAL    DEFAULT 0.0,
-    disk_total_gb  REAL    DEFAULT 0.0
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp        INTEGER NOT NULL,  -- Unix epoch seconds
+    cpu_pct          REAL    NOT NULL,
+    mem_pct          REAL    NOT NULL,
+    disk_free_gb     REAL    NOT NULL,
+    net_sent_bytes   INTEGER NOT NULL,
+    net_recv_bytes   INTEGER NOT NULL,
+    cpu_cores        INTEGER DEFAULT 0,
+    mem_total_gb     REAL    DEFAULT 0.0,
+    disk_total_gb    REAL    DEFAULT 0.0,
+    disk_read_ops    INTEGER DEFAULT 0,
+    disk_write_ops   INTEGER DEFAULT 0,
+    disk_iops        REAL    DEFAULT 0.0,
+    net_mbps         REAL    DEFAULT 0.0,
+    concurrent_users INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(timestamp);
 
@@ -116,21 +126,26 @@ CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
 	if _, err := db.conn.Exec(schema); err != nil {
 		return err
 	}
-	
+
 	// Safely add new columns to existing databases (ignore errors if columns already exist)
 	db.conn.Exec("ALTER TABLE metrics ADD COLUMN cpu_cores INTEGER DEFAULT 0")
 	db.conn.Exec("ALTER TABLE metrics ADD COLUMN mem_total_gb REAL DEFAULT 0.0")
 	db.conn.Exec("ALTER TABLE metrics ADD COLUMN disk_total_gb REAL DEFAULT 0.0")
-	
+	db.conn.Exec("ALTER TABLE metrics ADD COLUMN disk_read_ops INTEGER DEFAULT 0")
+	db.conn.Exec("ALTER TABLE metrics ADD COLUMN disk_write_ops INTEGER DEFAULT 0")
+	db.conn.Exec("ALTER TABLE metrics ADD COLUMN disk_iops REAL DEFAULT 0.0")
+	db.conn.Exec("ALTER TABLE metrics ADD COLUMN net_mbps REAL DEFAULT 0.0")
+	db.conn.Exec("ALTER TABLE metrics ADD COLUMN concurrent_users INTEGER DEFAULT 0")
+
 	return nil
 }
 
 // InsertMetric writes one metrics row.
 func (db *DB) InsertMetric(m MetricRow) error {
 	_, err := db.conn.Exec(
-		`INSERT INTO metrics(timestamp, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.Timestamp.Unix(), m.CPUPct, m.MemPct, m.DiskFreeGB, m.NetSentBytes, m.NetRecvBytes, m.CPUCores, m.MemTotalGB, m.DiskTotalGB,
+		`INSERT INTO metrics(timestamp, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.Timestamp.Unix(), m.CPUPct, m.MemPct, m.DiskFreeGB, m.NetSentBytes, m.NetRecvBytes, m.CPUCores, m.MemTotalGB, m.DiskTotalGB, m.DiskReadOps, m.DiskWriteOps, m.DiskIOPS, m.NetMBps, m.ConcurrentUsers,
 	)
 	return err
 }
@@ -148,7 +163,7 @@ func (db *DB) InsertProcess(p ProcessRow) error {
 // QueryMetrics returns rows within the given time window, newest first.
 func (db *DB) QueryMetrics(since time.Time) ([]MetricRow, error) {
 	rows, err := db.conn.Query(
-		`SELECT id, timestamp, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb
+		`SELECT id, timestamp, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users
 		 FROM metrics WHERE timestamp >= ? ORDER BY timestamp ASC`,
 		since.Unix(),
 	)
@@ -161,7 +176,7 @@ func (db *DB) QueryMetrics(since time.Time) ([]MetricRow, error) {
 	for rows.Next() {
 		var r MetricRow
 		var ts int64
-		if err := rows.Scan(&r.ID, &ts, &r.CPUPct, &r.MemPct, &r.DiskFreeGB, &r.NetSentBytes, &r.NetRecvBytes, &r.CPUCores, &r.MemTotalGB, &r.DiskTotalGB); err != nil {
+		if err := rows.Scan(&r.ID, &ts, &r.CPUPct, &r.MemPct, &r.DiskFreeGB, &r.NetSentBytes, &r.NetRecvBytes, &r.CPUCores, &r.MemTotalGB, &r.DiskTotalGB, &r.DiskReadOps, &r.DiskWriteOps, &r.DiskIOPS, &r.NetMBps, &r.ConcurrentUsers); err != nil {
 			return nil, err
 		}
 		r.Timestamp = time.Unix(ts, 0)

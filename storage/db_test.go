@@ -24,12 +24,15 @@ func TestStorageRoundtrip(t *testing.T) {
 	// Insert 5 fake metric rows
 	for i := 0; i < 5; i++ {
 		m := storage.MetricRow{
-			Timestamp:    now.Add(time.Duration(i) * 10 * time.Second),
-			CPUPct:       float64(10 + i*5),
-			MemPct:       float64(40 + i*2),
-			DiskFreeGB:   float64(100 - i),
-			NetSentBytes: uint64(1000 * i),
-			NetRecvBytes: uint64(2000 * i),
+			Timestamp:       now.Add(time.Duration(i) * 10 * time.Second),
+			CPUPct:          float64(10 + i*5),
+			MemPct:          float64(40 + i*2),
+			DiskFreeGB:      float64(100 - i),
+			NetSentBytes:    uint64(1000 * i),
+			NetRecvBytes:    uint64(2000 * i),
+			DiskIOPS:        float64(50 + i*10),
+			NetMBps:         float64(1.5 + float64(i)*0.5),
+			ConcurrentUsers: i + 1,
 		}
 		if err := db.InsertMetric(m); err != nil {
 			t.Fatalf("InsertMetric[%d]: %v", i, err)
@@ -74,9 +77,15 @@ func TestStorageRoundtrip(t *testing.T) {
 	t.Logf("DB path: %s", tmp)
 	t.Logf("Metric rows: %d, Process rows: %d", mc, pc)
 
-	// Verify a spot value
+	// Verify spot values
 	if metrics[0].CPUPct != 10.0 {
 		t.Errorf("expected CPUPct=10.0, got %v", metrics[0].CPUPct)
+	}
+	if metrics[0].DiskIOPS != 50.0 {
+		t.Errorf("expected DiskIOPS=50.0, got %v", metrics[0].DiskIOPS)
+	}
+	if metrics[0].ConcurrentUsers != 1 {
+		t.Errorf("expected ConcurrentUsers=1, got %v", metrics[0].ConcurrentUsers)
 	}
 	if processes[2].Name != "proc_2" {
 		t.Errorf("expected name=proc_2, got %v", processes[2].Name)

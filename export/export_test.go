@@ -23,12 +23,15 @@ func TestExportCSVAndText(t *testing.T) {
 	now := time.Now().UTC()
 	for i := 0; i < 10; i++ {
 		db.InsertMetric(storage.MetricRow{
-			Timestamp:    now.Add(-time.Duration(i) * time.Hour),
-			CPUPct:       float64(10 + i*5),
-			MemPct:       float64(40 + i*2),
-			DiskFreeGB:   float64(100 - i),
-			NetSentBytes: uint64(1000 * i),
-			NetRecvBytes: uint64(2000 * i),
+			Timestamp:       now.Add(-time.Duration(i) * time.Hour),
+			CPUPct:          float64(10 + i*5),
+			MemPct:          float64(40 + i*2),
+			DiskFreeGB:      float64(100 - i),
+			NetSentBytes:    uint64(1000 * i),
+			NetRecvBytes:    uint64(2000 * i),
+			DiskIOPS:        float64(100 + i*10),
+			NetMBps:         float64(2.0 + float64(i)*0.2),
+			ConcurrentUsers: 5 + i,
 		})
 	}
 
@@ -56,9 +59,9 @@ func TestExportCSVAndText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read csv: %v", err)
 	}
-	// summary block (11) + header (1) + 10 data rows = 22
-	if len(records) != 22 {
-		t.Errorf("expected 22 CSV rows (summary+header+10), got %d", len(records))
+	// summary block (17) + header (1) + 10 data rows = 28
+	if len(records) != 28 {
+		t.Errorf("expected 28 CSV rows (summary+header+10), got %d", len(records))
 	}
 	t.Logf("CSV path: %s, rows: %d", csvPath, len(records)-1)
 
@@ -72,6 +75,15 @@ func TestExportCSVAndText(t *testing.T) {
 	}
 	if s.PeakCPU < 10 {
 		t.Errorf("PeakCPU too low: %v", s.PeakCPU)
+	}
+	if s.SuggestedMinIOPS <= 0 {
+		t.Errorf("SuggestedMinIOPS should be > 0: %v", s.SuggestedMinIOPS)
+	}
+	if s.SuggestedMinDiskGB <= 0 {
+		t.Errorf("SuggestedMinDiskGB should be > 0: %v", s.SuggestedMinDiskGB)
+	}
+	if s.SuggestedMinNetMBps <= 0 {
+		t.Errorf("SuggestedMinNetMBps should be > 0: %v", s.SuggestedMinNetMBps)
 	}
 	t.Logf("Text report: %s, samples=%d, avg_cpu=%.2f%%, peak_cpu=%.2f%%", txtPath, s.RowCount, s.AvgCPU, s.PeakCPU)
 

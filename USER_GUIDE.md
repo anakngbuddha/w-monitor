@@ -10,51 +10,30 @@ W-Monitor collects system metrics every **10 seconds**, stores up to **30 days**
 
 > **Bandwidth note:** The figures below refer to *local loopback traffic* between your browser and the W-Monitor HTTP server. No data is sent over the internet.
 
-### Windows
+### Dynamic Resource Suggestions
 
-| Spec | Minimum | Recommended |
-|---|---|---|
-| **vCPU** | 1 core | 2 cores |
-| **RAM** | 256 MB | 512 MB |
-| **Disk Space** | 200 MB | 1 GB |
-| **Monthly Loopback Bandwidth** | ~2 GB | ~5 GB |
+Rather than hardcoded specs, W-Monitor automatically calculates and publishes the **minimum** and **recommended** system requirements based on your actual system's usage pattern across 5 key resource dimensions:
 
-**Bandwidth computation (Windows):**
-- Each dashboard `/api/metrics` JSON response (24h range) ≈ 8,640 rows × ~100 bytes ≈ **~864 KB per page load**
-- `/api/processes` response (24h) ≈ 172,800 rows × ~60 bytes ≈ **~10 MB per full load** (browser caches/paginates)
-- **Minimum** (5 dashboard visits/day × 2 API calls × ~500 KB avg) = ~1.5 GB/month ≈ **~2 GB/month**
-- **Recommended** (20 visits/day × 2 API calls × ~900 KB avg) = ~10.8 GB/month → rounded to **~5 GB/month** with typical browser-side caching
+1. **CPU (vCPUs):**
+   - **Minimum:** Measured peak CPU core consumption plus a 20% safety margin.
+   - **Recommended:** Headroom for workload bursts (+1 vCPU over minimum).
+2. **RAM (GB):**
+   - **Minimum:** Peak memory consumption plus a 20% safety margin (min 0.25 GB).
+   - **Recommended:** Double the peak memory usage (min 0.50 GB).
+3. **Disk Size (GB):**
+   - **Minimum:** Peak disk space utilization plus a 20% safety margin (min 10 GB).
+   - **Recommended:** Double the peak disk utilization for log & database growth headroom (min 20 GB).
+4. **Disk IOPS (Input/Output Operations Per Second):**
+   - **Minimum:** Peak disk read/write IOPS plus a 20% safety margin (min 100 IOPS).
+   - **Recommended:** Double the peak disk IOPS (min 300 IOPS).
+5. **Network Traffic Bandwidth (MB/s):**
+   - **Minimum:** Peak network transfer rate (sent + received) plus a 20% safety margin (min 1.0 MB/s).
+   - **Recommended:** Double the peak network transfer rate (min 5.0 MB/s).
 
-**Disk computation (Windows):**
-- DB steady-state: last 24h raw (~11 MB) + days 2–30 downsampled (~2 MB) ≈ **~15–50 MB SQLite DB**
-- Binary: `sysmon_windows.exe` ≈ **15 MB**
-- Minimum: binary + DB + OS overhead = **~200 MB**
-- Recommended: includes headroom for WAL, exports, and 30-day CSV reports = **~1 GB**
-
----
-
-### Linux
-
-| Spec | Minimum | Recommended |
-|---|---|---|
-| **vCPU** | 1 core | 2 cores |
-| **RAM** | 128 MB | 256 MB |
-| **Disk Space** | 150 MB | 500 MB |
-| **Monthly Loopback Bandwidth** | ~2 GB | ~5 GB |
-
-**Bandwidth computation (Linux):**
-- Same API payload structure as Windows — loopback traffic is identical.
-- **Minimum** (~5 dashboard visits/day): **~2 GB/month loopback**
-- **Recommended** (~20 visits/day with full chart loads): **~5 GB/month loopback**
-- Internet bandwidth: **0 GB** — W-Monitor is entirely local.
-
-**Disk computation (Linux):**
-- DB steady-state: **~15–50 MB** (same schema, same retention policy)
-- Binary: `sysmon_linux` ≈ **11 MB**
-- Minimum: binary + DB + systemd service overhead = **~150 MB**
-- Recommended: headroom for TXT exports and 30-day data history = **~500 MB**
-
-> **RAM note:** The Go runtime and gopsutil process enumeration (top-20 processes every 10s) are the primary memory consumers. Linux benefits from lower OS overhead, hence the lower minimum RAM figure.
+### Advanced Metrics Collected
+- **Disk IOPS:** Tracks instantaneous, minimum, average, and peak disk read/write operation rates.
+- **Concurrent Users:** Tracks minimum, average, and peak active client sessions interacting with the dashboard and API in real time.
+- **Network Bandwidth:** Measures transfer rates and total consumption over configurable report windows (`24h`, `7d`, `30d`).
 
 ---
 

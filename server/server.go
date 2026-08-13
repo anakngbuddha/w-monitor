@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"Zeus/export"
@@ -14,14 +16,21 @@ import (
 
 // Server wraps the HTTP mux and storage DB.
 type Server struct {
-	db   *storage.DB
-	port string
-	mux  *http.ServeMux
+	db          *storage.DB
+	port        string
+	mux         *http.ServeMux
+	mu          sync.Mutex
+	activeUsers map[string]time.Time
 }
 
 // New creates a Server bound to the given port (e.g. "8080").
 func New(db *storage.DB, port string) *Server {
-	s := &Server{db: db, port: port, mux: http.NewServeMux()}
+	s := &Server{
+		db:          db,
+		port:        port,
+		mux:         http.NewServeMux(),
+		activeUsers: make(map[string]time.Time),
+	}
 	s.routes()
 	return s
 }
@@ -41,36 +50,70 @@ func (s *Server) RegisterStatic(h http.Handler) {
 	s.mux.Handle("/", h)
 }
 
-// Handler returns the underlying http.Handler (for testing).
+// trackRequest records an active request from a client IP.
+func (s *Server) trackRequest(r *http.Request) {
+	ip := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(ip); err == nil {
+		ip = host
+	}
+	s.mu.Lock()
+	s.activeUsers[ip] = time.Now()
+	s.mu.Unlock()
+}
+
+// GetConcurrentUsers returns the count of unique active users/IPs in the last 60 seconds.
+func (s *Server) GetConcurrentUsers() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-60 * time.Second)
+	for ip, lastSeen := range s.activeUsers {
+		if lastSeen.Before(cutoff) {
+			delete(s.activeUsers, ip)
+		}
+	}
+	return len(s.activeUsers)
+}
+
+// Handler returns the underlying http.Handler with active request tracking (for testing and server start).
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.trackRequest(r)
+		s.mux.ServeHTTP(w, r)
+	})
 }
 
 // Start begins listening on the configured port.
 func (s *Server) Start() error {
 	addr := ":" + s.port
 	log.Printf("[server] listening on http://localhost%s", addr)
-	return http.ListenAndServe(addr, s.mux)
+	return http.ListenAndServe(addr, s.Handler())
 }
 
 // --- API handlers ---
 
 type metricsResponse struct {
-	Range string             `json:"range"`
-	Count int                `json:"count"`
-	Data  []metricDataPoint  `json:"data"`
+	Range string            `json:"range"`
+	Count int               `json:"count"`
+	Data  []metricDataPoint `json:"data"`
 }
 
 type metricDataPoint struct {
-	Timestamp int64   `json:"ts"`
-	CPUPct    float64 `json:"cpu_pct"`
-	MemPct    float64 `json:"mem_pct"`
-	DiskFreeGB float64 `json:"disk_free_gb"`
-	NetSentBytes uint64 `json:"net_sent_bytes"`
-	NetRecvBytes uint64 `json:"net_recv_bytes"`
-	CPUCores     int     `json:"cpu_cores"`
-	MemTotalGB   float64 `json:"mem_total_gb"`
-	DiskTotalGB  float64 `json:"disk_total_gb"`
+	Timestamp       int64   `json:"ts"`
+	CPUPct          float64 `json:"cpu_pct"`
+	MemPct          float64 `json:"mem_pct"`
+	DiskFreeGB      float64 `json:"disk_free_gb"`
+	NetSentBytes    uint64  `json:"net_sent_bytes"`
+	NetRecvBytes    uint64  `json:"net_recv_bytes"`
+	CPUCores        int     `json:"cpu_cores"`
+	MemTotalGB      float64 `json:"mem_total_gb"`
+	DiskTotalGB     float64 `json:"disk_total_gb"`
+	DiskReadOps     uint64  `json:"disk_read_ops"`
+	DiskWriteOps    uint64  `json:"disk_write_ops"`
+	DiskIOPS        float64 `json:"disk_iops"`
+	NetMBps         float64 `json:"net_mbps"`
+	ConcurrentUsers int     `json:"concurrent_users"`
 }
 
 func parseRange(r string) time.Duration {
@@ -102,15 +145,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	data := make([]metricDataPoint, 0, len(rows))
 	for _, row := range rows {
 		data = append(data, metricDataPoint{
-			Timestamp:    row.Timestamp.Unix(),
-			CPUPct:       row.CPUPct,
-			MemPct:       row.MemPct,
-			DiskFreeGB:   row.DiskFreeGB,
-			NetSentBytes: row.NetSentBytes,
-			NetRecvBytes: row.NetRecvBytes,
-			CPUCores:     row.CPUCores,
-			MemTotalGB:   row.MemTotalGB,
-			DiskTotalGB:  row.DiskTotalGB,
+			Timestamp:       row.Timestamp.Unix(),
+			CPUPct:          row.CPUPct,
+			MemPct:          row.MemPct,
+			DiskFreeGB:      row.DiskFreeGB,
+			NetSentBytes:    row.NetSentBytes,
+			NetRecvBytes:    row.NetRecvBytes,
+			CPUCores:        row.CPUCores,
+			MemTotalGB:      row.MemTotalGB,
+			DiskTotalGB:     row.DiskTotalGB,
+			DiskReadOps:     row.DiskReadOps,
+			DiskWriteOps:    row.DiskWriteOps,
+			DiskIOPS:        row.DiskIOPS,
+			NetMBps:         row.NetMBps,
+			ConcurrentUsers: row.ConcurrentUsers,
 		})
 	}
 

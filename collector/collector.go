@@ -18,10 +18,21 @@ import (
 
 const pollInterval = 10 * time.Second
 
+// UserTracker provides the active concurrent user count.
+type UserTracker interface {
+	GetConcurrentUsers() int
+}
+
 // Collector gathers system metrics on a fixed interval and writes to the DB.
 type Collector struct {
-	db       *storage.DB
-	interval time.Duration
+	db           *storage.DB
+	interval     time.Duration
+	userTracker  UserTracker
+	prevTime     time.Time
+	prevReadOps  uint64
+	prevWriteOps uint64
+	prevNetSent  uint64
+	prevNetRecv  uint64
 }
 
 // New creates a Collector with the default poll interval.
@@ -32,6 +43,11 @@ func New(db *storage.DB) *Collector {
 // NewWithInterval creates a Collector with a custom poll interval (useful for testing).
 func NewWithInterval(db *storage.DB, interval time.Duration) *Collector {
 	return &Collector{db: db, interval: interval}
+}
+
+// SetUserTracker sets the UserTracker instance.
+func (c *Collector) SetUserTracker(ut UserTracker) {
+	c.userTracker = ut
 }
 
 // Run starts the polling loop. It blocks until ctx is cancelled.
@@ -103,6 +119,18 @@ func (c *Collector) collect() error {
 		diskTotalGB = float64(disk.Total) / (1024 * 1024 * 1024)
 	}
 
+	// Disk IOPS counters
+	var diskReadOps, diskWriteOps uint64
+	diskCounters, err := gopsutil_disk.IOCounters()
+	if err != nil {
+		log.Printf("[collector] disk io error: %v", err)
+	} else {
+		for _, d := range diskCounters {
+			diskReadOps += d.ReadCount
+			diskWriteOps += d.WriteCount
+		}
+	}
+
 	// Network — aggregate all interfaces
 	netCounters, err := gopsutil_net.IOCounters(false) // false = aggregate
 	if err != nil {
@@ -114,17 +142,67 @@ func (c *Collector) collect() error {
 		netRecv = netCounters[0].BytesRecv
 	}
 
+	// Calculate IOPS and Net MB/s deltas
+	diskIOPS := 0.0
+	netMBps := 0.0
+	if !c.prevTime.IsZero() {
+		elapsed := now.Sub(c.prevTime).Seconds()
+		if elapsed > 0 {
+			var deltaRead, deltaWrite uint64
+			if diskReadOps >= c.prevReadOps {
+				deltaRead = diskReadOps - c.prevReadOps
+			} else {
+				deltaRead = diskReadOps
+			}
+			if diskWriteOps >= c.prevWriteOps {
+				deltaWrite = diskWriteOps - c.prevWriteOps
+			} else {
+				deltaWrite = diskWriteOps
+			}
+			diskIOPS = float64(deltaRead+deltaWrite) / elapsed
+
+			var deltaSent, deltaRecv uint64
+			if netSent >= c.prevNetSent {
+				deltaSent = netSent - c.prevNetSent
+			} else {
+				deltaSent = netSent
+			}
+			if netRecv >= c.prevNetRecv {
+				deltaRecv = netRecv - c.prevNetRecv
+			} else {
+				deltaRecv = netRecv
+			}
+			netMBps = float64(deltaSent+deltaRecv) / (elapsed * 1024 * 1024)
+		}
+	}
+	c.prevTime = now
+	c.prevReadOps = diskReadOps
+	c.prevWriteOps = diskWriteOps
+	c.prevNetSent = netSent
+	c.prevNetRecv = netRecv
+
+	// Concurrent Users
+	concurrentUsers := 0
+	if c.userTracker != nil {
+		concurrentUsers = c.userTracker.GetConcurrentUsers()
+	}
+
 	// Write metric row
 	metric := storage.MetricRow{
-		Timestamp:    now,
-		CPUPct:       cpuPct,
-		MemPct:       memPct,
-		DiskFreeGB:   diskFreeGB,
-		NetSentBytes: netSent,
-		NetRecvBytes: netRecv,
-		CPUCores:     cpuCores,
-		MemTotalGB:   memTotalGB,
-		DiskTotalGB:  diskTotalGB,
+		Timestamp:       now,
+		CPUPct:          cpuPct,
+		MemPct:          memPct,
+		DiskFreeGB:      diskFreeGB,
+		NetSentBytes:    netSent,
+		NetRecvBytes:    netRecv,
+		CPUCores:        cpuCores,
+		MemTotalGB:      memTotalGB,
+		DiskTotalGB:     diskTotalGB,
+		DiskReadOps:     diskReadOps,
+		DiskWriteOps:    diskWriteOps,
+		DiskIOPS:        diskIOPS,
+		NetMBps:         netMBps,
+		ConcurrentUsers: concurrentUsers,
 	}
 	if err := c.db.InsertMetric(metric); err != nil {
 		return err

@@ -80,6 +80,9 @@ func (j *Job) downsampleMetrics(cutoff time.Time) error {
 			AVG(disk_free_gb),
 			CAST(AVG(net_sent_bytes) AS INTEGER),
 			CAST(AVG(net_recv_bytes) AS INTEGER),
+			AVG(disk_iops),
+			AVG(net_mbps),
+			CAST(AVG(concurrent_users) AS INTEGER),
 			COUNT(*)
 		FROM metrics
 		WHERE timestamp < ?
@@ -91,17 +94,20 @@ func (j *Job) downsampleMetrics(cutoff time.Time) error {
 	}
 
 	type avg struct {
-		hourTS      int64
-		cpu, mem    float64
-		diskFreeGB  float64
-		netSent     int64
-		netRecv     int64
-		count       int
+		hourTS     int64
+		cpu, mem   float64
+		diskFreeGB float64
+		netSent    int64
+		netRecv    int64
+		diskIOPS   float64
+		netMBps    float64
+		users      int
+		count      int
 	}
 	var avgs []avg
 	for rows.Next() {
 		var a avg
-		if err := rows.Scan(&a.hourTS, &a.cpu, &a.mem, &a.diskFreeGB, &a.netSent, &a.netRecv, &a.count); err != nil {
+		if err := rows.Scan(&a.hourTS, &a.cpu, &a.mem, &a.diskFreeGB, &a.netSent, &a.netRecv, &a.diskIOPS, &a.netMBps, &a.users, &a.count); err != nil {
 			rows.Close()
 			return err
 		}
@@ -130,9 +136,9 @@ func (j *Job) downsampleMetrics(cutoff time.Time) error {
 
 		// Insert the averaged row after deletion
 		_, err = tx.Exec(
-			`INSERT INTO metrics(timestamp, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			a.hourTS, a.cpu, a.mem, a.diskFreeGB, a.netSent, a.netRecv,
+			`INSERT INTO metrics(timestamp, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, disk_iops, net_mbps, concurrent_users)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			a.hourTS, a.cpu, a.mem, a.diskFreeGB, a.netSent, a.netRecv, a.diskIOPS, a.netMBps, a.users,
 		)
 		if err != nil {
 			return err

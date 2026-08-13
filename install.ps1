@@ -24,7 +24,7 @@ if (-not $isAdmin) {
 }
 
 $installDir = "$env:ProgramFiles\Sysmon"
-$exeName = "sysmon.exe"
+$exeName = "wmonitor.exe"
 $sourceExe = Join-Path $PSScriptRoot $exeName
 $targetExe = Join-Path $installDir $exeName
 

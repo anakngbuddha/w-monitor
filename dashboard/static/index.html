@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>W-Monitor — System Monitor</title>
-  <meta name="description" content="Real-time system monitoring dashboard — CPU, memory, disk, and network metrics with historical graphs." />
+  <meta name="description" content="Real-time system monitoring dashboard — CPU, memory, disk, network, disk IOPS, and concurrent user metrics." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -68,6 +68,7 @@
       align-items: center;
       justify-content: center;
       font-size: 18px;
+      font-weight: 700;
     }
     .logo-text h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
     .logo-text span { font-size: 12px; color: var(--text-secondary); font-weight: 400; }
@@ -135,12 +136,13 @@
     /* ── KPI Strip ── */
     .kpi-strip {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(6, 1fr);
       gap: 16px;
       padding: 24px 0 0;
     }
-    @media (max-width: 900px) { .kpi-strip { grid-template-columns: repeat(2, 1fr); } }
-    @media (max-width: 500px) { .kpi-strip { grid-template-columns: 1fr; } }
+    @media (max-width: 1200px) { .kpi-strip { grid-template-columns: repeat(3, 1fr); } }
+    @media (max-width: 700px) { .kpi-strip { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 450px) { .kpi-strip { grid-template-columns: 1fr; } }
 
     .kpi-card {
       background: var(--bg-card);
@@ -166,6 +168,7 @@
     .kpi-card.purple::before{ background: linear-gradient(90deg, var(--accent-purple), transparent); }
     .kpi-card.green::before { background: linear-gradient(90deg, var(--accent-green), transparent); }
     .kpi-card.orange::before{ background: linear-gradient(90deg, var(--accent-orange), transparent); }
+    .kpi-card.red::before   { background: linear-gradient(90deg, var(--accent-red), transparent); }
 
     .kpi-label {
       font-size: 11px;
@@ -183,9 +186,10 @@
     .purple .kpi-label-dot{ background: var(--accent-purple); box-shadow: 0 0 6px var(--accent-purple); }
     .green .kpi-label-dot { background: var(--accent-green); box-shadow: 0 0 6px var(--accent-green); }
     .orange .kpi-label-dot{ background: var(--accent-orange); box-shadow: 0 0 6px var(--accent-orange); }
+    .red .kpi-label-dot   { background: var(--accent-red); box-shadow: 0 0 6px var(--accent-red); }
 
     .kpi-value {
-      font-size: 32px;
+      font-size: 26px;
       font-weight: 600;
       letter-spacing: -0.5px;
       line-height: 1;
@@ -213,6 +217,36 @@
     .purple .kpi-bar-fill { background: var(--accent-purple); }
     .green .kpi-bar-fill  { background: var(--accent-green); }
     .orange .kpi-bar-fill { background: var(--accent-orange); }
+    .red .kpi-bar-fill    { background: var(--accent-red); }
+
+    /* Specs Banner */
+    .specs-banner {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      margin-top: 16px;
+    }
+    @media (max-width: 700px) { .specs-banner { grid-template-columns: 1fr; } }
+
+    .spec-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      box-shadow: var(--shadow-card);
+    }
+    .spec-card.min-spec { border-left: 4px solid var(--accent-orange); }
+    .spec-card.rec-spec { border-left: 4px solid var(--accent-green); }
+    .spec-title {
+      font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+      margin-bottom: 12px; color: var(--text-primary); display: flex; align-items: center; justify-content: space-between;
+    }
+    .spec-items {
+      display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: var(--text-secondary);
+    }
+    .spec-item { display: flex; flex-direction: column; gap: 2px; }
+    .spec-item label { font-size: 10px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.05em; }
+    .spec-item span { font-weight: 600; color: var(--text-primary); font-family: 'JetBrains Mono', monospace; }
 
     /* ── Charts Grid ── */
     .charts-grid {
@@ -260,9 +294,9 @@
     .badge-purple { background: rgba(183,148,244,0.15); color: var(--accent-purple); }
     .badge-green  { background: rgba(104,211,145,0.15); color: var(--accent-green); }
     .badge-orange { background: rgba(246,173,85,0.15); color: var(--accent-orange); }
+    .badge-red    { background: rgba(252,129,129,0.15); color: var(--accent-red); }
 
     .chart-wrap { position: relative; height: 220px; }
-    .chart-wrap-tall { position: relative; height: 280px; }
 
     /* ── Processes Table ── */
     .processes-card {
@@ -323,15 +357,6 @@
     .footer-text { font-size: 12px; color: var(--text-muted); }
     .footer-mono { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-muted); }
 
-    /* Skeleton loader */
-    .skeleton {
-      background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-hover) 50%, var(--bg-card) 75%);
-      background-size: 200% 100%;
-      animation: shimmer 1.5s infinite;
-      border-radius: 4px;
-    }
-    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-
     /* Fade-in animation */
     @keyframes fadeInUp {
       from { opacity: 0; transform: translateY(12px); }
@@ -342,6 +367,8 @@
     .delay-2 { animation-delay: 0.10s; }
     .delay-3 { animation-delay: 0.15s; }
     .delay-4 { animation-delay: 0.20s; }
+    .delay-5 { animation-delay: 0.25s; }
+    .delay-6 { animation-delay: 0.30s; }
   </style>
 </head>
 <body>
@@ -398,6 +425,44 @@
       <div class="kpi-bar-track"><div class="kpi-bar-fill" id="netBar" style="width:50%"></div></div>
       <div class="kpi-avg-peak"><span id="netAvg">Avg: — MB/s</span><span id="netPeak">Peak: — MB/s</span></div>
     </div>
+    <div class="kpi-card blue fade-in delay-5" id="iopsCard">
+      <div class="kpi-label"><span class="kpi-label-dot"></span>Disk IOPS</div>
+      <div class="kpi-value" id="iopsVal">—</div>
+      <div class="kpi-sub" id="iopsSub">Read & Write Ops/sec</div>
+      <div class="kpi-bar-track"><div class="kpi-bar-fill" id="iopsBar" style="width:20%"></div></div>
+      <div class="kpi-avg-peak"><span id="iopsAvg">Avg: — IOPS</span><span id="iopsPeak">Peak: — IOPS</span></div>
+    </div>
+    <div class="kpi-card purple fade-in delay-6" id="usersCard">
+      <div class="kpi-label"><span class="kpi-label-dot"></span>Concurrent Users</div>
+      <div class="kpi-value" id="usersVal">—</div>
+      <div class="kpi-sub" id="usersSub">Active Sessions (60s)</div>
+      <div class="kpi-bar-track"><div class="kpi-bar-fill" id="usersBar" style="width:10%"></div></div>
+      <div class="kpi-avg-peak"><span id="usersAvg">Avg: —</span><span id="usersMax">Max: —</span></div>
+    </div>
+  </div>
+
+  <!-- Specs Banner -->
+  <div class="specs-banner fade-in" style="margin-top:16px">
+    <div class="spec-card min-spec">
+      <div class="spec-title">⚡ Minimum Specs Needed <span style="font-size:10px;font-weight:400;color:var(--text-muted)">Peak Usage + 20% Margin</span></div>
+      <div class="spec-items">
+        <div class="spec-item"><label>CPU</label><span id="minSpecCPU">— vCPU</span></div>
+        <div class="spec-item"><label>RAM</label><span id="minSpecRAM">— GB</span></div>
+        <div class="spec-item"><label>Disk Size</label><span id="minSpecDisk">— GB</span></div>
+        <div class="spec-item"><label>Disk IOPS</label><span id="minSpecIOPS">— IOPS</span></div>
+        <div class="spec-item"><label>Network BW</label><span id="minSpecNet">— MB/s</span></div>
+      </div>
+    </div>
+    <div class="spec-card rec-spec">
+      <div class="spec-title">🚀 Recommended Specs Needed <span style="font-size:10px;font-weight:400;color:var(--text-muted)">100% Growth Headroom</span></div>
+      <div class="spec-items">
+        <div class="spec-item"><label>CPU</label><span id="recSpecCPU">— vCPU</span></div>
+        <div class="spec-item"><label>RAM</label><span id="recSpecRAM">— GB</span></div>
+        <div class="spec-item"><label>Disk Size</label><span id="recSpecDisk">— GB</span></div>
+        <div class="spec-item"><label>Disk IOPS</label><span id="recSpecIOPS">— IOPS</span></div>
+        <div class="spec-item"><label>Network BW</label><span id="recSpecNet">— MB/s</span></div>
+      </div>
+    </div>
   </div>
 
   <!-- Charts Grid -->
@@ -436,11 +501,31 @@
       <div class="chart-header">
         <div class="chart-title">
           <span class="chart-title-dot" style="background:var(--accent-orange)"></span>
-          Network I/O
+          Network Bandwidth
         </div>
         <span class="chart-badge badge-orange" id="netChartBadge">— MB/s</span>
       </div>
       <div class="chart-wrap"><canvas id="netChart"></canvas></div>
+    </div>
+    <div class="chart-card fade-in delay-4">
+      <div class="chart-header">
+        <div class="chart-title">
+          <span class="chart-title-dot" style="background:var(--accent-blue)"></span>
+          Disk IOPS
+        </div>
+        <span class="chart-badge badge-blue" id="iopsChartBadge">— IOPS</span>
+      </div>
+      <div class="chart-wrap"><canvas id="iopsChart"></canvas></div>
+    </div>
+    <div class="chart-card fade-in delay-5">
+      <div class="chart-header">
+        <div class="chart-title">
+          <span class="chart-title-dot" style="background:var(--accent-purple)"></span>
+          Concurrent Users
+        </div>
+        <span class="chart-badge badge-purple" id="usersChartBadge">— Users</span>
+      </div>
+      <div class="chart-wrap"><canvas id="usersChart"></canvas></div>
     </div>
   </div>
 
@@ -586,10 +671,12 @@ function makeNetChart() {
 }
 
 // ── Initialize charts ──
-const cpuChart  = makeChart('cpuChart',  COLORS.blue,   'CPU %',     '%');
-const memChart  = makeChart('memChart',  COLORS.purple, 'Mem %',     '%');
-const diskChart = makeChart('diskChart', COLORS.green,  'Free GB',   ' GB');
-const netChart  = makeNetChart();
+const cpuChart   = makeChart('cpuChart',   COLORS.blue,   'CPU %',     '%');
+const memChart   = makeChart('memChart',   COLORS.purple, 'Mem %',     '%');
+const diskChart  = makeChart('diskChart',  COLORS.green,  'Free GB',   ' GB');
+const netChart   = makeNetChart();
+const iopsChart  = makeChart('iopsChart',  COLORS.blue,   'IOPS',      ' IOPS');
+const usersChart = makeChart('usersChart', COLORS.purple, 'Users',     '');
 
 let currentRange = '24h';
 
@@ -616,7 +703,6 @@ function fmtBytes(bytes) {
   return (bytes/1024/1024/1024).toFixed(1) + ' GB';
 }
 
-// Compute delta MB/s between consecutive net samples
 function computeNetDeltas(data) {
   const sentMB = [], recvMB = [];
   for (let i = 0; i < data.length; i++) {
@@ -636,7 +722,6 @@ function updateChart(chart, labels, data) {
 
 async function fetchData() {
   try {
-    // Fetch metrics
     const mResp = await fetch(`/api/metrics?range=${currentRange}`);
     if (!mResp.ok) throw new Error('metrics fetch failed');
     const mJson = await mResp.json();
@@ -651,12 +736,10 @@ async function fetchData() {
     const labels = data.map(d => fmtTime(d.ts));
     const latest = data[data.length - 1];
 
-    // Calculate absolute consumption
     const vCPUsUsed = (latest.cpu_pct / 100) * (latest.cpu_cores || 1);
     const memUsedGB = (latest.mem_pct / 100) * (latest.mem_total_gb || 1);
     const diskUsedGB = (latest.disk_total_gb || 1) - latest.disk_free_gb;
 
-    // Calculate total network consumption across the selected range
     let totalNetSent = 0;
     let totalNetRecv = 0;
     for (let i = 1; i < data.length; i++) {
@@ -674,7 +757,7 @@ async function fetchData() {
         }
     }
 
-    // Update KPIs
+    // Update main KPIs
     document.getElementById('cpuVal').textContent  = vCPUsUsed.toFixed(2) + ' vCPU';
     document.getElementById('cpuSub').textContent  = `of ${latest.cpu_cores || 1} Cores (${latest.cpu_pct.toFixed(1)}%)`;
     document.getElementById('cpuBar').style.width  = Math.min(latest.cpu_pct, 100) + '%';
@@ -688,23 +771,41 @@ async function fetchData() {
     document.getElementById('diskBar').style.width = Math.min((diskUsedGB / (latest.disk_total_gb || 1)) * 100, 100) + '%';
 
     document.getElementById('netVal').textContent  = fmtBytes(totalNetSent + totalNetRecv);
-    document.getElementById('netSub').textContent  = `Total I/O in ${currentRange} (up + down)`;
+    document.getElementById('netSub').textContent  = `Total I/O in ${currentRange}`;
 
-    // Compute aggregations for Average and Peak
+    document.getElementById('iopsVal').textContent = (latest.disk_iops || 0).toFixed(1);
+    document.getElementById('usersVal').textContent = latest.concurrent_users || 0;
+
+    // Aggregations
     let sumCPU = 0, peakCPU = 0;
     let sumMem = 0, peakMem = 0;
     let minDisk = Infinity;
-    
+    let sumIOPS = 0, peakIOPS = 0, minIOPS = Infinity;
+    let sumUsers = 0, maxUsers = 0, minUsers = Infinity;
+
     data.forEach(d => {
       sumCPU += d.cpu_pct;
       sumMem += d.mem_pct;
+      const iops = d.disk_iops || 0;
+      const users = d.concurrent_users || 0;
+      sumIOPS += iops;
+      sumUsers += users;
+
       if (d.cpu_pct > peakCPU) peakCPU = d.cpu_pct;
       if (d.mem_pct > peakMem) peakMem = d.mem_pct;
       if (d.disk_free_gb < minDisk) minDisk = d.disk_free_gb;
+
+      if (iops > peakIOPS) peakIOPS = iops;
+      if (iops < minIOPS) minIOPS = iops;
+
+      if (users > maxUsers) maxUsers = users;
+      if (users < minUsers) minUsers = users;
     });
 
     const avgCPU = sumCPU / data.length;
     const avgMem = sumMem / data.length;
+    const avgIOPS = sumIOPS / data.length;
+    const avgUsers = sumUsers / data.length;
 
     document.getElementById('cpuAvg').textContent = `Avg: ${avgCPU.toFixed(1)}%`;
     document.getElementById('cpuPeak').textContent = `Peak: ${peakCPU.toFixed(1)}%`;
@@ -714,39 +815,80 @@ async function fetchData() {
 
     document.getElementById('diskAvg').textContent = `Min Free: ${minDisk === Infinity ? '0' : minDisk.toFixed(1)} GB`;
 
-    // Update chart badges
+    document.getElementById('iopsAvg').textContent = `Avg: ${avgIOPS.toFixed(1)}`;
+    document.getElementById('iopsPeak').textContent = `Peak: ${peakIOPS.toFixed(1)}`;
+
+    document.getElementById('usersAvg').textContent = `Avg: ${avgUsers.toFixed(1)}`;
+    document.getElementById('usersMax').textContent = `Max: ${maxUsers}`;
+
+    // Specs calculation
+    const peakCPUvCPU = (peakCPU / 100) * (latest.cpu_cores || 1);
+    const peakMemGB = (peakMem / 100) * (latest.mem_total_gb || 1);
+    const peakUsedDisk = (latest.disk_total_gb || 1) - (minDisk === Infinity ? 0 : minDisk);
+
+    const { sentMB, recvMB } = computeNetDeltas(data);
+    let peakNetMB = 0;
+    for (let i = 0; i < sentMB.length; i++) {
+      const totalRate = sentMB[i] + recvMB[i];
+      if (totalRate > peakNetMB) peakNetMB = totalRate;
+    }
+
+    // Minimum Requirements (Peak + 20%)
+    const minCPU = Math.max(1, Math.ceil(peakCPUvCPU * 1.2));
+    const minRAM = Math.max(0.25, (peakMemGB * 1.2)).toFixed(2);
+    const minDisk = Math.max(10, (peakUsedDisk * 1.2)).toFixed(1);
+    const minIOPS = Math.max(100, Math.ceil(peakIOPS * 1.2));
+    const minNet = Math.max(1.0, (peakNetMB * 1.2)).toFixed(2);
+
+    // Recommended Requirements (Peak * 2)
+    const recCPU = Math.max(2, minCPU + 1);
+    const recRAM = Math.max(0.5, (peakMemGB * 2.0)).toFixed(2);
+    const recDisk = Math.max(20, (peakUsedDisk * 2.0)).toFixed(1);
+    const recIOPS = Math.max(300, Math.ceil(peakIOPS * 2.0));
+    const recNet = Math.max(5.0, (peakNetMB * 2.0)).toFixed(2);
+
+    document.getElementById('minSpecCPU').textContent = minCPU + ' vCPU';
+    document.getElementById('minSpecRAM').textContent = minRAM + ' GB';
+    document.getElementById('minSpecDisk').textContent = minDisk + ' GB';
+    document.getElementById('minSpecIOPS').textContent = minIOPS + ' IOPS';
+    document.getElementById('minSpecNet').textContent = minNet + ' MB/s';
+
+    document.getElementById('recSpecCPU').textContent = recCPU + ' vCPU';
+    document.getElementById('recSpecRAM').textContent = recRAM + ' GB';
+    document.getElementById('recSpecDisk').textContent = recDisk + ' GB';
+    document.getElementById('recSpecIOPS').textContent = recIOPS + ' IOPS';
+    document.getElementById('recSpecNet').textContent = recNet + ' MB/s';
+
+    // Chart Badges
     document.getElementById('cpuChartBadge').textContent  = vCPUsUsed.toFixed(2) + ' vCPU';
     document.getElementById('memChartBadge').textContent  = memUsedGB.toFixed(1) + ' GB';
     document.getElementById('diskChartBadge').textContent = latest.disk_free_gb.toFixed(1) + ' GB Free';
+    document.getElementById('iopsChartBadge').textContent = (latest.disk_iops || 0).toFixed(1) + ' IOPS';
+    document.getElementById('usersChartBadge').textContent = (latest.concurrent_users || 0) + ' Users';
 
-    // Update charts
-    updateChart(cpuChart,  labels, data.map(d => d.cpu_pct));
-    updateChart(memChart,  labels, data.map(d => d.mem_pct));
-    updateChart(diskChart, labels, data.map(d => d.disk_free_gb));
+    // Charts update
+    updateChart(cpuChart,   labels, data.map(d => d.cpu_pct));
+    updateChart(memChart,   labels, data.map(d => d.mem_pct));
+    updateChart(diskChart,  labels, data.map(d => d.disk_free_gb));
+    updateChart(iopsChart,  labels, data.map(d => d.disk_iops || 0));
+    updateChart(usersChart, labels, data.map(d => d.concurrent_users || 0));
 
-    const { sentMB, recvMB } = computeNetDeltas(data);
     netChart.data.labels = labels;
     netChart.data.datasets[0].data = sentMB;
     netChart.data.datasets[1].data = recvMB;
     netChart.update('active');
-    const maxMB = Math.max(...sentMB, ...recvMB);
-    document.getElementById('netChartBadge').textContent = maxMB.toFixed(2) + ' MB/s pk';
 
     let sumNet = 0;
-    for (let i = 0; i < sentMB.length; i++) {
-        sumNet += sentMB[i] + recvMB[i];
-    }
+    for (let i = 0; i < sentMB.length; i++) sumNet += sentMB[i] + recvMB[i];
     const avgNet = sentMB.length > 0 ? (sumNet / sentMB.length) : 0;
     document.getElementById('netAvg').textContent = `Avg: ${avgNet.toFixed(2)} MB/s`;
-    document.getElementById('netPeak').textContent = `Peak: ${maxMB.toFixed(2)} MB/s`;
+    document.getElementById('netPeak').textContent = `Peak: ${peakNetMB.toFixed(2)} MB/s`;
 
-    // Status
     document.getElementById('statusLabel').textContent = 'Live';
     document.getElementById('statusDot').style.background = 'var(--accent-green)';
     document.getElementById('lastUpdated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
     document.getElementById('footerStats').textContent = `${data.length} metric rows · range: ${currentRange}`;
 
-    // Fetch processes
     const pResp = await fetch(`/api/processes?range=${currentRange}`);
     if (pResp.ok) {
       const pJson = await pResp.json();
@@ -761,7 +903,7 @@ async function fetchData() {
 }
 
 function showNoData() {
-  ['cpuVal','memVal','diskVal','netVal'].forEach(id => {
+  ['cpuVal','memVal','diskVal','netVal','iopsVal','usersVal'].forEach(id => {
     document.getElementById(id).textContent = '—';
   });
   document.getElementById('procContainer').innerHTML =
@@ -776,7 +918,6 @@ function renderProcesses(procs) {
     return;
   }
 
-  // Aggregate by name: take latest CPU + mem
   const byName = {};
   procs.forEach(p => {
     if (!byName[p.name] || p.ts > byName[p.name].ts) byName[p.name] = p;
@@ -808,7 +949,6 @@ function renderProcesses(procs) {
   document.getElementById('procContainer').innerHTML = html;
 }
 
-// ── Auto-refresh every 15s ──
 fetchData();
 setInterval(fetchData, 15000);
 </script>

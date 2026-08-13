@@ -3,6 +3,8 @@ sysmon
 sysmon.exe
 sysmon_linux
 sysmon_windows.exe
+wmonitor.exe
+wmonitor_linux
 *.db
 
 # Graphify

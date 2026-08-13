@@ -40,6 +40,7 @@ func TestRetentionPurgeAndDownsample(t *testing.T) {
 		db.InsertMetric(storage.MetricRow{
 			Timestamp: ts, CPUPct: float64(20 + i), MemPct: 50, DiskFreeGB: 90,
 			NetSentBytes: 500, NetRecvBytes: 1500,
+			DiskIOPS: float64(100 + i*10), NetMBps: float64(1.0 + float64(i)*0.1), ConcurrentUsers: 2 + i%3,
 		})
 	}
 
@@ -49,6 +50,7 @@ func TestRetentionPurgeAndDownsample(t *testing.T) {
 		db.InsertMetric(storage.MetricRow{
 			Timestamp: ts, CPUPct: 55, MemPct: 60, DiskFreeGB: 80,
 			NetSentBytes: 9000, NetRecvBytes: 8000,
+			DiskIOPS: 250, NetMBps: 3.5, ConcurrentUsers: 10,
 		})
 	}
 
@@ -76,7 +78,7 @@ func TestRetentionPurgeAndDownsample(t *testing.T) {
 		t.Errorf("expected 4 rows after retention, got %d", afterCount)
 	}
 
-	// Verify the averaged row has a plausible CPU value (average of 20..31 ≈ 25.5)
+	// Verify the averaged row has a plausible CPU, DiskIOPS, NetMBps, and ConcurrentUsers value
 	rows, err := db.QueryMetrics(time.Unix(0, 0))
 	if err != nil {
 		t.Fatalf("QueryMetrics: %v", err)
@@ -89,7 +91,13 @@ func TestRetentionPurgeAndDownsample(t *testing.T) {
 			if r.CPUPct < 20 || r.CPUPct > 32 {
 				t.Errorf("averaged CPUPct out of range: %v", r.CPUPct)
 			}
-			t.Logf("Averaged row: ts=%v cpu=%.2f", r.Timestamp, r.CPUPct)
+			if r.DiskIOPS < 100 || r.DiskIOPS > 220 {
+				t.Errorf("averaged DiskIOPS out of range: %v", r.DiskIOPS)
+			}
+			if r.ConcurrentUsers < 1 || r.ConcurrentUsers > 5 {
+				t.Errorf("averaged ConcurrentUsers out of range: %v", r.ConcurrentUsers)
+			}
+			t.Logf("Averaged row: ts=%v cpu=%.2f iops=%.1f users=%d", r.Timestamp, r.CPUPct, r.DiskIOPS, r.ConcurrentUsers)
 		}
 	}
 	if !foundAvg {

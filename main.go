@@ -135,6 +135,7 @@ func main() {
 	col := collector.New(db)
 	ret := retention.New(db.Conn())
 	srv := server.New(db, *flagPort)
+	col.SetUserTracker(srv)
 
 	if err := dashboard.Register(srv); err != nil {
 		log.Fatalf("dashboard register: %v", err)
