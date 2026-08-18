@@ -72,6 +72,15 @@ var (
 	// Phase 12 — assessment report
 	flagAssessmentReport = flag.String("assessment-report", "", "Generate HTML assessment report to this path and exit")
 	flagSince            = flag.Duration("since", 30*24*time.Hour, "Time window for assessment/export reports (default 30d)")
+
+	// Key recovery
+	flagShowKey = flag.Bool("show-key", false, "Print the baked-in API key and exit")
+)
+
+// Build-time variables injected via -ldflags (e.g. for pre-configured client binaries)
+var (
+	defaultHubURL string
+	defaultAPIKey string
 )
 
 // ── Service program ──
@@ -137,10 +146,22 @@ func main() {
 	flag.Parse()
 	loadConfigEnv()
 
-	// Apply config.env fallbacks if flags were not explicitly provided
+	if *flagShowKey {
+		key := resolveAPIKey()
+		if key == "" {
+			fmt.Println("No API key configured or baked into this binary.")
+		} else {
+			fmt.Printf("Your W-Monitor API Key: %s\n", key)
+		}
+		return
+	}
+
+	// Apply config.env or build-time defaults if flags were not explicitly provided
 	if *flagAgentHub == "" {
 		if hub := os.Getenv("WMONITOR_AGENT_HUB"); hub != "" {
 			*flagAgentHub = hub
+		} else if defaultHubURL != "" {
+			*flagAgentHub = defaultHubURL
 		}
 	}
 	if *flagDB == "sqlite" {
@@ -453,12 +474,15 @@ func logSafeDSN(dsn string) {
 	log.Printf("[wmonitor] DB backend: postgres @ %s%s", u.Hostname(), u.Path)
 }
 
-// resolveAPIKey reads API key from -api-key flag or WMONITOR_API_KEY env var.
+// resolveAPIKey reads API key from -api-key flag, WMONITOR_API_KEY env var, or build-time default.
 func resolveAPIKey() string {
 	if *flagAPIKey != "" {
 		return *flagAPIKey
 	}
-	return os.Getenv("WMONITOR_API_KEY")
+	if v := os.Getenv("WMONITOR_API_KEY"); v != "" {
+		return v
+	}
+	return defaultAPIKey
 }
 
 // runAgentMode starts the collector in agent mode — no local DB, no dashboard.

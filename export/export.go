@@ -53,8 +53,9 @@ type Summary struct {
 }
 
 // WriteCSV writes a CSV summary of metrics with a header block to the provided writer.
-func WriteCSV(w io.Writer, db storage.Store, since time.Time) (int, error) {
-	rows, err := db.QueryMetrics(since)
+// Pass tenantID="" to include all tenants (admin/CLI use); non-empty filters to one tenant.
+func WriteCSV(w io.Writer, db storage.Store, since time.Time, tenantID string) (int, error) {
+	rows, err := db.QueryMetrics(since, tenantID)
 	if err != nil {
 		return 0, fmt.Errorf("query metrics: %w", err)
 	}
@@ -134,7 +135,7 @@ func CSVReport(db storage.Store, since time.Time, outPath string) (int, error) {
 	}
 	defer f.Close()
 
-	return WriteCSV(f, db, since)
+	return WriteCSV(f, db, since, "")
 }
 
 // ComputeSummary calculates aggregate stats from metric rows.
@@ -277,7 +278,7 @@ func ComputeSummary(rows []storage.MetricRow, period string) Summary {
 
 // TextReport writes a human-readable plain-text summary report.
 func TextReport(db storage.Store, since time.Time, outPath string) (Summary, error) {
-	rows, err := db.QueryMetrics(since)
+	rows, err := db.QueryMetrics(since, "")
 	if err != nil {
 		return Summary{}, fmt.Errorf("query metrics: %w", err)
 	}

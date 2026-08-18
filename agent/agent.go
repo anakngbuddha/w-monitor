@@ -49,12 +49,12 @@ func (a *Agent) InsertProcess(p storage.ProcessRow) error {
 }
 
 // QueryMetrics is not supported in agent mode — agents are write-only.
-func (a *Agent) QueryMetrics(since time.Time) ([]storage.MetricRow, error) {
+func (a *Agent) QueryMetrics(since time.Time, tenantID string) ([]storage.MetricRow, error) {
 	return nil, fmt.Errorf("agent: QueryMetrics not supported in agent mode")
 }
 
 // QueryProcesses is not supported in agent mode.
-func (a *Agent) QueryProcesses(since time.Time) ([]storage.ProcessRow, error) {
+func (a *Agent) QueryProcesses(since time.Time, tenantID string) ([]storage.ProcessRow, error) {
 	return nil, fmt.Errorf("agent: QueryProcesses not supported in agent mode")
 }
 
@@ -69,7 +69,7 @@ func (a *Agent) CountProcesses() (int, error) {
 }
 
 // QueryServers is not supported in agent mode.
-func (a *Agent) QueryServers() ([]string, error) {
+func (a *Agent) QueryServers(tenantID string) ([]string, error) {
 	return nil, fmt.Errorf("agent: QueryServers not supported in agent mode")
 }
 

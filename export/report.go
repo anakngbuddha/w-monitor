@@ -22,7 +22,7 @@ type AssessmentReport struct {
 // GenerateAssessmentReport aggregates data over the period and writes an HTML report to outPath.
 // This is the primary deliverable for a cloud migration/sizing proposal.
 func GenerateAssessmentReport(db storage.Store, start, end time.Time, outPath string) error {
-	rows, err := db.QueryMetrics(start)
+	rows, err := db.QueryMetrics(start, "")
 	if err != nil {
 		return fmt.Errorf("query metrics: %w", err)
 	}

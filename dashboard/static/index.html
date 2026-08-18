@@ -377,24 +377,162 @@
       flex-wrap: wrap;
       gap: 8px;
     }
-    .footer-text { font-size: 12px; color: var(--text-muted); }
-    .footer-mono { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-muted); }
-
-    /* Fade-in animation */
-    @keyframes fadeInUp {
-      from { opacity: 0; transform: translateY(12px); }
-      to   { opacity: 1; transform: translateY(0); }
+    /* Login Modal & Tenant Header */
+    .auth-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.85);
+      backdrop-filter: blur(8px);
+      z-index: 9999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
     }
-    .fade-in { animation: fadeInUp 0.4s ease both; }
-    .delay-1 { animation-delay: 0.05s; }
-    .delay-2 { animation-delay: 0.10s; }
-    .delay-3 { animation-delay: 0.15s; }
-    .delay-4 { animation-delay: 0.20s; }
-    .delay-5 { animation-delay: 0.25s; }
-    .delay-6 { animation-delay: 0.30s; }
+    .auth-card {
+      background: #0d0d0d;
+      border: 1px solid var(--border-glow);
+      border-radius: var(--radius);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.8);
+      max-width: 460px;
+      width: 100%;
+      padding: 32px;
+      animation: fadeInUp 0.3s ease;
+    }
+    .auth-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .auth-desc {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-bottom: 20px;
+      line-height: 1.5;
+    }
+    .auth-input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .auth-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .auth-input {
+      background: #141414;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      padding: 10px 14px;
+      font-size: 14px;
+      font-family: 'JetBrains Mono', monospace;
+      outline: none;
+      transition: var(--transition);
+    }
+    .auth-input:focus {
+      border-color: var(--accent-blue);
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+    }
+    .btn-login {
+      width: 100%;
+      background: var(--text-primary);
+      color: #000;
+      border: none;
+      border-radius: var(--radius-sm);
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: var(--transition);
+      margin-top: 4px;
+    }
+    .btn-login:hover {
+      background: #ffffff;
+      transform: translateY(-1px);
+    }
+    .auth-recovery {
+      margin-top: 20px;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px dashed var(--border);
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+    .auth-recovery code {
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--accent-orange);
+      background: rgba(245, 158, 11, 0.1);
+      padding: 2px 4px;
+      border-radius: 3px;
+    }
+    .auth-error {
+      color: var(--accent-red);
+      font-size: 12px;
+      margin-top: 8px;
+      display: none;
+    }
+    .tenant-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(59, 130, 246, 0.1);
+      border: 1px solid rgba(59, 130, 246, 0.25);
+      border-radius: var(--radius-sm);
+      padding: 4px 10px;
+      font-size: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--accent-blue);
+    }
+    .btn-logout {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: var(--radius-sm);
+      padding: 4px 8px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: var(--transition);
+    }
+    .btn-logout:hover {
+      color: var(--text-primary);
+      border-color: var(--border-glow);
+      background: var(--bg-hover);
+    }
   </style>
 </head>
 <body>
+<!-- Login Overlay -->
+<div id="authModal" class="auth-overlay" style="display:none;">
+  <div class="auth-card">
+    <div class="auth-title">
+      <span>🔐</span> W-Monitor Client Access
+    </div>
+    <div class="auth-desc">
+      Enter the API key associated with your monitoring agents to view your servers.
+    </div>
+    <div class="auth-input-group">
+      <label class="auth-label" for="apiKeyInput">API Key</label>
+      <input type="password" id="apiKeyInput" class="auth-input" placeholder="Paste your API key here..." autocomplete="off" />
+      <div id="authErrorMsg" class="auth-error">Invalid API key. Please check and try again.</div>
+    </div>
+    <button class="btn-login" onclick="submitAuthKey()">Access Dashboard</button>
+    <div class="auth-recovery">
+      💡 <strong>Lost your key?</strong><br/>
+      Run <code>wmonitor.exe -show-key</code> on any of your monitored servers to retrieve your API key.
+    </div>
+  </div>
+</div>
+
 <div class="container">
   <!-- Header -->
   <header>
@@ -402,10 +540,15 @@
       <div class="logo-icon">W</div>
       <div class="logo-text">
         <h1>W-Monitor</h1>
-        <span>System Monitor</span>
+        <span>Multi-Tenant System Monitor</span>
       </div>
     </div>
     <div class="header-controls">
+      <div class="tenant-badge" id="tenantBadge" style="display:none;">
+        <span>Tenant:</span>
+        <span id="tenantKeyPreview">—</span>
+        <button class="btn-logout" onclick="logoutApiKey()" title="Switch API Key / Logout">Switch Key</button>
+      </div>
       <select id="serverSelect" class="server-select" onchange="onServerChange()" title="Filter by server">
         <option value="">All Servers</option>
       </select>
@@ -707,9 +850,96 @@ const usersChart = makeChart('usersChart', COLORS.purple, 'Users',     '');
 let currentRange = '24h';
 let currentServer = '';
 
+// ── Auth & API Key Management ──
+const API_KEY_STORAGE = 'wmonitor_api_key';
+
+function getApiKey() {
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.has('api_key')) {
+    const key = urlParams.get('api_key');
+    localStorage.setItem(API_KEY_STORAGE, key);
+    return key;
+  }
+  return localStorage.getItem(API_KEY_STORAGE) || '';
+}
+
+function showAuthModal(errMsg) {
+  document.getElementById('authModal').style.display = 'flex';
+  const errEl = document.getElementById('authErrorMsg');
+  if (errMsg) {
+    errEl.textContent = errMsg;
+    errEl.style.display = 'block';
+  } else {
+    errEl.style.display = 'none';
+  }
+  document.getElementById('apiKeyInput').focus();
+}
+
+function hideAuthModal() {
+  document.getElementById('authModal').style.display = 'none';
+  updateTenantBadge();
+}
+
+function updateTenantBadge() {
+  const key = getApiKey();
+  const badge = document.getElementById('tenantBadge');
+  const preview = document.getElementById('tenantKeyPreview');
+  if (key && key.length > 8) {
+    badge.style.display = 'flex';
+    preview.textContent = key.substring(0, 6) + '…' + key.substring(key.length - 4);
+  } else if (key) {
+    badge.style.display = 'flex';
+    preview.textContent = key;
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+function submitAuthKey() {
+  const input = document.getElementById('apiKeyInput');
+  const key = (input.value || '').trim();
+  if (!key) {
+    const errEl = document.getElementById('authErrorMsg');
+    errEl.textContent = 'Please enter a valid API key.';
+    errEl.style.display = 'block';
+    return;
+  }
+  localStorage.setItem(API_KEY_STORAGE, key);
+  hideAuthModal();
+  fetchData();
+}
+
+document.getElementById('apiKeyInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') submitAuthKey();
+});
+
+function logoutApiKey() {
+  localStorage.removeItem(API_KEY_STORAGE);
+  updateTenantBadge();
+  document.getElementById('apiKeyInput').value = '';
+  showAuthModal();
+}
+
+async function authFetch(url, options = {}) {
+  const key = getApiKey();
+  const opts = { ...options };
+  opts.headers = { ...opts.headers };
+  if (key) {
+    opts.headers['X-API-Key'] = key;
+  }
+  const resp = await fetch(url, opts);
+  if (resp.status === 401) {
+    showAuthModal('Unauthorized: Check your API key.');
+    throw new Error('Unauthorized');
+  }
+  return resp;
+}
+
 function exportCSV() {
+  const key = getApiKey();
   let url = `/api/export/csv?range=${currentRange}`;
   if (currentServer) url += `&server_id=${encodeURIComponent(currentServer)}`;
+  if (key) url += `&api_key=${encodeURIComponent(key)}`;
   window.open(url, '_blank');
 }
 
@@ -727,7 +957,7 @@ function onServerChange() {
 
 async function fetchServers() {
   try {
-    const resp = await fetch('/api/servers');
+    const resp = await authFetch('/api/servers');
     if (!resp.ok) return;
     const json = await resp.json();
     const servers = json.servers || [];
@@ -779,10 +1009,11 @@ function updateChart(chart, labels, data) {
 
 async function fetchData() {
   try {
+    updateTenantBadge();
     fetchServers();
     let url = `/api/metrics?range=${currentRange}`;
     if (currentServer) url += `&server_id=${encodeURIComponent(currentServer)}`;
-    const mResp = await fetch(url);
+    const mResp = await authFetch(url);
     if (!mResp.ok) throw new Error('metrics fetch failed');
     const mJson = await mResp.json();
     const data = mJson.data || [];
@@ -949,7 +1180,7 @@ async function fetchData() {
     document.getElementById('lastUpdated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
     let pUrl = `/api/processes?range=${currentRange}`;
     if (currentServer) pUrl += `&server_id=${encodeURIComponent(currentServer)}`;
-    const pResp = await fetch(pUrl);
+    const pResp = await authFetch(pUrl);
     if (pResp.ok) {
       const pJson = await pResp.json();
       renderProcesses(pJson.data || []);

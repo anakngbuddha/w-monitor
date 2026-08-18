@@ -2,13 +2,11 @@
 package server
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -23,9 +21,8 @@ type Server struct {
 	mux         *http.ServeMux
 	mu          sync.Mutex
 	activeUsers map[string]time.Time
-	// Hub mode
+	// Hub mode — when true, /api/ingest is enabled and API key acts as tenant ID
 	hubMode bool
-	apiKey  string
 }
 
 // New creates a Server bound to the given port (e.g. "8080").
@@ -40,16 +37,13 @@ func New(db storage.Store, port string) *Server {
 	return s
 }
 
-// EnableHubMode enables the /api/ingest endpoint with API key authentication.
-// apiKey is read from the WMONITOR_API_KEY env var if empty.
-func (s *Server) EnableHubMode(apiKey string) {
-	if apiKey == "" {
-		apiKey = os.Getenv("WMONITOR_API_KEY")
-	}
+// EnableHubMode enables the /api/ingest endpoint.
+// In hub mode the X-API-Key header serves as both authentication and tenant isolation.
+// Any non-empty key is accepted; each key's data is stored and queried separately.
+func (s *Server) EnableHubMode(_ string) {
 	s.hubMode = true
-	s.apiKey = apiKey
 	s.mux.HandleFunc("/api/ingest", s.handleIngest)
-	log.Println("[server] hub mode enabled — POST /api/ingest accepting agent data")
+	log.Println("[server] hub mode enabled — POST /api/ingest accepting agent data (key = tenant ID)")
 }
 
 // routes registers all HTTP handlers.
@@ -158,7 +152,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	since := time.Now().Add(-parseRange(rangeParam))
 
-	rows, err := s.db.QueryMetrics(since)
+	// In hub mode, filter by the tenant's API key so clients only see their own data.
+	tenantID := ""
+	if s.hubMode {
+		tenantID = r.Header.Get("X-API-Key")
+		if tenantID == "" {
+			tenantID = r.URL.Query().Get("api_key")
+		}
+		if tenantID == "" {
+			http.Error(w, `{"error":"X-API-Key header or api_key query param required"}`, http.StatusUnauthorized)
+			return
+		}
+	}
+
+	rows, err := s.db.QueryMetrics(since, tenantID)
 	if err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		log.Printf("[server] QueryMetrics error: %v", err)
@@ -226,7 +233,20 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 	}
 	since := time.Now().Add(-parseRange(rangeParam))
 
-	rows, err := s.db.QueryProcesses(since)
+	// In hub mode, filter by tenant
+	tenantID := ""
+	if s.hubMode {
+		tenantID = r.Header.Get("X-API-Key")
+		if tenantID == "" {
+			tenantID = r.URL.Query().Get("api_key")
+		}
+		if tenantID == "" {
+			http.Error(w, `{"error":"X-API-Key header or api_key query param required"}`, http.StatusUnauthorized)
+			return
+		}
+	}
+
+	rows, err := s.db.QueryProcesses(since, tenantID)
 	if err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
@@ -274,10 +294,23 @@ func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 	since := time.Now().Add(-parseRange(rangeParam))
 
+	// In hub mode, scope export to the requesting tenant's data
+	tenantID := ""
+	if s.hubMode {
+		tenantID = r.Header.Get("X-API-Key")
+		if tenantID == "" {
+			tenantID = r.URL.Query().Get("api_key")
+		}
+		if tenantID == "" {
+			http.Error(w, `{"error":"X-API-Key header or api_key query param required"}`, http.StatusUnauthorized)
+			return
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="wmonitor_export_%s.csv"`, time.Now().Format("20060102_150405")))
 
-	_, err := export.WriteCSV(w, s.db, since)
+	_, err := export.WriteCSV(w, s.db, since, tenantID)
 	if err != nil {
 		log.Printf("[server] CSV export error: %v", err)
 	}
@@ -285,7 +318,19 @@ func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 
 // handleServers returns distinct server_id values seen in the DB (Phase 7).
 func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
-	servers, err := s.db.QueryServers()
+	// In hub mode, filter by tenant so clients only see their own servers.
+	tenantID := ""
+	if s.hubMode {
+		tenantID = r.Header.Get("X-API-Key")
+		if tenantID == "" {
+			tenantID = r.URL.Query().Get("api_key")
+		}
+		if tenantID == "" {
+			http.Error(w, `{"error":"X-API-Key header or api_key query param required"}`, http.StatusUnauthorized)
+			return
+		}
+	}
+	servers, err := s.db.QueryServers(tenantID)
 	if err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		log.Printf("[server] QueryServers error: %v", err)
@@ -299,19 +344,20 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"servers": servers})
 }
 
-// handleIngest accepts JSON metric/process payloads from agents (Phase 6 — Hub mode).
-// Requires X-API-Key header matching the configured API key.
+// handleIngest accepts JSON metric/process payloads from agents (hub mode).
+// The X-API-Key header serves as both authentication and tenant identifier.
+// Any non-empty key is accepted — each unique key is its own isolated tenant.
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Constant-time API key comparison to prevent timing attacks
-	provided := r.Header.Get("X-API-Key")
-	if subtle.ConstantTimeCompare([]byte(provided), []byte(s.apiKey)) != 1 {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-		log.Printf("[server] ingest: unauthorized attempt from %s", r.RemoteAddr)
+	// API key = tenant identifier. Reject empty keys.
+	tenantID := r.Header.Get("X-API-Key")
+	if tenantID == "" {
+		http.Error(w, `{"error":"X-API-Key header required"}`, http.StatusUnauthorized)
+		log.Printf("[server] ingest: missing API key from %s", r.RemoteAddr)
 		return
 	}
 
@@ -325,6 +371,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 			return
 		}
+		m.TenantID = tenantID // tag with tenant before storing
 		if err := s.db.InsertMetric(m); err != nil {
 			http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 			log.Printf("[server] ingest metric error: %v", err)
@@ -336,6 +383,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 			return
 		}
+		p.TenantID = tenantID // tag with tenant before storing
 		if err := s.db.InsertProcess(p); err != nil {
 			http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 			log.Printf("[server] ingest process error: %v", err)

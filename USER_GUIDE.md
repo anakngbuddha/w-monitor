@@ -7,7 +7,10 @@ Welcome to **W-Monitor**, a lightweight, single-binary system monitoring and pre
 ## Table of Contents
 
 1. [Architectural Overview & Operating Modes](#architectural-overview--operating-modes)
-2. [Windows Guide](#windows-guide)
+2. [Choosing Which Database to Run (SQLite vs PostgreSQL vs Agent Zero-DB)](#choosing-which-database-to-run)
+3. [Where to Get the API Key for Client Agents](#where-to-get-the-api-key-for-client-agents)
+4. [Running for a Limited Time Only (e.g. 1h, 24h, 7d)](#running-for-a-limited-time-only-eg-1-hour-24-hours-7-days)
+5. [Windows Guide](#windows-guide)
    - [Step 1: Downloading & Obtaining the Binary](#windows-step-1-downloading--obtaining-the-binary)
    - [Step 2: Installation as a Client Agent (Multi-Server Assessment)](#windows-step-2-installation-as-a-client-agent)
    - [Step 3: Installation as a Standalone Local Monitor](#windows-step-3-installation-as-a-standalone-local-monitor)
@@ -15,7 +18,7 @@ Welcome to **W-Monitor**, a lightweight, single-binary system monitoring and pre
    - [Step 5: Managing the Windows Service](#windows-step-5-managing-the-windows-service)
    - [Step 6: Generating Reports & Data Exports](#windows-step-6-generating-reports--data-exports)
    - [Windows File Locations & Security](#windows-file-locations--security)
-3. [Linux Guide](#linux-guide)
+6. [Linux Guide](#linux-guide)
    - [Step 1: Downloading & Obtaining the Binary](#linux-step-1-downloading--obtaining-the-binary)
    - [Step 2: Installation as a Client Agent (Multi-Server Assessment)](#linux-step-2-installation-as-a-client-agent)
    - [Step 3: Installation as a Standalone Local Monitor](#linux-step-3-installation-as-a-standalone-local-monitor)
@@ -23,8 +26,8 @@ Welcome to **W-Monitor**, a lightweight, single-binary system monitoring and pre
    - [Step 5: Managing the Systemd Service](#linux-step-5-managing-the-systemd-service)
    - [Step 6: Generating Reports & Data Exports](#linux-step-6-generating-reports--data-exports)
    - [Linux File Locations & Security](#linux-file-locations--security)
-4. [Using the Web Dashboard](#using-the-web-dashboard)
-5. [Advanced Metrics & Sizing Recommendations](#advanced-metrics--sizing-recommendations)
+7. [Using the Web Dashboard](#using-the-web-dashboard)
+8. [Advanced Metrics & Sizing Recommendations](#advanced-metrics--sizing-recommendations)
 
 ---
 
@@ -32,16 +35,106 @@ Welcome to **W-Monitor**, a lightweight, single-binary system monitoring and pre
 
 W-Monitor operates in two main modes:
 
-1. **Client Agent Mode (Zero Credentials):**
+1. **Client Agent Mode (Zero Database Footprint):**
    - Ideal for target client servers during pre-migration assessments.
    - The agent machine **never receives or touches database passwords or cloud credentials**.
    - Collects system metrics every 10 seconds and securely pushes them over HTTPS/HTTP to the central Hub via `POST /api/ingest` with an `X-API-Key` header.
    - Zero local database footprint and no open dashboard port on client machines.
 
 2. **Standalone / Hub Mode:**
-   - Runs locally on a single machine or acts as a central aggregator for multiple client agents.
-   - Stores metrics in SQLite (default zero-config) or PostgreSQL (multi-server centralized).
-   - Serves the real-time web dashboard on port `8080` (customizable with `-port`).
+   - Runs locally on a single machine or acts as a central aggregator for multiple client agents (e.g., hosted on Render or your laptop).
+   - Stores metrics in **SQLite** (default zero-config) or **PostgreSQL** (multi-server centralized, e.g. Aiven.io).
+   - Serves the real-time web dashboard on port `8080` (customizable with `-port` or `$PORT`).
+
+---
+
+## Choosing Which Database to Run
+
+W-Monitor supports two database backends:
+
+| Backend | When to Use | How to Choose |
+|---|---|---|
+| **Local SQLite** *(Default)* | Single-server local monitoring or offline assessment on a client server | Just run `wmonitor` (or `wmonitor -db sqlite`). No setup required. Data is stored locally in `wmonitor.db`. |
+| **Aiven / PostgreSQL** | Centralized Hub mode collecting metrics from 10+ client servers | Run with `-db postgres` and provide the DSN via the `WMONITOR_DB_DSN` environment variable. |
+| **Client Agent** *(No DB)* | Target client servers pushing data to your Hub | Run with `-agent <hub-url> -api-key <key>`. **No local DB is created or needed on the client server.** |
+
+### 1. Running with Local SQLite (Zero-Config)
+```powershell
+# Windows:
+.\wmonitor.exe
+
+# Linux:
+./wmonitor_linux
+```
+
+### 2. Running with Aiven.io PostgreSQL (Central Hub)
+```powershell
+# Windows PowerShell:
+$env:WMONITOR_DB_DSN = "postgres://avnadmin:PASSWORD@pg-host:11914/defaultdb?sslmode=require"
+.\wmonitor.exe -hub -db postgres
+
+# Linux:
+export WMONITOR_DB_DSN="postgres://avnadmin:PASSWORD@pg-host:11914/defaultdb?sslmode=require"
+./wmonitor_linux -hub -db postgres
+```
+
+---
+
+## Where to Get the API Key for Client Agents
+
+The **API Key** is a shared secret token that protects your central Hub (`POST /api/ingest`) from unauthorized data submissions.
+
+### How it is Created:
+- **If Hosting on Render**:
+  - In your Render Dashboard under **Environment**, look for **`WMONITOR_API_KEY`**. Render generates a secure random key for you, or you can type any passphrase you choose (e.g., `client-cluster-key-2026`).
+- **If Hosting on Your Own Server/Laptop**:
+  - You decide the key when starting the Hub by setting `$env:WMONITOR_API_KEY = "my-secret-key"`.
+
+### How to Give it to the Client:
+Provide the key string to the client so their agent can authenticate with your Hub:
+```powershell
+# Windows:
+.\wmonitor.exe -agent "https://<your-hub-url>" -api-key "client-cluster-key-2026"
+
+# Linux:
+./wmonitor_linux -agent "https://<your-hub-url>" -api-key "client-cluster-key-2026"
+```
+
+---
+
+## Running for a Limited Time Only (e.g., 1 Hour, 24 Hours, 7 Days)
+
+If you or your client only wants to run W-Monitor for a specific duration (e.g. during a 1-hour load test, a 24-hour baseline, or a 7-day pre-migration assessment) and then automatically stop and export reports:
+
+Use the **`-run-for`** flag (`1h`, `30m`, `24h`, `168h` for 7 days):
+
+### Windows Examples:
+
+```powershell
+# 1. Run for 1 hour, then automatically export a 24-hour summary CSV on exit:
+.\wmonitor.exe -run-for 1h -export-filter daily
+
+# 2. Run for 1 hour in standalone mode, then generate an HTML Assessment Report:
+.\wmonitor.exe -run-for 1h
+.\wmonitor.exe -assessment-report assessment_1h.html -since 1h
+
+# 3. Run for 24 hours as an Agent pushing to your Hub, then exit:
+.\wmonitor.exe -agent "https://your-hub.onrender.com" -api-key "your-key" -run-for 24h
+```
+
+### Linux Examples:
+
+```bash
+# 1. Run for 1 hour and auto-export a summary text report on exit:
+./wmonitor_linux -run-for 1h -export-filter daily
+
+# 2. Run for 1 hour in standalone mode, then generate an HTML Assessment Report:
+./wmonitor_linux -run-for 1h
+./wmonitor_linux -assessment-report assessment_1h.html -since 1h
+
+# 3. Run for 24 hours in agent mode pushing to your Hub, then exit:
+./wmonitor_linux -agent "https://your-hub.onrender.com" -api-key "your-key" -run-for 24h
+```
 
 ---
 
@@ -105,19 +198,18 @@ http://localhost:8080
 
 You can test W-Monitor directly in your terminal without installing a service:
 
-**Local standalone monitor:**
+**Local standalone monitor (SQLite):**
 ```powershell
 .\wmonitor.exe
 ```
 
 **Run as an agent pushing to a Hub:**
 ```powershell
-.\wmonitor.exe -agent "https://hub.example.com:8080" -api-key "your-api-key"
+.\wmonitor.exe -agent "https://hub.example.com" -api-key "your-api-key"
 ```
 
-**Run for a specific duration and auto-export on exit:**
+**Run for a specific duration (e.g. 1 hour) and auto-export on exit:**
 ```powershell
-# Runs for 1 hour, auto-exports a 24-hour summary CSV, and exits
 .\wmonitor.exe -run-for 1h -export-filter daily
 ```
 

@@ -152,10 +152,11 @@ func TestAPIServers(t *testing.T) {
 	}
 }
 
-// TestHubIngest verifies the /api/ingest endpoint accepts metrics with a valid API key
-// and rejects requests with a wrong key.
+// TestHubIngest verifies the /api/ingest endpoint accepts metrics with an API key
+// and isolates metrics between different tenants.
 func TestHubIngest(t *testing.T) {
-	const apiKey = "supersecret"
+	const key1 = "client-alpha-key"
+	const key2 = "client-beta-key"
 
 	tmp := filepath.Join(t.TempDir(), "hub_test.db")
 	db, err := storage.Open(tmp)
@@ -165,50 +166,104 @@ func TestHubIngest(t *testing.T) {
 	defer db.Close()
 
 	srv := server.New(db, "9996")
-	srv.EnableHubMode(apiKey)
+	srv.EnableHubMode("")
 
-	// Insert via /api/ingest
-	m := storage.MetricRow{
-		Timestamp: time.Now(),
-		ServerID:  "agent-01",
-		CPUPct:    77.5,
-		MemPct:    50.0,
+	// 1. Ingest metric for tenant Alpha
+	m1 := storage.MetricRow{
+		Timestamp:  time.Now(),
+		ServerID:   "agent-alpha",
+		CPUPct:     77.5,
+		MemPct:     50.0,
 		DiskFreeGB: 50.0,
 	}
-	body, _ := json.Marshal(m)
+	body1, _ := json.Marshal(m1)
+	req1 := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body1))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("X-API-Key", key1)
+	w1 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w1, req1)
 
-	req := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", apiKey)
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, req)
-
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("expected 202 Accepted, got %d: %s", w.Code, w.Body.String())
+	if w1.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d: %s", w1.Code, w1.Body.String())
 	}
 
-	// Verify row was inserted
-	rows, err := db.QueryMetrics(time.Now().Add(-time.Minute))
-	if err != nil {
-		t.Fatalf("QueryMetrics: %v", err)
+	// 2. Ingest metric for tenant Beta
+	m2 := storage.MetricRow{
+		Timestamp:  time.Now(),
+		ServerID:   "agent-beta",
+		CPUPct:     33.2,
+		MemPct:     25.0,
+		DiskFreeGB: 80.0,
 	}
-	if len(rows) != 1 {
-		t.Errorf("expected 1 row after ingest, got %d", len(rows))
-	} else if rows[0].ServerID != "agent-01" {
-		t.Errorf("expected ServerID=agent-01, got %q", rows[0].ServerID)
-	} else if rows[0].CPUPct != 77.5 {
-		t.Errorf("expected CPUPct=77.5, got %v", rows[0].CPUPct)
-	}
-
-	// Wrong key → 401
-	req2 := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body))
+	body2, _ := json.Marshal(m2)
+	req2 := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body2))
 	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("X-API-Key", "wrong-key")
+	req2.Header.Set("X-API-Key", key2)
 	w2 := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w2, req2)
-	if w2.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 for wrong key, got %d", w2.Code)
+
+	if w2.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d: %s", w2.Code, w2.Body.String())
 	}
 
-	t.Logf("Hub ingest: POST /api/ingest → 202; wrong key → 401 ✓")
+	// 3. Query as tenant Alpha via API — should only see Alpha
+	reqAlpha := httptest.NewRequest("GET", "/api/metrics?range=24h", nil)
+	reqAlpha.Header.Set("X-API-Key", key1)
+	wAlpha := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(wAlpha, reqAlpha)
+
+	if wAlpha.Code != http.StatusOK {
+		t.Fatalf("Alpha query failed with code %d: %s", wAlpha.Code, wAlpha.Body.String())
+	}
+	var respAlpha struct {
+		Count int `json:"count"`
+		Data  []struct {
+			ServerID string  `json:"server_id"`
+			CPUPct   float64 `json:"cpu_pct"`
+		} `json:"data"`
+	}
+	json.NewDecoder(wAlpha.Body).Decode(&respAlpha)
+	if respAlpha.Count != 1 || respAlpha.Data[0].ServerID != "agent-alpha" {
+		t.Errorf("expected only Alpha's metric, got: %+v", respAlpha)
+	}
+
+	// 4. Query as tenant Beta via API — should only see Beta
+	reqBeta := httptest.NewRequest("GET", "/api/metrics?range=24h", nil)
+	reqBeta.Header.Set("X-API-Key", key2)
+	wBeta := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(wBeta, reqBeta)
+
+	if wBeta.Code != http.StatusOK {
+		t.Fatalf("Beta query failed with code %d: %s", wBeta.Code, wBeta.Body.String())
+	}
+	var respBeta struct {
+		Count int `json:"count"`
+		Data  []struct {
+			ServerID string  `json:"server_id"`
+			CPUPct   float64 `json:"cpu_pct"`
+		} `json:"data"`
+	}
+	json.NewDecoder(wBeta.Body).Decode(&respBeta)
+	if respBeta.Count != 1 || respBeta.Data[0].ServerID != "agent-beta" {
+		t.Errorf("expected only Beta's metric, got: %+v", respBeta)
+	}
+
+	// 5. Query without X-API-Key in hub mode → 401
+	reqNoKey := httptest.NewRequest("GET", "/api/metrics?range=24h", nil)
+	wNoKey := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(wNoKey, reqNoKey)
+	if wNoKey.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for missing key, got %d", wNoKey.Code)
+	}
+
+	// 6. Ingest without X-API-Key in hub mode → 401
+	reqIngestNoKey := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body1))
+	reqIngestNoKey.Header.Set("Content-Type", "application/json")
+	wIngestNoKey := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(wIngestNoKey, reqIngestNoKey)
+	if wIngestNoKey.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for ingest without key, got %d", wIngestNoKey.Code)
+	}
+
+	t.Logf("Multi-tenant isolation and API key enforcement verified ✓")
 }

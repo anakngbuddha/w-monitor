@@ -79,7 +79,7 @@ func TestRetentionPurgeAndDownsample(t *testing.T) {
 	}
 
 	// Verify the averaged row has a plausible CPU, DiskIOPS, NetMBps, and ConcurrentUsers value
-	rows, err := db.QueryMetrics(time.Unix(0, 0))
+	rows, err := db.QueryMetrics(time.Unix(0, 0), "")
 	if err != nil {
 		t.Fatalf("QueryMetrics: %v", err)
 	}

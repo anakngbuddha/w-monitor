@@ -62,7 +62,7 @@ func TestStorageRoundtrip(t *testing.T) {
 	}
 
 	// Read back
-	metrics, err := db.QueryMetrics(now.Add(-time.Minute))
+	metrics, err := db.QueryMetrics(now.Add(-time.Minute), "")
 	if err != nil {
 		t.Fatalf("QueryMetrics: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestStorageRoundtrip(t *testing.T) {
 		t.Errorf("expected 5 metric rows, got %d", len(metrics))
 	}
 
-	processes, err := db.QueryProcesses(now.Add(-time.Minute))
+	processes, err := db.QueryProcesses(now.Add(-time.Minute), "")
 	if err != nil {
 		t.Fatalf("QueryProcesses: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestStorageRoundtrip(t *testing.T) {
 	}
 
 	// Test QueryServers
-	servers, err := db.QueryServers()
+	servers, err := db.QueryServers("")
 	if err != nil {
 		t.Fatalf("QueryServers: %v", err)
 	}
@@ -174,7 +174,7 @@ func BenchmarkQueryMetrics(b *testing.B) {
 	since := now.Add(-2 * time.Hour)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows, err := db.QueryMetrics(since)
+		rows, err := db.QueryMetrics(since, "")
 		if err != nil {
 			b.Fatalf("QueryMetrics: %v", err)
 		}

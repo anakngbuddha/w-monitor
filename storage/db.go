@@ -21,6 +21,7 @@ type DB struct {
 type MetricRow struct {
 	ID               int64
 	Timestamp        time.Time
+	TenantID         string // API key used as tenant identifier (hub mode)
 	ServerID         string
 	Hostname         string
 	CPUPct           float64
@@ -47,6 +48,7 @@ type MetricRow struct {
 type ProcessRow struct {
 	ID        int64
 	Timestamp time.Time
+	TenantID  string // API key used as tenant identifier (hub mode)
 	ServerID  string
 	Hostname  string
 	PID       int32
@@ -116,6 +118,7 @@ func (db *DB) migrate() error {
 CREATE TABLE IF NOT EXISTS metrics (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp           INTEGER NOT NULL,  -- Unix epoch seconds
+    tenant_id           TEXT    DEFAULT '',
     server_id           TEXT    DEFAULT '',
     hostname            TEXT    DEFAULT '',
     cpu_pct             REAL    NOT NULL,
@@ -140,6 +143,7 @@ CREATE TABLE IF NOT EXISTS metrics (
 CREATE TABLE IF NOT EXISTS processes (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp INTEGER NOT NULL,
+    tenant_id TEXT    DEFAULT '',
     server_id TEXT    DEFAULT '',
     hostname  TEXT    DEFAULT '',
     pid       INTEGER NOT NULL,
@@ -154,6 +158,7 @@ CREATE TABLE IF NOT EXISTS processes (
 
 	// Safely add new columns to existing databases (ignore errors if columns already exist)
 	alters := []string{
+		"ALTER TABLE metrics ADD COLUMN tenant_id TEXT DEFAULT ''",
 		"ALTER TABLE metrics ADD COLUMN cpu_cores INTEGER DEFAULT 0",
 		"ALTER TABLE metrics ADD COLUMN mem_total_gb REAL DEFAULT 0.0",
 		"ALTER TABLE metrics ADD COLUMN disk_total_gb REAL DEFAULT 0.0",
@@ -168,6 +173,7 @@ CREATE TABLE IF NOT EXISTS processes (
 		"ALTER TABLE metrics ADD COLUMN net_recv_external INTEGER DEFAULT 0",
 		"ALTER TABLE metrics ADD COLUMN net_sent_internal INTEGER DEFAULT 0",
 		"ALTER TABLE metrics ADD COLUMN net_recv_internal INTEGER DEFAULT 0",
+		"ALTER TABLE processes ADD COLUMN tenant_id TEXT DEFAULT ''",
 		"ALTER TABLE processes ADD COLUMN server_id TEXT DEFAULT ''",
 		"ALTER TABLE processes ADD COLUMN hostname TEXT DEFAULT ''",
 	}
@@ -178,6 +184,7 @@ CREATE TABLE IF NOT EXISTS processes (
 	indexes := `
 CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_metrics_server ON metrics(server_id);
+CREATE INDEX IF NOT EXISTS idx_metrics_tenant ON metrics(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
 `
 	if _, err := db.conn.Exec(indexes); err != nil {
@@ -190,9 +197,9 @@ CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
 // InsertMetric writes one metrics row.
 func (db *DB) InsertMetric(m MetricRow) error {
 	_, err := db.conn.Exec(
-		`INSERT INTO metrics(timestamp, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.Timestamp.Unix(), m.ServerID, m.Hostname, m.CPUPct, m.MemPct, m.DiskFreeGB, m.NetSentBytes, m.NetRecvBytes, m.CPUCores, m.MemTotalGB, m.DiskTotalGB, m.DiskReadOps, m.DiskWriteOps, m.DiskIOPS, m.NetMBps, m.ConcurrentUsers, m.NetSentExternal, m.NetRecvExternal, m.NetSentInternal, m.NetRecvInternal,
+		`INSERT INTO metrics(timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.Timestamp.Unix(), m.TenantID, m.ServerID, m.Hostname, m.CPUPct, m.MemPct, m.DiskFreeGB, m.NetSentBytes, m.NetRecvBytes, m.CPUCores, m.MemTotalGB, m.DiskTotalGB, m.DiskReadOps, m.DiskWriteOps, m.DiskIOPS, m.NetMBps, m.ConcurrentUsers, m.NetSentExternal, m.NetRecvExternal, m.NetSentInternal, m.NetRecvInternal,
 	)
 	return err
 }
@@ -200,20 +207,31 @@ func (db *DB) InsertMetric(m MetricRow) error {
 // InsertProcess writes one process row.
 func (db *DB) InsertProcess(p ProcessRow) error {
 	_, err := db.conn.Exec(
-		`INSERT INTO processes(timestamp, server_id, hostname, pid, name, cpu_pct, mem_mb)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		p.Timestamp.Unix(), p.ServerID, p.Hostname, p.PID, p.Name, p.CPUPct, p.MemMB,
+		`INSERT INTO processes(timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.Timestamp.Unix(), p.TenantID, p.ServerID, p.Hostname, p.PID, p.Name, p.CPUPct, p.MemMB,
 	)
 	return err
 }
 
 // QueryMetrics returns rows within the given time window, oldest first.
-func (db *DB) QueryMetrics(since time.Time) ([]MetricRow, error) {
-	rows, err := db.conn.Query(
-		`SELECT id, timestamp, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
-		 FROM metrics WHERE timestamp >= ? ORDER BY timestamp ASC`,
-		since.Unix(),
-	)
+// If tenantID is non-empty, only rows with that tenant_id are returned.
+func (db *DB) QueryMetrics(since time.Time, tenantID string) ([]MetricRow, error) {
+	var rows *sql.Rows
+	var err error
+	if tenantID != "" {
+		rows, err = db.conn.Query(
+			`SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
+			 FROM metrics WHERE timestamp >= ? AND tenant_id = ? ORDER BY timestamp ASC`,
+			since.Unix(), tenantID,
+		)
+	} else {
+		rows, err = db.conn.Query(
+			`SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
+			 FROM metrics WHERE timestamp >= ? ORDER BY timestamp ASC`,
+			since.Unix(),
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +241,7 @@ func (db *DB) QueryMetrics(since time.Time) ([]MetricRow, error) {
 	for rows.Next() {
 		var r MetricRow
 		var ts int64
-		if err := rows.Scan(&r.ID, &ts, &r.ServerID, &r.Hostname, &r.CPUPct, &r.MemPct, &r.DiskFreeGB, &r.NetSentBytes, &r.NetRecvBytes, &r.CPUCores, &r.MemTotalGB, &r.DiskTotalGB, &r.DiskReadOps, &r.DiskWriteOps, &r.DiskIOPS, &r.NetMBps, &r.ConcurrentUsers, &r.NetSentExternal, &r.NetRecvExternal, &r.NetSentInternal, &r.NetRecvInternal); err != nil {
+		if err := rows.Scan(&r.ID, &ts, &r.TenantID, &r.ServerID, &r.Hostname, &r.CPUPct, &r.MemPct, &r.DiskFreeGB, &r.NetSentBytes, &r.NetRecvBytes, &r.CPUCores, &r.MemTotalGB, &r.DiskTotalGB, &r.DiskReadOps, &r.DiskWriteOps, &r.DiskIOPS, &r.NetMBps, &r.ConcurrentUsers, &r.NetSentExternal, &r.NetRecvExternal, &r.NetSentInternal, &r.NetRecvInternal); err != nil {
 			return nil, err
 		}
 		r.Timestamp = time.Unix(ts, 0)
@@ -233,12 +251,23 @@ func (db *DB) QueryMetrics(since time.Time) ([]MetricRow, error) {
 }
 
 // QueryProcesses returns process rows within the given time window.
-func (db *DB) QueryProcesses(since time.Time) ([]ProcessRow, error) {
-	rows, err := db.conn.Query(
-		`SELECT id, timestamp, server_id, hostname, pid, name, cpu_pct, mem_mb
-		 FROM processes WHERE timestamp >= ? ORDER BY timestamp ASC`,
-		since.Unix(),
-	)
+// If tenantID is non-empty, only rows with that tenant_id are returned.
+func (db *DB) QueryProcesses(since time.Time, tenantID string) ([]ProcessRow, error) {
+	var rows *sql.Rows
+	var err error
+	if tenantID != "" {
+		rows, err = db.conn.Query(
+			`SELECT id, timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb
+			 FROM processes WHERE timestamp >= ? AND tenant_id = ? ORDER BY timestamp ASC`,
+			since.Unix(), tenantID,
+		)
+	} else {
+		rows, err = db.conn.Query(
+			`SELECT id, timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb
+			 FROM processes WHERE timestamp >= ? ORDER BY timestamp ASC`,
+			since.Unix(),
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +277,7 @@ func (db *DB) QueryProcesses(since time.Time) ([]ProcessRow, error) {
 	for rows.Next() {
 		var p ProcessRow
 		var ts int64
-		if err := rows.Scan(&p.ID, &ts, &p.ServerID, &p.Hostname, &p.PID, &p.Name, &p.CPUPct, &p.MemMB); err != nil {
+		if err := rows.Scan(&p.ID, &ts, &p.TenantID, &p.ServerID, &p.Hostname, &p.PID, &p.Name, &p.CPUPct, &p.MemMB); err != nil {
 			return nil, err
 		}
 		p.Timestamp = time.Unix(ts, 0)
@@ -272,8 +301,18 @@ func (db *DB) CountProcesses() (int, error) {
 }
 
 // QueryServers returns distinct server_id values seen in the metrics table.
-func (db *DB) QueryServers() ([]string, error) {
-	rows, err := db.conn.Query("SELECT DISTINCT server_id FROM metrics WHERE server_id != '' ORDER BY server_id")
+// If tenantID is non-empty, only servers for that tenant are returned.
+func (db *DB) QueryServers(tenantID string) ([]string, error) {
+	var rows *sql.Rows
+	var err error
+	if tenantID != "" {
+		rows, err = db.conn.Query(
+			"SELECT DISTINCT server_id FROM metrics WHERE server_id != '' AND tenant_id = ? ORDER BY server_id",
+			tenantID,
+		)
+	} else {
+		rows, err = db.conn.Query("SELECT DISTINCT server_id FROM metrics WHERE server_id != '' ORDER BY server_id")
+	}
 	if err != nil {
 		return nil, err
 	}
