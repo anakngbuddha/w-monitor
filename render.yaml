@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: wmonitor-hub
+    runtime: go
+    plan: free
+    region: oregon
+    buildCommand: go build -ldflags "-s -w" -o wmonitor .
+    startCommand: ./wmonitor
+    healthCheckPath: /api/health
+    envVars:
+      - key: WMONITOR_MODE
+        value: hub
+      - key: WMONITOR_DB
+        value: postgres
+      - key: WMONITOR_DB_DSN
+        sync: false
+      - key: WMONITOR_API_KEY
+        generateValue: true

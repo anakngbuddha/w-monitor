@@ -115,6 +115,28 @@
     .range-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
     .range-btn.active { background: var(--text-primary); color: #000; }
 
+    .server-select {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      padding: 6px 12px;
+      font-size: 13px;
+      font-family: 'Inter', sans-serif;
+      font-weight: 500;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      outline: none;
+      transition: var(--transition);
+    }
+    .server-select:hover {
+      background: var(--bg-hover);
+      border-color: var(--border-glow);
+    }
+    .server-select option {
+      background: var(--bg-card);
+      color: var(--text-primary);
+    }
+
     .btn-export {
       padding: 7px 16px;
       font-size: 13px;
@@ -384,6 +406,9 @@
       </div>
     </div>
     <div class="header-controls">
+      <select id="serverSelect" class="server-select" onchange="onServerChange()" title="Filter by server">
+        <option value="">All Servers</option>
+      </select>
       <button class="btn-export" onclick="exportCSV()">Export CSV</button>
       <div class="status-dot" id="statusDot"></div>
       <span class="status-label" id="statusLabel">Connecting…</span>
@@ -680,15 +705,46 @@ const iopsChart  = makeChart('iopsChart',  COLORS.blue,   'IOPS',      ' IOPS');
 const usersChart = makeChart('usersChart', COLORS.purple, 'Users',     '');
 
 let currentRange = '24h';
+let currentServer = '';
 
 function exportCSV() {
-  window.open(`/api/export/csv?range=${currentRange}`, '_blank');
+  let url = `/api/export/csv?range=${currentRange}`;
+  if (currentServer) url += `&server_id=${encodeURIComponent(currentServer)}`;
+  window.open(url, '_blank');
 }
 
 function setRange(r) {
   currentRange = r;
   ['24h','7d','30d'].forEach(x => document.getElementById('btn'+x).classList.toggle('active', x === r));
   fetchData();
+}
+
+function onServerChange() {
+  const sel = document.getElementById('serverSelect');
+  currentServer = sel ? sel.value : '';
+  fetchData();
+}
+
+async function fetchServers() {
+  try {
+    const resp = await fetch('/api/servers');
+    if (!resp.ok) return;
+    const json = await resp.json();
+    const servers = json.servers || [];
+    const sel = document.getElementById('serverSelect');
+    if (!sel) return;
+    const prevVal = sel.value;
+    sel.innerHTML = '<option value="">All Servers</option>';
+    servers.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s;
+      opt.textContent = s;
+      if (s === prevVal) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  } catch(e) {
+    console.error('Failed to fetch servers:', e);
+  }
 }
 
 function fmtTime(ts) {
@@ -723,7 +779,10 @@ function updateChart(chart, labels, data) {
 
 async function fetchData() {
   try {
-    const mResp = await fetch(`/api/metrics?range=${currentRange}`);
+    fetchServers();
+    let url = `/api/metrics?range=${currentRange}`;
+    if (currentServer) url += `&server_id=${encodeURIComponent(currentServer)}`;
+    const mResp = await fetch(url);
     if (!mResp.ok) throw new Error('metrics fetch failed');
     const mJson = await mResp.json();
     const data = mJson.data || [];
@@ -888,9 +947,9 @@ async function fetchData() {
     document.getElementById('statusLabel').textContent = 'Live';
     document.getElementById('statusDot').style.background = 'var(--accent-green)';
     document.getElementById('lastUpdated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
-    document.getElementById('footerStats').textContent = `${data.length} metric rows · range: ${currentRange}`;
-
-    const pResp = await fetch(`/api/processes?range=${currentRange}`);
+    let pUrl = `/api/processes?range=${currentRange}`;
+    if (currentServer) pUrl += `&server_id=${encodeURIComponent(currentServer)}`;
+    const pResp = await fetch(pUrl);
     if (pResp.ok) {
       const pJson = await pResp.json();
       renderProcesses(pJson.data || []);

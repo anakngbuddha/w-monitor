@@ -1,114 +1,346 @@
 # W-Monitor User Guide
 
-Welcome to **W-Monitor**, a single-binary system monitoring tool. W-Monitor collects CPU, memory, disk, and network metrics locally and provides a web dashboard and detailed CSV/TXT reports.
+Welcome to **W-Monitor**, a lightweight, single-binary system monitoring and pre-migration assessment tool. W-Monitor collects high-frequency utilization data (CPU, memory, disk, network, disk IOPS, and active processes) and provides a sleek web dashboard, automated export utilities, and client-ready cloud migration assessment reports.
 
 ---
 
-## System Requirements
+## Table of Contents
 
-W-Monitor collects system metrics every **10 seconds**, stores up to **30 days** of data in a local SQLite database (raw data for the last 24 hours, then downsampled to hourly averages), and serves a local web dashboard on `localhost:8080`. **All traffic is loopback-only — W-Monitor generates zero internet bandwidth.**
-
-> **Bandwidth note:** The figures below refer to *local loopback traffic* between your browser and the W-Monitor HTTP server. No data is sent over the internet.
-
-### Dynamic Resource Suggestions
-
-Rather than hardcoded specs, W-Monitor automatically calculates and publishes the **minimum** and **recommended** system requirements based on your actual system's usage pattern across 5 key resource dimensions:
-
-1. **CPU (vCPUs):**
-   - **Minimum:** Measured peak CPU core consumption plus a 20% safety margin.
-   - **Recommended:** Headroom for workload bursts (+1 vCPU over minimum).
-2. **RAM (GB):**
-   - **Minimum:** Peak memory consumption plus a 20% safety margin (min 0.25 GB).
-   - **Recommended:** Double the peak memory usage (min 0.50 GB).
-3. **Disk Size (GB):**
-   - **Minimum:** Peak disk space utilization plus a 20% safety margin (min 10 GB).
-   - **Recommended:** Double the peak disk utilization for log & database growth headroom (min 20 GB).
-4. **Disk IOPS (Input/Output Operations Per Second):**
-   - **Minimum:** Peak disk read/write IOPS plus a 20% safety margin (min 100 IOPS).
-   - **Recommended:** Double the peak disk IOPS (min 300 IOPS).
-5. **Network Traffic Bandwidth (MB/s):**
-   - **Minimum:** Peak network transfer rate (sent + received) plus a 20% safety margin (min 1.0 MB/s).
-   - **Recommended:** Double the peak network transfer rate (min 5.0 MB/s).
-
-### Advanced Metrics Collected
-- **Disk IOPS:** Tracks instantaneous, minimum, average, and peak disk read/write operation rates.
-- **Concurrent Users:** Tracks minimum, average, and peak active client sessions interacting with the dashboard and API in real time.
-- **Network Bandwidth:** Measures transfer rates and total consumption over configurable report windows (`24h`, `7d`, `30d`).
+1. [Architectural Overview & Operating Modes](#architectural-overview--operating-modes)
+2. [Windows Guide](#windows-guide)
+   - [Step 1: Downloading & Obtaining the Binary](#windows-step-1-downloading--obtaining-the-binary)
+   - [Step 2: Installation as a Client Agent (Multi-Server Assessment)](#windows-step-2-installation-as-a-client-agent)
+   - [Step 3: Installation as a Standalone Local Monitor](#windows-step-3-installation-as-a-standalone-local-monitor)
+   - [Step 4: Running Interactively (Foreground Mode)](#windows-step-4-running-interactively)
+   - [Step 5: Managing the Windows Service](#windows-step-5-managing-the-windows-service)
+   - [Step 6: Generating Reports & Data Exports](#windows-step-6-generating-reports--data-exports)
+   - [Windows File Locations & Security](#windows-file-locations--security)
+3. [Linux Guide](#linux-guide)
+   - [Step 1: Downloading & Obtaining the Binary](#linux-step-1-downloading--obtaining-the-binary)
+   - [Step 2: Installation as a Client Agent (Multi-Server Assessment)](#linux-step-2-installation-as-a-client-agent)
+   - [Step 3: Installation as a Standalone Local Monitor](#linux-step-3-installation-as-a-standalone-local-monitor)
+   - [Step 4: Running Interactively (Foreground Mode)](#linux-step-4-running-interactively)
+   - [Step 5: Managing the Systemd Service](#linux-step-5-managing-the-systemd-service)
+   - [Step 6: Generating Reports & Data Exports](#linux-step-6-generating-reports--data-exports)
+   - [Linux File Locations & Security](#linux-file-locations--security)
+4. [Using the Web Dashboard](#using-the-web-dashboard)
+5. [Advanced Metrics & Sizing Recommendations](#advanced-metrics--sizing-recommendations)
 
 ---
 
-## Installation
+## Architectural Overview & Operating Modes
 
-You can run W-Monitor interactively or install it as a background service. Since you have the installer scripts, you can use them directly to set up W-Monitor permanently on your machine.
+W-Monitor operates in two main modes:
 
-### Windows
-To install W-Monitor as a Windows Service, open an **Administrator PowerShell** and run:
+1. **Client Agent Mode (Zero Credentials):**
+   - Ideal for target client servers during pre-migration assessments.
+   - The agent machine **never receives or touches database passwords or cloud credentials**.
+   - Collects system metrics every 10 seconds and securely pushes them over HTTPS/HTTP to the central Hub via `POST /api/ingest` with an `X-API-Key` header.
+   - Zero local database footprint and no open dashboard port on client machines.
+
+2. **Standalone / Hub Mode:**
+   - Runs locally on a single machine or acts as a central aggregator for multiple client agents.
+   - Stores metrics in SQLite (default zero-config) or PostgreSQL (multi-server centralized).
+   - Serves the real-time web dashboard on port `8080` (customizable with `-port`).
+
+---
+
+## Windows Guide
+
+### Windows Step 1: Downloading & Obtaining the Binary
+
+You will typically receive a release package containing:
+- `wmonitor.exe` (The compiled 64-bit Windows binary)
+- `install.ps1` (Automated service installation script)
+
+If you are building from source:
 ```powershell
-.\install.ps1
+# From the repository root:
+.\build_release.ps1
 ```
-*(Note: There is also `install_user.ps1` if you wish to run it in a specific user context).*
-
-### Linux
-To install W-Monitor as a systemd service, run:
-```bash
-sudo ./install.sh
-```
-
-Once installed, W-Monitor will run automatically in the background and start collecting metrics on every boot.
+This produces `wmonitor.exe` in your workspace.
 
 ---
 
-## Interactive Usage & Features
+### Windows Step 2: Installation as a Client Agent
 
-If you prefer to run W-Monitor manually (in the foreground), just open a terminal and run the binary:
+If you are installing W-Monitor on a client machine to send metrics back to your central Hub:
+
+1. Open **PowerShell as Administrator** (Right-click Start &rarr; *Windows PowerShell (Admin)* or *Terminal (Admin)*).
+2. Navigate to the directory containing `wmonitor.exe` and `install.ps1`:
+   ```powershell
+   cd C:\path\to\wmonitor-package
+   ```
+3. Run the installer with `-Mode agent`, specifying the Hub URL and shared API Key:
+   ```powershell
+   .\install.ps1 -Mode agent -HubUrl "https://<hub-address>:8080" -ApiKey "<your-shared-api-key>"
+   ```
+4. **What happens automatically:**
+   - Validates Administrator permissions.
+   - Copies `wmonitor.exe` to `C:\Program Files\Sysmon\wmonitor.exe`.
+   - Adds the directory to the System `PATH`.
+   - Writes credentials into `%LOCALAPPDATA%\Sysmon\config.env`.
+   - Locks `config.env` using Windows ACLs (`icacls`) so only `SYSTEM` and the installer account can read it.
+   - Registers and starts the `wmonitor` Windows Service with startup type *Automatic*.
+
+---
+
+### Windows Step 3: Installation as a Standalone Local Monitor
+
+To monitor the local Windows machine with a local SQLite database and local dashboard:
+
+```powershell
+# In Administrator PowerShell:
+.\install.ps1 -Mode hub -Db sqlite -ApiKey "local-admin-key"
+```
+
+Once installed, open your browser and navigate to:
+```
+http://localhost:8080
+```
+
+---
+
+### Windows Step 4: Running Interactively
+
+You can test W-Monitor directly in your terminal without installing a service:
+
+**Local standalone monitor:**
+```powershell
+.\wmonitor.exe
+```
+
+**Run as an agent pushing to a Hub:**
+```powershell
+.\wmonitor.exe -agent "https://hub.example.com:8080" -api-key "your-api-key"
+```
+
+**Run for a specific duration and auto-export on exit:**
+```powershell
+# Runs for 1 hour, auto-exports a 24-hour summary CSV, and exits
+.\wmonitor.exe -run-for 1h -export-filter daily
+```
+
+**Override the external network interface:**
+```powershell
+# Treat "Ethernet 2" as the external/public interface
+.\wmonitor.exe -external-iface "Ethernet 2"
+```
+
+---
+
+### Windows Step 5: Managing the Windows Service
+
+When installed as a Windows service, manage W-Monitor using either the CLI flags or standard Windows service commands:
+
+**Using W-Monitor CLI (Admin PowerShell):**
+```powershell
+# Start the service
+wmonitor -start
+
+# Stop the service
+wmonitor -stop
+
+# Uninstall the service
+wmonitor -uninstall
+```
+
+**Using PowerShell Service cmdlets:**
+```powershell
+Get-Service wmonitor
+Start-Service wmonitor
+Stop-Service wmonitor
+Restart-Service wmonitor
+```
+
+---
+
+### Windows Step 6: Generating Reports & Data Exports
+
+Generate summary reports directly from the stored metrics without starting the server:
+
+**1. Client-Ready HTML Assessment Report (Printable to PDF):**
+```powershell
+# Generates a 30-day assessment report with cloud sizing recommendations
+wmonitor -assessment-report assessment_report.html -since 720h
+```
+
+**2. CSV Spreadsheet Export:**
+```powershell
+wmonitor -export-csv migration_metrics.csv -since 720h
+```
+
+**3. Plain-Text Terminal Report:**
+```powershell
+wmonitor -export-txt summary.txt -since 168h
+```
+
+---
+
+### Windows File Locations & Security
+
+| Component | Default Path | Description |
+|-----------|--------------|-------------|
+| **Binary** | `C:\Program Files\Sysmon\wmonitor.exe` | Executable path in system PATH |
+| **Config File** | `%LOCALAPPDATA%\Sysmon\config.env` | Locked configuration (`icacls` restricted) |
+| **Local SQLite DB** | `%LOCALAPPDATA%\Sysmon\wmonitor.db` | Stored metrics database (in Standalone/Hub mode) |
+| **Windows Service** | `wmonitor` | Registered in Windows Service Control Manager |
+
+---
+
+## Linux Guide
+
+### Linux Step 1: Downloading & Obtaining the Binary
+
+You will typically receive a release package containing:
+- `wmonitor_linux` (The compiled 64-bit Linux binary)
+- `install.sh` (Automated systemd installation script)
+
+If you are building from source:
+```bash
+# On a machine with Go installed:
+GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o wmonitor_linux .
+chmod +x wmonitor_linux install.sh
+```
+
+---
+
+### Linux Step 2: Installation as a Client Agent
+
+To install on a Linux client machine pushing to your central Hub:
+
+1. Make sure `install.sh` is executable:
+   ```bash
+   chmod +x install.sh
+   ```
+2. Run the script with `sudo`:
+   ```bash
+   sudo ./install.sh --mode agent --hub-url "https://<hub-address>:8080" --api-key "<your-shared-api-key>"
+   ```
+3. **What happens automatically:**
+   - Validates root privileges.
+   - Copies `wmonitor_linux` to `/usr/local/bin/sysmon`.
+   - Creates `~/.local/share/sysmon/config.env` and sets permissions to `chmod 600` (readable only by owner).
+   - Installs and enables the systemd service.
+   - Starts the agent service immediately.
+
+---
+
+### Linux Step 3: Installation as a Standalone Local Monitor
+
+To monitor the Linux server locally with an embedded SQLite database and dashboard:
 
 ```bash
-# Windows
-.\wmonitor.exe
+sudo ./install.sh --mode hub --db sqlite --api-key "local-admin-key"
+```
 
-# Linux
+Access the dashboard at `http://<server-ip>:8080`.
+
+---
+
+### Linux Step 4: Running Interactively
+
+Test or run W-Monitor in the foreground:
+
+**Local monitor:**
+```bash
 ./wmonitor_linux
 ```
 
-The web dashboard will instantly become available at `http://localhost:8080`.
-
-### Custom Run Duration & Automated Exports
-
-You can tell W-Monitor to run for a specific duration, collect metrics, and then automatically shut down and export a report (CSV on Windows, TXT on Linux). This is great for benchmarking!
-
-**Run for a specific duration:**
+**Agent mode:**
 ```bash
-wmonitor -run-for 1h
-# Supports units like 's' (seconds), 'm' (minutes), 'h' (hours)
+./wmonitor_linux -agent "https://hub.example.com:8080" -api-key "your-api-key"
 ```
 
-**Filter the automated export:**
-You can specify a time window for the report generated upon shutdown. Available filters are `daily`, `weekly`, and `monthly`.
+**Custom run duration with automated export on exit:**
 ```bash
-wmonitor -run-for 30m -export-filter daily
-```
-*When the 30 minutes are up (or if you manually press Ctrl+C), W-Monitor will cleanly exit and generate a file like `wmonitor_export_YYYYMMDD_HHMMSS.csv` (or `.txt` on Linux) in your current directory.*
-
-### Manual Report Exports
-
-You can generate a 30-day historical report at any time without starting the monitoring server:
-
-**Export to CSV (Windows friendly):**
-```bash
-wmonitor -export-csv report.csv
+./wmonitor_linux -run-for 2h -export-filter daily
 ```
 
-**Export to Text (Linux friendly):**
+**Specify custom HTTP port:**
 ```bash
-wmonitor -export-txt report.txt
+./wmonitor_linux -port 9090
 ```
 
 ---
 
-## Service Management
+### Linux Step 5: Managing the Systemd Service
 
-If you installed W-Monitor as a service, you can manage it using the built-in flags (these must be run as Administrator/root):
+Manage the running service with standard systemd commands:
 
-- **Start the service:** `wmonitor -start`
-- **Stop the service:** `wmonitor -stop`
-- **Uninstall the service:** `wmonitor -uninstall`
+```bash
+# Check service status
+sudo systemctl status sysmon
+
+# View real-time logs
+sudo journalctl -u sysmon -f
+
+# Stop or restart
+sudo systemctl stop sysmon
+sudo systemctl restart sysmon
+
+# Uninstall service
+sudo sysmon -uninstall
+```
+
+---
+
+### Linux Step 6: Generating Reports & Data Exports
+
+**1. HTML Assessment Report:**
+```bash
+sysmon -assessment-report assessment.html -since 720h
+```
+
+**2. CSV Export:**
+```bash
+sysmon -export-csv metrics_export.csv -since 720h
+```
+
+**3. Text Summary Report:**
+```bash
+sysmon -export-txt report.txt -since 168h
+```
+
+---
+
+### Linux File Locations & Security
+
+| Component | Default Path | Description |
+|-----------|--------------|-------------|
+| **Binary** | `/usr/local/bin/sysmon` | Standard system binary path |
+| **Config File** | `~/.local/share/sysmon/config.env` | Protected config file (`chmod 600`) |
+| **Local SQLite DB** | `~/.local/share/sysmon/wmonitor.db` | Stored metrics database (Hub mode) |
+| **Service Name** | `sysmon.service` | Managed by `systemd` |
+
+---
+
+## Using the Web Dashboard
+
+When running in Standalone or Hub mode, open `http://localhost:8080` in your web browser:
+
+1. **Server Filter Dropdown (Top Bar):**
+   - Click the server dropdown to toggle between **"All Servers"** aggregate view or inspect a specific client server node.
+2. **Time Range Selectors:**
+   - Toggle between **24h** (high-resolution raw 10-second data), **7d**, and **30d** (hourly downsampled averages).
+3. **Real-Time KPI Cards:**
+   - **CPU Usage:** Average & peak core consumption.
+   - **Memory:** Average & peak RAM utilization.
+   - **Disk Free:** Minimum free storage observed.
+   - **Network I/O:** Total bandwidth transferred and peak throughput (split by external/internal interfaces).
+   - **Disk IOPS:** Real-time and peak read/write ops per second.
+   - **Concurrent Users:** Active sessions tracked.
+4. **Top Processes Table:**
+   - Displays top processes ranked by CPU and RAM consumption.
+5. **One-Click CSV Export:**
+   - Click the **"Export CSV"** button in the header to download data for the active server and time range.
+
+---
+
+## Advanced Metrics & Sizing Recommendations
+
+W-Monitor computes suggested cloud target specs based on observed peak workload + safety headroom:
+
+- **Suggested Minimum Specs:** Measured peak resource utilization + 20% margin.
+- **Suggested Recommended Specs:** Peak workload doubled (2.0x) to accommodate burst traffic and 12-month data growth.
+- **Network Split:** External vs Internal traffic is automatically categorized by identifying the interface with the default gateway route, allowing precise cloud egress cost forecasting.

@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ func TestExportCSVAndText(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		db.InsertMetric(storage.MetricRow{
 			Timestamp:       now.Add(-time.Duration(i) * time.Hour),
+			ServerID:        "srv-01",
 			CPUPct:          float64(10 + i*5),
 			MemPct:          float64(40 + i*2),
 			DiskFreeGB:      float64(100 - i),
@@ -63,7 +65,7 @@ func TestExportCSVAndText(t *testing.T) {
 	if len(records) != 28 {
 		t.Errorf("expected 28 CSV rows (summary+header+10), got %d", len(records))
 	}
-	t.Logf("CSV path: %s, rows: %d", csvPath, len(records)-1)
+	t.Logf("CSV path: %s, total CSV rows (including summary): %d", csvPath, len(records))
 
 	// Test text report
 	s, err := export.TextReport(db, now.Add(-48*time.Hour), txtPath)
@@ -92,4 +94,65 @@ func TestExportCSVAndText(t *testing.T) {
 	if info.Size() == 0 {
 		t.Error("text report file is empty")
 	}
+}
+
+// TestAssessmentHTMLReport verifies the HTML report generator (Phase 12).
+func TestAssessmentHTMLReport(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmp, "report_test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	for i := 0; i < 20; i++ {
+		db.InsertMetric(storage.MetricRow{
+			Timestamp:       now.Add(-time.Duration(i) * 30 * time.Minute),
+			ServerID:        "srv-01",
+			CPUPct:          float64(10 + i*3),
+			MemPct:          float64(40 + i),
+			DiskFreeGB:      float64(200 - i),
+			DiskTotalGB:     250.0,
+			MemTotalGB:      16.0,
+			CPUCores:        8,
+			NetSentBytes:    uint64(1024 * i),
+			NetRecvBytes:    uint64(2048 * i),
+			DiskIOPS:        float64(100 + i*5),
+			NetMBps:         float64(1.0 + float64(i)*0.1),
+			ConcurrentUsers: i % 10,
+		})
+	}
+
+	outPath := filepath.Join(tmp, "assessment.html")
+	start := now.Add(-24 * time.Hour)
+	end := now
+
+	if err := export.GenerateAssessmentReport(db, start, end, outPath); err != nil {
+		t.Fatalf("GenerateAssessmentReport: %v", err)
+	}
+
+	// Verify HTML file is created and contains key elements
+	content, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read HTML: %v", err)
+	}
+	html := string(content)
+
+	checks := []string{
+		"<!DOCTYPE html>",
+		"W-Monitor",
+		"Assessment Report",
+		"vCPU",
+		"Recommended Target Sizing",
+		"Minimum",
+		"Recommended",
+	}
+	for _, check := range checks {
+		if !strings.Contains(html, check) {
+			t.Errorf("HTML missing expected string: %q", check)
+		}
+	}
+
+	t.Logf("Assessment HTML report: %s, size=%d bytes", outPath, len(content))
 }

@@ -1,47 +1,96 @@
 <#
 .SYNOPSIS
-Installs Sysmon as a Windows Service.
+Installs W-Monitor as a Windows Service (hub or agent mode).
 
 .DESCRIPTION
 This script must be run as Administrator. It will:
 1. Check for administrative privileges
-2. Stop the sysmon service if it already exists
-3. Copy sysmon.exe to C:\Program Files\Sysmon
-4. Add the installation directory to the system PATH
-5. Install and start the Sysmon service
+2. Stop the wmonitor service if it already exists
+3. Copy wmonitor.exe to %ProgramFiles%\Sysmon
+4. Write agent/hub credentials to a locked config.env file
+5. Install and start the wmonitor service
+
+.PARAMETER Mode
+"agent" (default) — push metrics to a hub, no local DB.
+"hub"   — receive metrics from agents, serve dashboard.
+
+.PARAMETER HubUrl
+The URL of the Hub (required when -Mode agent).
+Example: https://hub.example.com:8080
+
+.PARAMETER ApiKey
+Shared API key for hub authentication.
+
+.PARAMETER Dsn
+Postgres DSN (required only when -Mode hub -Db postgres).
+Example: postgres://user:pass@host:5432/dbname?sslmode=require
+
+.PARAMETER Db
+"sqlite" (default) or "postgres" — only relevant for hub mode.
 
 .EXAMPLE
-.\install.ps1
+# Install as agent, pushing to a hub:
+.\install.ps1 -Mode agent -HubUrl "https://hub.example.com:8080" -ApiKey "abc123"
+
+# Install as hub with SQLite:
+.\install.ps1 -Mode hub -ApiKey "abc123"
+
+# Install as hub with Postgres:
+.\install.ps1 -Mode hub -Db postgres -Dsn "postgres://user:pass@host:5432/wmonitor?sslmode=require" -ApiKey "abc123"
 #>
+
+param(
+    [string]$Mode    = "agent",   # "agent" or "hub"
+    [string]$HubUrl  = "",
+    [string]$ApiKey  = "",
+    [string]$Dsn     = "",
+    [string]$Db      = "sqlite"   # "sqlite" or "postgres"
+)
 
 # 1. Ensure Admin privileges
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Warning "This script requires Administrator privileges to install the service."
     Write-Host "Attempting to restart script with elevated permissions..."
-    Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Mode `"$Mode`" -HubUrl `"$HubUrl`" -ApiKey `"$ApiKey`" -Dsn `"$Dsn`" -Db `"$Db`"" -Verb RunAs
     exit
 }
 
-$installDir = "$env:ProgramFiles\Sysmon"
-$exeName = "wmonitor.exe"
-$sourceExe = Join-Path $PSScriptRoot $exeName
-$targetExe = Join-Path $installDir $exeName
-
-if (-not (Test-Path $sourceExe)) {
-    Write-Error "Cannot find $sourceExe. Please run build_release.ps1 first to build the executable."
+# 2. Validate parameters
+if ($Mode -eq "agent" -and $HubUrl -eq "") {
+    Write-Error "Agent mode requires -HubUrl. Example: -HubUrl 'https://hub:8080'"
+    exit 1
+}
+if ($ApiKey -eq "") {
+    Write-Error "-ApiKey is required for both agent and hub modes."
+    exit 1
+}
+if ($Mode -eq "hub" -and $Db -eq "postgres" -and $Dsn -eq "") {
+    Write-Error "Hub mode with -Db postgres requires -Dsn."
     exit 1
 }
 
-# 2. Stop and uninstall existing service (if running)
-Write-Host "Checking for existing sysmon service..."
-$existingService = Get-Service -Name "sysmon" -ErrorAction SilentlyContinue
+$installDir = "$env:ProgramFiles\Sysmon"
+$exeName    = "wmonitor.exe"
+$sourceExe  = Join-Path $PSScriptRoot $exeName
+$targetExe  = Join-Path $installDir $exeName
+
+# Config file under %LOCALAPPDATA%\Sysmon (same as DataDir())
+$configDir  = Join-Path $env:LOCALAPPDATA "Sysmon"
+$configFile = Join-Path $configDir "config.env"
+
+if (-not (Test-Path $sourceExe)) {
+    Write-Error "Cannot find $sourceExe. Please run build_release.ps1 first."
+    exit 1
+}
+
+# 3. Stop and uninstall existing service
+Write-Host "Checking for existing wmonitor service..."
+$existingService = Get-Service -Name "wmonitor" -ErrorAction SilentlyContinue
 if ($existingService) {
-    Write-Host "Stopping sysmon service..."
-    Stop-Service -Name "sysmon" -Force
+    Write-Host "Stopping wmonitor service..."
+    Stop-Service -Name "wmonitor" -Force
     Start-Sleep -Seconds 2
-    
-    # We call the executable to uninstall itself if it's already there
     if (Test-Path $targetExe) {
         Write-Host "Uninstalling old service registration..."
         & $targetExe -uninstall
@@ -49,46 +98,86 @@ if ($existingService) {
     }
 }
 
-# 3. Copy files
+# 4. Copy files
 Write-Host "Creating installation directory: $installDir"
 if (-not (Test-Path $installDir)) {
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 }
-
 Write-Host "Copying $exeName to $installDir"
 Copy-Item -Path $sourceExe -Destination $targetExe -Force
 
-# 4. Add to PATH (Machine level)
+# 5. Add to PATH (Machine level)
 $envPath = [Environment]::GetEnvironmentVariable("PATH", [EnvironmentVariableTarget]::Machine)
 if ($envPath -notmatch [regex]::Escape($installDir)) {
     Write-Host "Adding $installDir to System PATH..."
     $newPath = $envPath + (if ($envPath.EndsWith(";")) { "" } else { ";" }) + $installDir
     [Environment]::SetEnvironmentVariable("PATH", $newPath, [EnvironmentVariableTarget]::Machine)
-    $env:PATH = $newPath # Update current session
+    $env:PATH = $newPath
 }
 
-# 5. Install and Start Service
-Write-Host "Installing Sysmon service..."
-& $targetExe -install
+# 6. Write config.env — credentials never go on the command line
+Write-Host "Writing config to: $configFile"
+if (-not (Test-Path $configDir)) {
+    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+}
 
+$configLines = @(
+    "# W-Monitor config — DO NOT COMMIT — generated by install.ps1",
+    "WMONITOR_MODE=$Mode",
+    "WMONITOR_API_KEY=$ApiKey"
+)
+if ($Mode -eq "agent") {
+    $configLines += "WMONITOR_AGENT_HUB=$HubUrl"
+}
+if ($Mode -eq "hub" -and $Db -eq "postgres") {
+    $configLines += "WMONITOR_DB_DSN=$Dsn"
+    $configLines += "WMONITOR_DB=postgres"
+}
+
+$configLines | Set-Content -Path $configFile -Encoding UTF8
+
+# Lock: only SYSTEM and current user can read (no other users)
+Write-Host "Locking config file permissions..."
+icacls $configFile /inheritance:r /grant:r "SYSTEM:(R)" /grant:r "${env:USERNAME}:(R)" | Out-Null
+
+# 7. Determine service arguments from mode
+$serviceArgs = @("-port", "8080")
+if ($Mode -eq "agent") {
+    $serviceArgs += @("-agent", $HubUrl, "-api-key", $ApiKey)
+} else {
+    # hub mode
+    $serviceArgs += @("-hub")
+    if ($Db -eq "postgres") {
+        $serviceArgs += @("-db", "postgres")
+    }
+}
+
+# 8. Install and start the service
+Write-Host "Installing W-Monitor service ($Mode mode)..."
+& $targetExe -install @serviceArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to install service."
     exit 1
 }
 
-Write-Host "Starting Sysmon service..."
+Write-Host "Starting W-Monitor service..."
 & $targetExe -start
-
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to start service."
     exit 1
 }
 
 Write-Host ""
-Write-Host "Sysmon has been successfully installed and started!" -ForegroundColor Green
-Write-Host "Dashboard is available at http://localhost:8080"
-Write-Host "Logs are stored in the Windows Event Viewer."
-Write-Host "Data is stored in %LOCALAPPDATA%\Sysmon\sysmon.db (usually C:\Windows\System32\config\systemprofile\AppData\Local\Sysmon for SYSTEM account)."
+if ($Mode -eq "agent") {
+    Write-Host "W-Monitor AGENT installed and started!" -ForegroundColor Green
+    Write-Host "  Pushing metrics to: $HubUrl"
+    Write-Host "  Config stored in:   $configFile"
+} else {
+    Write-Host "W-Monitor HUB installed and started!" -ForegroundColor Green
+    Write-Host "  Dashboard:  http://localhost:8080"
+    Write-Host "  DB backend: $Db"
+    Write-Host "  Config:     $configFile"
+}
 Write-Host ""
 Write-Host "Press any key to exit..."
 $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null

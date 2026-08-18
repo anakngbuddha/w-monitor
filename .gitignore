@@ -13,3 +13,10 @@ graph.json
 
 # Go
 vendor/
+
+# W-Monitor credentials — NEVER commit these
+config.env
+*.config.env
+wmonitor_export_*.csv
+wmonitor_export_*.txt
+*.html

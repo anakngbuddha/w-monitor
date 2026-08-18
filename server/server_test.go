@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -109,4 +110,105 @@ func TestAPIMetrics(t *testing.T) {
 		t.Fatalf("health: expected 200, got %d", w3.Code)
 	}
 	t.Logf("/api/health → %s", w3.Body.String())
+}
+
+// TestAPIServers verifies the /api/servers endpoint returns distinct server IDs.
+func TestAPIServers(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "servers_test.db")
+	db, err := storage.Open(tmp)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	for _, sid := range []string{"srv-a", "srv-b", "srv-a"} {
+		db.InsertMetric(storage.MetricRow{
+			Timestamp: now,
+			ServerID:  sid,
+			CPUPct:    1.0,
+			MemPct:    1.0,
+		})
+	}
+
+	srv := server.New(db, "9997")
+	req := httptest.NewRequest("GET", "/api/servers", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Servers []string `json:"servers"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	t.Logf("/api/servers → %v", resp.Servers)
+	if len(resp.Servers) != 2 {
+		t.Errorf("expected 2 distinct servers, got %d: %v", len(resp.Servers), resp.Servers)
+	}
+}
+
+// TestHubIngest verifies the /api/ingest endpoint accepts metrics with a valid API key
+// and rejects requests with a wrong key.
+func TestHubIngest(t *testing.T) {
+	const apiKey = "supersecret"
+
+	tmp := filepath.Join(t.TempDir(), "hub_test.db")
+	db, err := storage.Open(tmp)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	srv := server.New(db, "9996")
+	srv.EnableHubMode(apiKey)
+
+	// Insert via /api/ingest
+	m := storage.MetricRow{
+		Timestamp: time.Now(),
+		ServerID:  "agent-01",
+		CPUPct:    77.5,
+		MemPct:    50.0,
+		DiskFreeGB: 50.0,
+	}
+	body, _ := json.Marshal(m)
+
+	req := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", apiKey)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify row was inserted
+	rows, err := db.QueryMetrics(time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("QueryMetrics: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("expected 1 row after ingest, got %d", len(rows))
+	} else if rows[0].ServerID != "agent-01" {
+		t.Errorf("expected ServerID=agent-01, got %q", rows[0].ServerID)
+	} else if rows[0].CPUPct != 77.5 {
+		t.Errorf("expected CPUPct=77.5, got %v", rows[0].CPUPct)
+	}
+
+	// Wrong key → 401
+	req2 := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-API-Key", "wrong-key")
+	w2 := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w2, req2)
+	if w2.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong key, got %d", w2.Code)
+	}
+
+	t.Logf("Hub ingest: POST /api/ingest → 202; wrong key → 401 ✓")
 }

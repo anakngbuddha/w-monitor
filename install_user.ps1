@@ -25,10 +25,10 @@ if (-not (Test-Path $sourceExe)) {
 }
 
 # 1. Stop existing process if running
-$existingProcess = Get-Process -Name "sysmon" -ErrorAction SilentlyContinue
+$existingProcess = Get-Process -Name "wmonitor", "sysmon" -ErrorAction SilentlyContinue
 if ($existingProcess) {
-    Write-Host "Stopping existing sysmon process..."
-    Stop-Process -Name "sysmon" -Force
+    Write-Host "Stopping existing wmonitor process..."
+    Stop-Process -InputObject $existingProcess -Force
     Start-Sleep -Seconds 2
 }
 

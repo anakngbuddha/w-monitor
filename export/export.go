@@ -1,4 +1,4 @@
-// Package export generates CSV and PDF summary reports from sysmon data.
+// Package export generates CSV and text summary reports from sysmon data.
 package export
 
 import (
@@ -27,17 +27,17 @@ type Summary struct {
 	TotalNetSentBytes   uint64
 	TotalNetRecvBytes   uint64
 
-	MinDiskIOPS         float64
-	AvgDiskIOPS         float64
-	PeakDiskIOPS        float64
+	MinDiskIOPS  float64
+	AvgDiskIOPS  float64
+	PeakDiskIOPS float64
 
-	MinNetMBps          float64
-	AvgNetMBps          float64
-	PeakNetMBps         float64
+	MinNetMBps  float64
+	AvgNetMBps  float64
+	PeakNetMBps float64
 
-	MinConcurrentUsers  int
-	AvgConcurrentUsers  float64
-	MaxConcurrentUsers  int
+	MinConcurrentUsers int
+	AvgConcurrentUsers float64
+	MaxConcurrentUsers int
 
 	SuggestedMinCPU     int
 	SuggestedMinRAM     float64
@@ -53,7 +53,7 @@ type Summary struct {
 }
 
 // WriteCSV writes a CSV summary of metrics with a header block to the provided writer.
-func WriteCSV(w io.Writer, db *storage.DB, since time.Time) (int, error) {
+func WriteCSV(w io.Writer, db storage.Store, since time.Time) (int, error) {
 	rows, err := db.QueryMetrics(since)
 	if err != nil {
 		return 0, fmt.Errorf("query metrics: %w", err)
@@ -92,7 +92,7 @@ func WriteCSV(w io.Writer, db *storage.DB, since time.Time) (int, error) {
 
 	// Header
 	if err := cw.Write([]string{
-		"Date/Time (UTC)", "CPU %", "Memory %", "Disk Free GB", "Net Sent MB", "Net Recv MB", "vCPUs", "Total RAM GB", "Total Disk GB", "Disk IOPS", "Net MB/s", "Concurrent Users",
+		"Date/Time (UTC)", "Server ID", "Hostname", "CPU %", "Memory %", "Disk Free GB", "Net Sent MB", "Net Recv MB", "vCPUs", "Total RAM GB", "Total Disk GB", "Disk IOPS", "Net MB/s", "Concurrent Users",
 	}); err != nil {
 		return 0, err
 	}
@@ -101,6 +101,8 @@ func WriteCSV(w io.Writer, db *storage.DB, since time.Time) (int, error) {
 	for _, r := range rows {
 		if err := cw.Write([]string{
 			r.Timestamp.UTC().Format("2006-01-02 15:04:05"),
+			r.ServerID,
+			r.Hostname,
 			fmt.Sprintf("%.2f", r.CPUPct),
 			fmt.Sprintf("%.2f", r.MemPct),
 			fmt.Sprintf("%.2f", r.DiskFreeGB),
@@ -121,7 +123,7 @@ func WriteCSV(w io.Writer, db *storage.DB, since time.Time) (int, error) {
 }
 
 // CSVReport writes a CSV summary of metrics within the given time range to outPath.
-func CSVReport(db *storage.DB, since time.Time, outPath string) (int, error) {
+func CSVReport(db storage.Store, since time.Time, outPath string) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 		return 0, fmt.Errorf("mkdir: %w", err)
 	}
@@ -274,7 +276,7 @@ func ComputeSummary(rows []storage.MetricRow, period string) Summary {
 }
 
 // TextReport writes a human-readable plain-text summary report.
-func TextReport(db *storage.DB, since time.Time, outPath string) (Summary, error) {
+func TextReport(db storage.Store, since time.Time, outPath string) (Summary, error) {
 	rows, err := db.QueryMetrics(since)
 	if err != nil {
 		return Summary{}, fmt.Errorf("query metrics: %w", err)

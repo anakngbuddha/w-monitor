@@ -2,11 +2,13 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -14,17 +16,20 @@ import (
 	"Zeus/storage"
 )
 
-// Server wraps the HTTP mux and storage DB.
+// Server wraps the HTTP mux and storage store.
 type Server struct {
-	db          *storage.DB
+	db          storage.Store
 	port        string
 	mux         *http.ServeMux
 	mu          sync.Mutex
 	activeUsers map[string]time.Time
+	// Hub mode
+	hubMode bool
+	apiKey  string
 }
 
 // New creates a Server bound to the given port (e.g. "8080").
-func New(db *storage.DB, port string) *Server {
+func New(db storage.Store, port string) *Server {
 	s := &Server{
 		db:          db,
 		port:        port,
@@ -35,12 +40,25 @@ func New(db *storage.DB, port string) *Server {
 	return s
 }
 
+// EnableHubMode enables the /api/ingest endpoint with API key authentication.
+// apiKey is read from the WMONITOR_API_KEY env var if empty.
+func (s *Server) EnableHubMode(apiKey string) {
+	if apiKey == "" {
+		apiKey = os.Getenv("WMONITOR_API_KEY")
+	}
+	s.hubMode = true
+	s.apiKey = apiKey
+	s.mux.HandleFunc("/api/ingest", s.handleIngest)
+	log.Println("[server] hub mode enabled — POST /api/ingest accepting agent data")
+}
+
 // routes registers all HTTP handlers.
 func (s *Server) routes() {
 	s.mux.HandleFunc("/api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("/api/processes", s.handleProcesses)
 	s.mux.HandleFunc("/api/health", s.handleHealth)
 	s.mux.HandleFunc("/api/export/csv", s.handleExportCSV)
+	s.mux.HandleFunc("/api/servers", s.handleServers)
 	// Dashboard served at root — registered by dashboard package via RegisterDashboard
 }
 
@@ -100,20 +118,26 @@ type metricsResponse struct {
 }
 
 type metricDataPoint struct {
-	Timestamp       int64   `json:"ts"`
-	CPUPct          float64 `json:"cpu_pct"`
-	MemPct          float64 `json:"mem_pct"`
-	DiskFreeGB      float64 `json:"disk_free_gb"`
-	NetSentBytes    uint64  `json:"net_sent_bytes"`
-	NetRecvBytes    uint64  `json:"net_recv_bytes"`
-	CPUCores        int     `json:"cpu_cores"`
-	MemTotalGB      float64 `json:"mem_total_gb"`
-	DiskTotalGB     float64 `json:"disk_total_gb"`
-	DiskReadOps     uint64  `json:"disk_read_ops"`
-	DiskWriteOps    uint64  `json:"disk_write_ops"`
-	DiskIOPS        float64 `json:"disk_iops"`
-	NetMBps         float64 `json:"net_mbps"`
-	ConcurrentUsers int     `json:"concurrent_users"`
+	Timestamp        int64   `json:"ts"`
+	ServerID         string  `json:"server_id"`
+	Hostname         string  `json:"hostname"`
+	CPUPct           float64 `json:"cpu_pct"`
+	MemPct           float64 `json:"mem_pct"`
+	DiskFreeGB       float64 `json:"disk_free_gb"`
+	NetSentBytes     uint64  `json:"net_sent_bytes"`
+	NetRecvBytes     uint64  `json:"net_recv_bytes"`
+	CPUCores         int     `json:"cpu_cores"`
+	MemTotalGB       float64 `json:"mem_total_gb"`
+	DiskTotalGB      float64 `json:"disk_total_gb"`
+	DiskReadOps      uint64  `json:"disk_read_ops"`
+	DiskWriteOps     uint64  `json:"disk_write_ops"`
+	DiskIOPS         float64 `json:"disk_iops"`
+	NetMBps          float64 `json:"net_mbps"`
+	ConcurrentUsers  int     `json:"concurrent_users"`
+	NetSentExternal  uint64  `json:"net_sent_external"`
+	NetRecvExternal  uint64  `json:"net_recv_external"`
+	NetSentInternal  uint64  `json:"net_sent_internal"`
+	NetRecvInternal  uint64  `json:"net_recv_internal"`
 }
 
 func parseRange(r string) time.Duration {
@@ -141,11 +165,19 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optionally filter by server_id
+	serverFilter := r.URL.Query().Get("server_id")
+
 	// Build response — empty slice (not nil) so JSON returns [] not null
 	data := make([]metricDataPoint, 0, len(rows))
 	for _, row := range rows {
+		if serverFilter != "" && row.ServerID != serverFilter {
+			continue
+		}
 		data = append(data, metricDataPoint{
 			Timestamp:       row.Timestamp.Unix(),
+			ServerID:        row.ServerID,
+			Hostname:        row.Hostname,
 			CPUPct:          row.CPUPct,
 			MemPct:          row.MemPct,
 			DiskFreeGB:      row.DiskFreeGB,
@@ -159,6 +191,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			DiskIOPS:        row.DiskIOPS,
 			NetMBps:         row.NetMBps,
 			ConcurrentUsers: row.ConcurrentUsers,
+			NetSentExternal: row.NetSentExternal,
+			NetRecvExternal: row.NetRecvExternal,
+			NetSentInternal: row.NetSentInternal,
+			NetRecvInternal: row.NetRecvInternal,
 		})
 	}
 
@@ -169,13 +205,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 type processResponse struct {
-	Range string               `json:"range"`
-	Count int                  `json:"count"`
-	Data  []processDataPoint   `json:"data"`
+	Range string             `json:"range"`
+	Count int                `json:"count"`
+	Data  []processDataPoint `json:"data"`
 }
 
 type processDataPoint struct {
 	Timestamp int64   `json:"ts"`
+	ServerID  string  `json:"server_id"`
 	PID       int32   `json:"pid"`
 	Name      string  `json:"name"`
 	CPUPct    float64 `json:"cpu_pct"`
@@ -195,10 +232,16 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	serverFilter := r.URL.Query().Get("server_id")
+
 	data := make([]processDataPoint, 0, len(rows))
 	for _, row := range rows {
+		if serverFilter != "" && row.ServerID != serverFilter {
+			continue
+		}
 		data = append(data, processDataPoint{
 			Timestamp: row.Timestamp.Unix(),
+			ServerID:  row.ServerID,
 			PID:       row.PID,
 			Name:      row.Name,
 			CPUPct:    row.CPUPct,
@@ -217,10 +260,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	pc, _ := s.db.CountProcesses()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":         "ok",
-		"metric_rows":    mc,
-		"process_rows":   pc,
-		"timestamp":      time.Now().Unix(),
+		"status":        "ok",
+		"metric_rows":   mc,
+		"process_rows":  pc,
+		"timestamp":     time.Now().Unix(),
 	})
 }
 
@@ -238,4 +281,72 @@ func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("[server] CSV export error: %v", err)
 	}
+}
+
+// handleServers returns distinct server_id values seen in the DB (Phase 7).
+func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
+	servers, err := s.db.QueryServers()
+	if err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		log.Printf("[server] QueryServers error: %v", err)
+		return
+	}
+	if servers == nil {
+		servers = []string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(map[string]interface{}{"servers": servers})
+}
+
+// handleIngest accepts JSON metric/process payloads from agents (Phase 6 — Hub mode).
+// Requires X-API-Key header matching the configured API key.
+func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Constant-time API key comparison to prevent timing attacks
+	provided := r.Header.Get("X-API-Key")
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(s.apiKey)) != 1 {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		log.Printf("[server] ingest: unauthorized attempt from %s", r.RemoteAddr)
+		return
+	}
+
+	// Parse payload type
+	payloadType := r.URL.Query().Get("type") // "metric" or "process"
+
+	switch payloadType {
+	case "metric":
+		var m storage.MetricRow
+		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
+			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			return
+		}
+		if err := s.db.InsertMetric(m); err != nil {
+			http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+			log.Printf("[server] ingest metric error: %v", err)
+			return
+		}
+	case "process":
+		var p storage.ProcessRow
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			return
+		}
+		if err := s.db.InsertProcess(p); err != nil {
+			http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+			log.Printf("[server] ingest process error: %v", err)
+			return
+		}
+	default:
+		http.Error(w, `{"error":"type must be 'metric' or 'process'"}`, http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	w.Write([]byte(`{"status":"accepted"}`))
 }
