@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>W-Monitor — System Monitor</title>
   <meta name="description" content="Real-time system monitoring dashboard — CPU, memory, disk, network, disk IOPS, and concurrent user metrics." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23111111'/><text x='50%' y='55%' dominant-baseline='middle' text-anchor='middle' font-family='sans-serif' font-size='60' font-weight='bold' fill='%23ffffff'>W</text></svg>" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -779,9 +780,9 @@ async function fetchData() {
     // Aggregations
     let sumCPU = 0, peakCPU = 0;
     let sumMem = 0, peakMem = 0;
-    let minDisk = Infinity;
-    let sumIOPS = 0, peakIOPS = 0, minIOPS = Infinity;
-    let sumUsers = 0, maxUsers = 0, minUsers = Infinity;
+    let minDiskFree = Infinity;
+    let sumIOPS = 0, peakIOPS = 0, minRecordedIOPS = Infinity;
+    let sumUsers = 0, maxUsers = 0, minUsersVal = Infinity;
 
     data.forEach(d => {
       sumCPU += d.cpu_pct;
@@ -793,13 +794,13 @@ async function fetchData() {
 
       if (d.cpu_pct > peakCPU) peakCPU = d.cpu_pct;
       if (d.mem_pct > peakMem) peakMem = d.mem_pct;
-      if (d.disk_free_gb < minDisk) minDisk = d.disk_free_gb;
+      if (d.disk_free_gb < minDiskFree) minDiskFree = d.disk_free_gb;
 
       if (iops > peakIOPS) peakIOPS = iops;
-      if (iops < minIOPS) minIOPS = iops;
+      if (iops < minRecordedIOPS) minRecordedIOPS = iops;
 
       if (users > maxUsers) maxUsers = users;
-      if (users < minUsers) minUsers = users;
+      if (users < minUsersVal) minUsersVal = users;
     });
 
     const avgCPU = sumCPU / data.length;
@@ -813,7 +814,7 @@ async function fetchData() {
     document.getElementById('memAvg').textContent = `Avg: ${avgMem.toFixed(1)}%`;
     document.getElementById('memPeak').textContent = `Peak: ${peakMem.toFixed(1)}%`;
 
-    document.getElementById('diskAvg').textContent = `Min Free: ${minDisk === Infinity ? '0' : minDisk.toFixed(1)} GB`;
+    document.getElementById('diskAvg').textContent = `Min Free: ${minDiskFree === Infinity ? '0' : minDiskFree.toFixed(1)} GB`;
 
     document.getElementById('iopsAvg').textContent = `Avg: ${avgIOPS.toFixed(1)}`;
     document.getElementById('iopsPeak').textContent = `Peak: ${peakIOPS.toFixed(1)}`;
@@ -824,7 +825,7 @@ async function fetchData() {
     // Specs calculation
     const peakCPUvCPU = (peakCPU / 100) * (latest.cpu_cores || 1);
     const peakMemGB = (peakMem / 100) * (latest.mem_total_gb || 1);
-    const peakUsedDisk = (latest.disk_total_gb || 1) - (minDisk === Infinity ? 0 : minDisk);
+    const peakUsedDisk = (latest.disk_total_gb || 1) - (minDiskFree === Infinity ? 0 : minDiskFree);
 
     const { sentMB, recvMB } = computeNetDeltas(data);
     let peakNetMB = 0;
