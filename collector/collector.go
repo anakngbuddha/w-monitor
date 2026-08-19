@@ -47,13 +47,30 @@ type Collector struct {
 // New creates a Collector with the default poll interval.
 func New(db storage.Store) *Collector {
 	h, _ := resolveHostname()
-	return &Collector{db: db, interval: pollInterval, hostname: h}
+	return &Collector{
+		db:          db,
+		interval:    pollInterval,
+		hostname:    h,
+		serverID:    h,
+		userTracker: NewTCPUserTracker(),
+	}
 }
 
 // NewWithInterval creates a Collector with a custom poll interval (useful for testing).
 func NewWithInterval(db storage.Store, interval time.Duration) *Collector {
 	h, _ := resolveHostname()
-	return &Collector{db: db, interval: interval, hostname: h}
+	return &Collector{
+		db:          db,
+		interval:    interval,
+		hostname:    h,
+		serverID:    h,
+		userTracker: NewTCPUserTracker(),
+	}
+}
+
+// UserTracker returns the current UserTracker instance.
+func (c *Collector) UserTracker() UserTracker {
+	return c.userTracker
 }
 
 // SetUserTracker sets the UserTracker instance.

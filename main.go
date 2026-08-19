@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -45,6 +46,7 @@ import (
 var (
 	// Existing flags
 	flagPort      = flag.String("port", "8080", "HTTP port for the dashboard")
+	flagAppPort   = flag.String("app-port", "", "Comma-separated application listening ports to monitor for concurrent users (e.g. 80,443,3000)")
 	flagInstall   = flag.Bool("install", false, "Install wmonitor as a system service")
 	flagUninstall = flag.Bool("uninstall", false, "Uninstall the wmonitor service")
 	flagStart     = flag.Bool("start", false, "Start the installed service")
@@ -186,6 +188,13 @@ func main() {
 			*flagExternalIface = ifc
 		}
 	}
+	if *flagAppPort == "" {
+		if p := os.Getenv("WMONITOR_APP_PORT"); p != "" {
+			*flagAppPort = p
+		} else if p := os.Getenv("WMONITOR_APP_PORTS"); p != "" {
+			*flagAppPort = p
+		}
+	}
 
 	// ── Agent mode (Phase 5): no local DB, no Aiven credentials ──
 	if *flagAgentHub != "" {
@@ -236,6 +245,16 @@ func main() {
 	if *flagExternalIface != "" {
 		col.SetExternalIface(*flagExternalIface)
 	}
+	if *flagAppPort != "" {
+		if tracker, ok := col.UserTracker().(*collector.TCPUserTracker); ok {
+			tracker.SetAppPorts(parseAppPorts(*flagAppPort)...)
+		}
+	}
+	if srvPort, err := strconv.Atoi(*flagPort); err == nil && srvPort > 0 {
+		if tracker, ok := col.UserTracker().(*collector.TCPUserTracker); ok {
+			tracker.SetExcludePorts(uint32(srvPort))
+		}
+	}
 
 	// Retention only works with SQLite (uses raw *sql.DB). Postgres has no retention yet.
 	var ret *retention.Job
@@ -244,7 +263,6 @@ func main() {
 	}
 
 	srv := server.New(store, *flagPort)
-	col.SetUserTracker(srv)
 
 	if *flagHub {
 		srv.EnableHubMode(apiKey)
@@ -485,6 +503,21 @@ func resolveAPIKey() string {
 	return defaultAPIKey
 }
 
+// parseAppPorts parses a comma-separated list of port numbers.
+func parseAppPorts(raw string) []uint32 {
+	if raw == "" {
+		return nil
+	}
+	var ports []uint32
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if val, err := strconv.Atoi(p); err == nil && val > 0 && val <= 65535 {
+			ports = append(ports, uint32(val))
+		}
+	}
+	return ports
+}
+
 // runAgentMode starts the collector in agent mode — no local DB, no dashboard.
 // Metrics are POSTed to the hub's /api/ingest endpoint.
 func runAgentMode() {
@@ -500,6 +533,11 @@ func runAgentMode() {
 	col := collector.New(ag)
 	if *flagExternalIface != "" {
 		col.SetExternalIface(*flagExternalIface)
+	}
+	if *flagAppPort != "" {
+		if tracker, ok := col.UserTracker().(*collector.TCPUserTracker); ok {
+			tracker.SetAppPorts(parseAppPorts(*flagAppPort)...)
+		}
 	}
 	// Use hostname as server_id for identification in the hub's DB
 	h, _ := os.Hostname()

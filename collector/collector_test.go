@@ -2,6 +2,7 @@ package collector_test
 
 import (
 	"context"
+	"net"
 	"path/filepath"
 	"testing"
 	"time"
@@ -59,5 +60,54 @@ func TestCollectorRealData(t *testing.T) {
 	}
 	if plausible == 0 {
 		t.Error("all rows have zero mem/disk — collector may not be working correctly")
+	}
+}
+
+func TestTCPUserTracker(t *testing.T) {
+	tracker := collector.NewTCPUserTracker()
+
+	// Initial count
+	cnt := tracker.GetConcurrentUsers()
+	t.Logf("Initial concurrent users: %d", cnt)
+
+	// Test manual record
+	tracker.RecordUser("user1")
+	tracker.RecordUser("user2")
+	cnt = tracker.GetConcurrentUsers()
+	if cnt < 2 {
+		t.Errorf("expected at least 2 users after manual record, got %d", cnt)
+	}
+
+	// Test real HTTP server traffic
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer listener.Close()
+
+	port := uint32(listener.Addr().(*net.TCPAddr).Port)
+	tracker2 := collector.NewTCPUserTracker()
+	tracker2.SetAppPorts(port)
+
+	// Dial the listening port
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("net.Dial: %v", err)
+	}
+	defer conn.Close()
+
+	serverConn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("listener.Accept: %v", err)
+	}
+	defer serverConn.Close()
+
+	// Give OS socket table a moment to reflect ESTABLISHED state
+	time.Sleep(100 * time.Millisecond)
+
+	users := tracker2.GetConcurrentUsers()
+	t.Logf("Detected concurrent users on port %d: %d", port, users)
+	if users < 1 {
+		t.Errorf("expected at least 1 user on test app port %d, got %d", port, users)
 	}
 }

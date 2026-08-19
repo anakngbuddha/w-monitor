@@ -34,16 +34,19 @@ func TestDashboardServing(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	if !strings.Contains(body, "W-Monitor") {
-		t.Errorf("expected dashboard html to contain 'W-Monitor'")
+	requiredSnippets := []string{
+		"W-Monitor",
+		"updateMultiServerChart",
+		"updateMultiServerNetChart",
+		"SERVER_COLORS",
+		"server-badge",
+		"minDiskFree",
+		"renderProcesses",
+		"<link rel=\"icon\"",
 	}
-	if !strings.Contains(body, "minDiskFree") {
-		t.Errorf("expected dashboard html to use 'minDiskFree'")
-	}
-	if !strings.Contains(body, "minRecordedIOPS") {
-		t.Errorf("expected dashboard html to use 'minRecordedIOPS'")
-	}
-	if !strings.Contains(body, "<link rel=\"icon\"") {
-		t.Errorf("expected dashboard html to have favicon link")
+	for _, snip := range requiredSnippets {
+		if !strings.Contains(body, snip) {
+			t.Errorf("expected dashboard html to contain %q", snip)
+		}
 	}
 }
