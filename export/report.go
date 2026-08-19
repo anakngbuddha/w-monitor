@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"Zeus/storage"
@@ -17,6 +18,7 @@ type AssessmentReport struct {
 	Start       time.Time
 	End         time.Time
 	SampleCount int
+	Servers     []ServerSummary // per-server breakdown (len ≥ 1)
 }
 
 // GenerateAssessmentReport aggregates data over the period and writes an HTML report to outPath.
@@ -36,12 +38,17 @@ func GenerateAssessmentReport(db storage.Store, start, end time.Time, outPath st
 	}
 
 	period := fmt.Sprintf("%s to %s", start.UTC().Format("2006-01-02 15:04"), end.UTC().Format("2006-01-02 15:04"))
-	s := ComputeSummary(filtered, period)
+
+	// Compute per-server summaries first, then aggregate into fleet totals
+	servers := ComputePerServerSummaries(filtered, period)
+	fleet := AggregateFleetSummary(servers, period)
+
 	report := AssessmentReport{
-		Summary:     s,
+		Summary:     fleet,
 		Start:       start,
 		End:         end,
 		SampleCount: len(filtered),
+		Servers:     servers,
 	}
 
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
@@ -58,6 +65,89 @@ func GenerateAssessmentReport(db storage.Store, start, end time.Time, outPath st
 }
 
 func writeHTMLReport(f *os.File, r AssessmentReport) error {
+	// Decide labels based on fleet size
+	baselineTitle := "System Baseline"
+	baselineFleetLine := fmt.Sprintf(`<div class="metric"><span class="label">vCPUs</span><span class="value">%d</span></div>
+    <div class="metric"><span class="label">Total RAM</span><span class="value">%.1f GB</span></div>
+    <div class="metric"><span class="label">Total Disk</span><span class="value">%.1f GB</span></div>`,
+		r.CPUCores, r.MemTotalGB, r.DiskTotalGB)
+
+	if r.FleetServerCount > 1 {
+		baselineTitle = fmt.Sprintf("Fleet Baseline (%d Servers)", r.FleetServerCount)
+		baselineFleetLine = fmt.Sprintf(`<div class="metric"><span class="label">Servers</span><span class="value">%d</span></div>
+    <div class="metric"><span class="label">Total vCPUs</span><span class="value">%d</span></div>
+    <div class="metric"><span class="label">Total RAM</span><span class="value">%.1f GB</span></div>
+    <div class="metric"><span class="label">Total Disk</span><span class="value">%.1f GB</span></div>`,
+			r.FleetServerCount, r.CPUCores, r.MemTotalGB, r.DiskTotalGB)
+	}
+
+	cpuLabel := "CPU Usage"
+	memLabel := "Memory Usage"
+	if r.FleetServerCount > 1 {
+		cpuLabel = "CPU Usage (Fleet %)"
+		memLabel = "Memory Usage (Fleet %)"
+	}
+
+	// Build per-server breakdown table (shown only when monitoring multiple servers)
+	perServerSection := ""
+	if r.FleetServerCount > 1 {
+		var sb strings.Builder
+		sb.WriteString(`<div class="section">
+  <h2>🖥️ Per-Server Breakdown</h2>
+  <table class="specs-table">
+    <thead>
+      <tr>
+        <th>Server ID</th>
+        <th>Hostname</th>
+        <th>vCPU</th>
+        <th>RAM (GB)</th>
+        <th>Disk (GB)</th>
+        <th>Avg CPU%</th>
+        <th>Peak CPU%</th>
+        <th>Avg Mem%</th>
+        <th>Peak Mem%</th>
+        <th>Peak IOPS</th>
+        <th>Peak BW (MB/s)</th>
+        <th>Min Specs</th>
+        <th>Rec Specs</th>
+      </tr>
+    </thead>
+    <tbody>
+`)
+		for _, sv := range r.Servers {
+			s := sv.Summary
+			sb.WriteString(fmt.Sprintf(`      <tr>
+        <td>%s</td>
+        <td>%s</td>
+        <td>%d</td>
+        <td>%.1f</td>
+        <td>%.1f</td>
+        <td>%.1f%%</td>
+        <td>%.1f%%</td>
+        <td>%.1f%%</td>
+        <td>%.1f%%</td>
+        <td>%.0f</td>
+        <td>%.2f</td>
+        <td>%d vCPU / %.1f GB RAM</td>
+        <td>%d vCPU / %.1f GB RAM</td>
+      </tr>
+`,
+				sv.ServerID, sv.Hostname,
+				s.CPUCores, s.MemTotalGB, s.DiskTotalGB,
+				s.AvgCPU, s.PeakCPU,
+				s.AvgMem, s.PeakMem,
+				s.PeakDiskIOPS, s.PeakNetMBps,
+				s.SuggestedMinCPU, s.SuggestedMinRAM,
+				s.SuggestedRecCPU, s.SuggestedRecRAM,
+			))
+		}
+		sb.WriteString(`    </tbody>
+  </table>
+</div>
+`)
+		perServerSection = sb.String()
+	}
+
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -89,11 +179,11 @@ func writeHTMLReport(f *os.File, r AssessmentReport) error {
   .metric:last-child { border-bottom: none; }
   .metric .label { color: var(--muted); font-size: 0.875rem; }
   .metric .value { font-weight: 600; }
-  .specs-table { width: 100%%; border-collapse: collapse; margin-top: 1rem; }
-  .specs-table th { background: var(--primary); color: #fff; padding: 0.75rem 1rem; text-align: left; font-size: 0.8rem; }
-  .specs-table td { padding: 0.65rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.875rem; }
+  .specs-table { width: 100%%; border-collapse: collapse; margin-top: 1rem; overflow-x: auto; }
+  .specs-table th { background: var(--primary); color: #fff; padding: 0.75rem 1rem; text-align: left; font-size: 0.8rem; white-space: nowrap; }
+  .specs-table td { padding: 0.65rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.875rem; white-space: nowrap; }
   .specs-table tr:nth-child(even) td { background: var(--bg); }
-  .section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.5rem; margin-bottom: 1.5rem; }
+  .section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.5rem; margin-bottom: 1.5rem; overflow-x: auto; }
   .section h2 { font-size: 1rem; font-weight: 700; margin-bottom: 1rem; color: var(--primary); }
   .footer { text-align: center; color: var(--muted); font-size: 0.8rem; margin-top: 2rem; }
   @media print { body { padding: 0; } .header { border-radius: 0; } }
@@ -107,18 +197,16 @@ func writeHTMLReport(f *os.File, r AssessmentReport) error {
 
 <div class="grid">
   <div class="card">
-    <h2>System Baseline</h2>
-    <div class="metric"><span class="label">vCPUs</span><span class="value">%d</span></div>
-    <div class="metric"><span class="label">Total RAM</span><span class="value">%.1f GB</span></div>
-    <div class="metric"><span class="label">Total Disk</span><span class="value">%.1f GB</span></div>
+    <h2>%s</h2>
+    %s
   </div>
   <div class="card">
-    <h2>CPU Usage</h2>
+    <h2>%s</h2>
     <div class="metric"><span class="label">Average</span><span class="value">%.2f%%</span></div>
     <div class="metric"><span class="label">Peak</span><span class="value">%.2f%%</span></div>
   </div>
   <div class="card">
-    <h2>Memory Usage</h2>
+    <h2>%s</h2>
     <div class="metric"><span class="label">Average</span><span class="value">%.2f%%</span></div>
     <div class="metric"><span class="label">Peak</span><span class="value">%.2f%%</span></div>
     <div class="metric"><span class="label">Min Free Disk</span><span class="value">%.2f GB</span></div>
@@ -143,6 +231,7 @@ func writeHTMLReport(f *os.File, r AssessmentReport) error {
   </div>
 </div>
 
+%s
 <div class="section">
   <h2>🎯 Recommended Target Sizing</h2>
   <table class="specs-table">
@@ -183,21 +272,26 @@ func writeHTMLReport(f *os.File, r AssessmentReport) error {
 </body>
 </html>`,
 		r.Period,
+		// Header
 		r.Period, r.SampleCount, time.Now().UTC().Format(time.RFC3339),
-		// System baseline
-		r.CPUCores, r.MemTotalGB, r.DiskTotalGB,
-		// CPU
+		// System/Fleet baseline card
+		baselineTitle, baselineFleetLine,
+		// CPU card
+		cpuLabel,
 		r.AvgCPU, r.PeakCPU,
-		// Memory
+		// Memory card
+		memLabel,
 		r.AvgMem, r.PeakMem, r.MinDiskFreeGB,
-		// IOPS
+		// IOPS card
 		r.MinDiskIOPS, r.AvgDiskIOPS, r.PeakDiskIOPS,
-		// Network
+		// Network card
 		float64(r.TotalNetSentBytes)/(1024*1024*1024),
 		float64(r.TotalNetRecvBytes)/(1024*1024*1024),
 		r.PeakNetMBps,
-		// Users
+		// Users card
 		r.MinConcurrentUsers, r.AvgConcurrentUsers, r.MaxConcurrentUsers,
+		// Per-server breakdown (empty string for single server)
+		perServerSection,
 		// Minimum specs
 		r.SuggestedMinCPU, r.SuggestedMinRAM, r.SuggestedMinDiskGB, r.SuggestedMinIOPS, r.SuggestedMinNetMBps,
 		// Recommended specs
