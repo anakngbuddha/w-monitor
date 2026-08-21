@@ -20,6 +20,12 @@
 //	wmonitor -list-clients                      # list registered clients
 //	wmonitor -revoke-client <name>              # revoke a client's keys
 //	wmonitor -import-clients <csv>              # migrate clients_registry.csv into the DB
+//
+// Alerting:
+//
+//	wmonitor -write-default-alerts alerts.json  # write a starter rules file
+//	wmonitor -alerts alerts.json                # evaluate custom rules
+//	wmonitor -alert-slack <webhook-url>         # notify Slack when a rule fires
 package main
 
 import (
@@ -41,6 +47,7 @@ import (
 	"time"
 
 	"Zeus/agent"
+	"Zeus/alerting"
 	"Zeus/collector"
 	"Zeus/dashboard"
 	"Zeus/export"
@@ -138,6 +145,7 @@ type program struct {
 	srv       *server.Server
 	collector *collector.Collector
 	retention *retention.Job
+	evaluator *alerting.Evaluator
 	cancel    context.CancelFunc
 	// Keep *storage.DB around for Conn() (retention uses raw *sql.DB)
 	sqliteDB *storage.DB
@@ -155,6 +163,9 @@ func (p *program) run() {
 
 	// Collector goroutine
 	go p.collector.Run(ctx)
+
+	// Alert evaluation
+	runEvaluator(ctx, p.evaluator)
 
 	// Retention job (hourly) — only when we have a local SQLite DB
 	if p.retention != nil {
@@ -205,7 +216,10 @@ func main() {
 	flag.Parse()
 	recordExplicitFlags()
 	loadConfigEnv()
+
+	// Propagate the build stamp so /api/health and X-Agent-Version are useful.
 	server.BuildVersion = buildVersion
+	agent.BuildVersion = buildVersion
 
 	if *flagShowKey {
 		key := resolveAPIKey()
@@ -218,9 +232,13 @@ func main() {
 	}
 
 	applyEnvConfig()
+	alertEnvDefaults()
 
 	if *flagPrintConfig {
 		printConfig()
+		return
+	}
+	if maybeWriteDefaultAlerts() {
 		return
 	}
 
@@ -279,10 +297,15 @@ func main() {
 	}
 	configureUserTracker(col)
 
-	// Retention only works with SQLite (uses raw *sql.DB). Postgres has no retention yet.
+	// Retention only works with SQLite (uses raw *sql.DB).
 	var ret *retention.Job
 	if sqliteDB != nil {
 		ret = retention.New(sqliteDB.Conn())
+	} else {
+		// Called out loudly: the hub is the deployment that accumulates data from
+		// every agent, and it is the one with no pruning. See D5 in
+		// IMPLEMENTATION_PLAN.md.
+		log.Println("[wmonitor] WARNING: retention is not implemented for the Postgres backend — this database will grow without bound")
 	}
 
 	srv := server.New(store, *flagPort)
@@ -296,6 +319,8 @@ func main() {
 		srv.EnableHubMode(keys)
 	}
 
+	evaluator := buildEvaluator(store, srv)
+
 	if err := dashboard.Register(srv); err != nil {
 		log.Fatalf("dashboard register: %v", err)
 	}
@@ -305,6 +330,7 @@ func main() {
 		srv:       srv,
 		collector: col,
 		retention: ret,
+		evaluator: evaluator,
 		sqliteDB:  sqliteDB,
 	}
 
@@ -372,6 +398,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go col.Run(ctx)
+	runEvaluator(ctx, evaluator)
 
 	if ret != nil {
 		go func() {
@@ -517,6 +544,9 @@ func printConfig() {
 	fmt.Printf("app ports:       %s\n", orNone(*flagAppPort))
 	fmt.Printf("external iface:  %s\n", orNone(*flagExternalIface))
 	fmt.Printf("user window:     %s\n", *flagUserWindow)
+	fmt.Printf("alert rules:     %s\n", orNone(*flagAlerts))
+	fmt.Printf("alert webhook:   %s\n", orNone(*flagAlertWebhook))
+	fmt.Printf("alert slack:     %s\n", mask(*flagAlertSlack))
 	fmt.Printf("allowed origins: %s\n", orNone(os.Getenv("WMONITOR_ALLOWED_ORIGINS")))
 }
 
@@ -825,7 +855,14 @@ func runAgentMode() {
 	hubURL := strings.TrimRight(*flagAgentHub, "/")
 	log.Printf("[agent] starting (version %s) — pushing to %s", buildVersion, hubURL)
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	ag := agent.New(hubURL, apiKey)
+	// Retry spooled samples in the background; without this the spool would fill
+	// during an outage and never drain.
+	ag.StartDrainer(ctx)
+	defer ag.Close()
+
 	col := collector.New(ag)
 	if *flagExternalIface != "" {
 		col.SetExternalIface(*flagExternalIface)
@@ -833,7 +870,6 @@ func runAgentMode() {
 	configureUserTracker(col)
 	col.SetServerID(resolveServerID())
 
-	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -849,8 +885,8 @@ func runAgentMode() {
 //
 // Hostname alone is not unique: two clients each running a machine called
 // WIN-SERVER would merge into a single series inside a tenant, and renaming a
-// host would orphan all of its history. A UUID is generated once and persisted
-// alongside the data directory.
+// host would orphan all of its history. An identifier is generated once and
+// persisted in the data directory.
 func resolveServerID() string {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
@@ -874,7 +910,11 @@ func resolveServerID() string {
 		return hostname
 	}
 	// Human-readable prefix so operators can still recognise the machine.
-	id := hostname + "-" + strings.TrimPrefix(suffix, "t_")[:8]
+	trimmed := strings.TrimPrefix(suffix, "t_")
+	if len(trimmed) > 8 {
+		trimmed = trimmed[:8]
+	}
+	id := hostname + "-" + trimmed
 	if err := os.WriteFile(idPath, []byte(id), 0o600); err != nil {
 		log.Printf("[agent] could not persist server id (%v); falling back to hostname", err)
 		return hostname
