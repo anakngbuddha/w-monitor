@@ -14,10 +14,12 @@ import (
 	gopsutil_disk "github.com/shirou/gopsutil/v3/disk"
 	gopsutil_mem "github.com/shirou/gopsutil/v3/mem"
 	gopsutil_net "github.com/shirou/gopsutil/v3/net"
-	gopsutil_proc "github.com/shirou/gopsutil/v3/process"
 )
 
 const pollInterval = 10 * time.Second
+
+// topProcessCount is how many processes are persisted per snapshot.
+const topProcessCount = 20
 
 // UserTracker provides the active concurrent user count.
 type UserTracker interface {
@@ -26,17 +28,19 @@ type UserTracker interface {
 
 // Collector gathers system metrics on a fixed interval and writes to the store.
 type Collector struct {
-	db              storage.Store
-	interval        time.Duration
-	userTracker     UserTracker
-	serverID        string // set via SetServerID
-	hostname        string // resolved at startup
-	externalIface   string // override for external NIC auto-detect
-	prevTime        time.Time
-	prevReadOps     uint64
-	prevWriteOps    uint64
-	prevNetSent     uint64
-	prevNetRecv     uint64
+	db            storage.Store
+	interval      time.Duration
+	userTracker   UserTracker
+	serverID      string // set via SetServerID
+	hostname      string // resolved at startup
+	externalIface string // override for external NIC auto-detect
+	numCores      int
+	procSampler   *procCPUSampler
+	prevTime      time.Time
+	prevReadOps   uint64
+	prevWriteOps  uint64
+	prevNetSent   uint64
+	prevNetRecv   uint64
 	// per-interface previous counters
 	prevExtSent uint64
 	prevExtRecv uint64
@@ -46,24 +50,23 @@ type Collector struct {
 
 // New creates a Collector with the default poll interval.
 func New(db storage.Store) *Collector {
-	h, _ := resolveHostname()
-	return &Collector{
-		db:          db,
-		interval:    pollInterval,
-		hostname:    h,
-		serverID:    h,
-		userTracker: NewTCPUserTracker(),
-	}
+	return NewWithInterval(db, pollInterval)
 }
 
 // NewWithInterval creates a Collector with a custom poll interval (useful for testing).
 func NewWithInterval(db storage.Store, interval time.Duration) *Collector {
 	h, _ := resolveHostname()
+	cores, err := gopsutil_cpu.Counts(true)
+	if err != nil || cores < 1 {
+		cores = 1
+	}
 	return &Collector{
 		db:          db,
 		interval:    interval,
 		hostname:    h,
 		serverID:    h,
+		numCores:    cores,
+		procSampler: newProcCPUSampler(cores),
 		userTracker: NewTCPUserTracker(),
 	}
 }
@@ -90,10 +93,27 @@ func (c *Collector) SetExternalIface(iface string) {
 
 // Run starts the polling loop. It blocks until ctx is cancelled.
 func (c *Collector) Run(ctx context.Context) {
+	// Prime the delta-based samplers before the first real collection.
+	//
+	// gopsutil's non-blocking cpu.Percent(0, ...) reports usage since the
+	// previous call, so without a priming call the first sample would either be
+	// zero or cover the whole uptime of the process.
+	if _, err := gopsutil_cpu.Percent(0, false); err != nil {
+		log.Printf("[collector] cpu priming failed: %v", err)
+	}
+	c.procSampler.prime()
+
+	log.Printf("[collector] started, interval=%s server_id=%q cores=%d", c.interval, c.serverID, c.numCores)
+
+	// Collect immediately. The old loop waited a full interval before the first
+	// sample, so a freshly started service showed an empty dashboard for 10s and
+	// short -run-for windows lost their first data point entirely.
+	if err := c.collect(); err != nil {
+		log.Printf("[collector] collect error: %v", err)
+	}
+
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
-
-	log.Printf("[collector] started, interval=%s server_id=%q", c.interval, c.serverID)
 
 	for {
 		select {
@@ -112,8 +132,13 @@ func (c *Collector) Run(ctx context.Context) {
 func (c *Collector) collect() error {
 	now := time.Now()
 
-	// CPU — percent over 1-second sample window
-	cpuPcts, err := gopsutil_cpu.Percent(time.Second, false)
+	// CPU — non-blocking: percent since the previous call.
+	//
+	// Previously this was cpu.Percent(time.Second, false), which sleeps for a
+	// full second inside a 10s ticker. That made the true sample spacing ~11s
+	// while every rate denominator assumed 10s, biasing all throughput figures
+	// low by roughly 10%.
+	cpuPcts, err := gopsutil_cpu.Percent(0, false)
 	if err != nil {
 		log.Printf("[collector] cpu error: %v", err)
 	}
@@ -122,10 +147,7 @@ func (c *Collector) collect() error {
 		cpuPct = cpuPcts[0]
 	}
 
-	cpuCores, err := gopsutil_cpu.Counts(true)
-	if err != nil {
-		log.Printf("[collector] cpu cores error: %v", err)
-	}
+	cpuCores := c.numCores
 
 	// Memory
 	vm, err := gopsutil_mem.VirtualMemory()
@@ -192,37 +214,29 @@ func (c *Collector) collect() error {
 		}
 	}
 
-	// Calculate IOPS and Net MB/s deltas
+	// Calculate IOPS and Net MB/s deltas.
+	// counterDelta reports a reset rather than treating the absolute counter as
+	// an interval delta (see collector/delta.go).
 	diskIOPS := 0.0
 	netMBps := 0.0
 	if !c.prevTime.IsZero() {
 		elapsed := now.Sub(c.prevTime).Seconds()
 		if elapsed > 0 {
-			var deltaRead, deltaWrite uint64
-			if diskReadOps >= c.prevReadOps {
-				deltaRead = diskReadOps - c.prevReadOps
+			deltaRead, resetRead := counterDelta(diskReadOps, c.prevReadOps)
+			deltaWrite, resetWrite := counterDelta(diskWriteOps, c.prevWriteOps)
+			if resetRead || resetWrite {
+				log.Printf("[collector] disk IO counter reset detected — reporting 0 IOPS for this interval")
 			} else {
-				deltaRead = diskReadOps
+				diskIOPS = float64(deltaRead+deltaWrite) / elapsed
 			}
-			if diskWriteOps >= c.prevWriteOps {
-				deltaWrite = diskWriteOps - c.prevWriteOps
-			} else {
-				deltaWrite = diskWriteOps
-			}
-			diskIOPS = float64(deltaRead+deltaWrite) / elapsed
 
-			var deltaSent, deltaRecv uint64
-			if netSent >= c.prevNetSent {
-				deltaSent = netSent - c.prevNetSent
+			deltaSent, resetSent := counterDelta(netSent, c.prevNetSent)
+			deltaRecv, resetRecv := counterDelta(netRecv, c.prevNetRecv)
+			if resetSent || resetRecv {
+				log.Printf("[collector] network counter reset detected — reporting 0 MB/s for this interval")
 			} else {
-				deltaSent = netSent
+				netMBps = float64(deltaSent+deltaRecv) / (elapsed * 1024 * 1024)
 			}
-			if netRecv >= c.prevNetRecv {
-				deltaRecv = netRecv - c.prevNetRecv
-			} else {
-				deltaRecv = netRecv
-			}
-			netMBps = float64(deltaSent+deltaRecv) / (elapsed * 1024 * 1024)
 		}
 	}
 	c.prevTime = now
@@ -268,8 +282,8 @@ func (c *Collector) collect() error {
 		return err
 	}
 
-	// Processes — top 20 by CPU
-	procs, err := collectTopProcesses(now, c.serverID, c.hostname, 20)
+	// Processes — top N by CPU consumed since the previous poll.
+	procs, err := c.procSampler.sample(now, c.serverID, c.hostname, topProcessCount)
 	if err != nil {
 		log.Printf("[collector] processes error: %v", err)
 	} else {
@@ -285,54 +299,6 @@ func (c *Collector) collect() error {
 	return nil
 }
 
-// collectTopProcesses returns process stats for the top N processes by CPU.
-func collectTopProcesses(ts time.Time, serverID, hostname string, n int) ([]storage.ProcessRow, error) {
-	procs, err := gopsutil_proc.Processes()
-	if err != nil {
-		return nil, err
-	}
-
-	var rows []storage.ProcessRow
-
-	for _, p := range procs {
-		name, _ := p.Name()
-		cpu, err := p.CPUPercent()
-		if err != nil {
-			continue
-		}
-		memInfo, err := p.MemoryInfo()
-		if err != nil || memInfo == nil {
-			continue
-		}
-		memMB := float64(memInfo.RSS) / (1024 * 1024)
-		rows = append(rows, storage.ProcessRow{
-			Timestamp: ts,
-			ServerID:  serverID,
-			Hostname:  hostname,
-			PID:       p.Pid,
-			Name:      name,
-			CPUPct:    cpu,
-			MemMB:     memMB,
-		})
-	}
-
-	// Sort by CPU descending (simple selection of top N)
-	for i := 0; i < len(rows) && i < n; i++ {
-		max := i
-		for j := i + 1; j < len(rows); j++ {
-			if rows[j].CPUPct > rows[max].CPUPct {
-				max = j
-			}
-		}
-		rows[i], rows[max] = rows[max], rows[i]
-	}
-
-	if len(rows) > n {
-		rows = rows[:n]
-	}
-	return rows, nil
-}
-
 // resolveHostname returns the system hostname.
 func resolveHostname() (string, error) {
 	h, err := os.Hostname()
@@ -344,28 +310,5 @@ func resolveHostname() (string, error) {
 
 // detectExternalIface returns the NIC name that holds the default route,
 // used as the "external" interface for traffic split. Falls back to "" on error.
-func detectExternalIface() string {
-	// Use the first non-loopback interface that has a gateway — heuristic:
-	// The interface with the most bytes sent is typically the external one.
-	// For a proper implementation we would inspect routing tables, but this
-	// is platform-specific. We use a simple heuristic that works in most cases.
-	ifaces, err := gopsutil_net.IOCounters(true)
-	if err != nil || len(ifaces) == 0 {
-		return ""
-	}
-
-	var bestName string
-	var bestBytes uint64
-	for _, ifc := range ifaces {
-		// Skip loopback
-		if ifc.Name == "lo" || ifc.Name == "Loopback Pseudo-Interface 1" {
-			continue
-		}
-		total := ifc.BytesSent + ifc.BytesRecv
-		if total > bestBytes {
-			bestBytes = total
-			bestName = ifc.Name
-		}
-	}
-	return bestName
-}
+//
+// Implemented in iface.go.
