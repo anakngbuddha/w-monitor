@@ -4,9 +4,9 @@
 // writing to a local database, it POSTs each row as JSON to a central Hub
 // over HTTPS, authenticated with a shared API key.
 //
-// Delivery is durable: a failed post is written to a bounded on-disk spool and
-// retried with exponential backoff, so a hub outage costs latency rather than
-// data.
+// Delivery is durable: a retryable failure is written to a bounded on-disk spool
+// and retried with exponential backoff, so a hub outage costs latency rather
+// than data.
 //
 // Agent machines never receive or store Aiven/Postgres credentials.
 package agent
@@ -39,6 +39,11 @@ const (
 )
 
 // retryableError marks a failure worth retrying later.
+//
+// The distinction is load-bearing: retryable failures get spooled, permanent
+// ones do not. Spooling a permanent failure would fill the disk with rows that
+// can never be accepted, and because Drain stops at the first failure to
+// preserve ordering, a single poison entry would block the whole backlog.
 type retryableError struct {
 	err        error
 	retryAfter time.Duration
@@ -46,6 +51,11 @@ type retryableError struct {
 
 func (e *retryableError) Error() string { return e.err.Error() }
 func (e *retryableError) Unwrap() error { return e.err }
+
+func isRetryable(err error) bool {
+	var re *retryableError
+	return errors.As(err, &re)
+}
 
 // Agent POSTs metric and process rows to a Zeus Hub.
 type Agent struct {
@@ -62,8 +72,8 @@ type Agent struct {
 // apiKey is sent in the X-API-Key request header.
 //
 // If a spool directory is available, delivery becomes durable and a background
-// drainer is started. If it is not, the agent still runs but drops rows on
-// failure, exactly as it did before, and says so.
+// drainer can be started with StartDrainer. If it is not, the agent still runs
+// but drops rows on failure, exactly as it did before, and says so.
 func New(hubURL, apiKey string) *Agent {
 	a := &Agent{
 		hubURL: hubURL,
@@ -119,9 +129,8 @@ func (a *Agent) drainLoop(ctx context.Context) {
 	backoff := minBackoff
 
 	for {
-		depth, err := a.spool.Depth()
-		if err == nil && depth > 0 {
-			delivered, drainErr := a.spool.Drain(a.deliver)
+		if depth, err := a.spool.Depth(); err == nil && depth > 0 {
+			delivered, drainErr := a.spool.Drain(a.deliverOrDrop)
 			if delivered > 0 {
 				log.Printf("[agent] delivered %d spooled sample(s)", delivered)
 			}
@@ -130,7 +139,7 @@ func (a *Agent) drainLoop(ctx context.Context) {
 			} else {
 				var re *retryableError
 				if errors.As(drainErr, &re) && re.retryAfter > 0 {
-					// The hub asked us to wait a specific amount of time.
+					// The hub told us how long to wait.
 					backoff = re.retryAfter
 				} else {
 					backoff *= 2
@@ -154,6 +163,21 @@ func (a *Agent) drainLoop(ctx context.Context) {
 		case <-time.After(wait):
 		}
 	}
+}
+
+// deliverOrDrop delivers a spooled entry, discarding it if the hub rejects it
+// permanently.
+//
+// Returning nil for a permanent rejection looks odd but is correct here:
+// Drain halts at the first error to preserve ordering, so returning the error
+// would park the queue behind an entry that can never succeed.
+func (a *Agent) deliverOrDrop(payloadType string, body []byte) error {
+	err := a.deliver(payloadType, body)
+	if err == nil || isRetryable(err) {
+		return err
+	}
+	log.Printf("[agent] discarding spooled %s: hub rejected it permanently (%v)", payloadType, err)
+	return nil
 }
 
 func (a *Agent) wakeDrainer() {
@@ -199,7 +223,7 @@ func (a *Agent) QueryServers(tenantID string) ([]string, error) {
 	return nil, fmt.Errorf("agent: QueryServers not supported in agent mode")
 }
 
-// Close flushes what it can and releases resources.
+// Close reports any undelivered backlog and releases resources.
 func (a *Agent) Close() error {
 	if a.spool != nil {
 		if depth, err := a.spool.Depth(); err == nil && depth > 0 {
@@ -209,19 +233,19 @@ func (a *Agent) Close() error {
 	return nil
 }
 
-// enqueue attempts immediate delivery and spools the payload on failure.
+// enqueue attempts immediate delivery, spooling the payload on a retryable
+// failure.
 //
-// The collector must never block on network conditions, so a failure here is not
-// returned as an error: the sample is safely queued, and reporting an error
-// would make the collector log a scary message about data it did not actually
-// lose.
+// A retryable failure returns nil: the sample is safely queued, and reporting an
+// error would make the collector log a loss that did not happen. A permanent
+// failure is returned, because the operator needs to know their key is wrong.
 func (a *Agent) enqueue(payloadType string, v interface{}) error {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("agent: marshal %s: %w", payloadType, err)
 	}
 
-	// If a backlog exists, append rather than jumping the queue: delivering the
+	// With a backlog present, append instead of jumping the queue: delivering the
 	// newest sample first would reorder the client's history.
 	if a.spool != nil {
 		if depth, err := a.spool.Depth(); err == nil && depth > 0 {
@@ -230,17 +254,25 @@ func (a *Agent) enqueue(payloadType string, v interface{}) error {
 		}
 	}
 
-	if err := a.deliver(payloadType, body); err != nil {
-		if a.spool == nil {
-			// No spool available: this is the old lossy behaviour, reported honestly.
-			return fmt.Errorf("agent: %s dropped (no spool): %w", payloadType, err)
-		}
-		if appendErr := a.spool.Append(payloadType, body); appendErr != nil {
-			return fmt.Errorf("agent: %s lost — delivery failed (%v) and spooling failed: %w", payloadType, err, appendErr)
-		}
-		log.Printf("[agent] hub unreachable (%v); sample spooled for retry", err)
-		a.wakeDrainer()
+	deliverErr := a.deliver(payloadType, body)
+	if deliverErr == nil {
+		return nil
 	}
+
+	if !isRetryable(deliverErr) {
+		// Bad key or malformed payload. Retrying cannot help, and spooling would
+		// fill the disk with rows the hub will never accept.
+		return deliverErr
+	}
+
+	if a.spool == nil {
+		return fmt.Errorf("agent: %s dropped (no spool available): %w", payloadType, deliverErr)
+	}
+	if appendErr := a.spool.Append(payloadType, body); appendErr != nil {
+		return fmt.Errorf("agent: %s lost — delivery failed (%v) and spooling failed: %w", payloadType, deliverErr, appendErr)
+	}
+	log.Printf("[agent] hub unreachable (%v); sample spooled for retry", deliverErr)
+	a.wakeDrainer()
 	return nil
 }
 
@@ -249,8 +281,7 @@ func (a *Agent) enqueue(payloadType string, v interface{}) error {
 // Retry classification is deliberate. The previous implementation retried
 // network errors but broke out of its loop on any HTTP error status, so a hub
 // restart returning 502 was treated as permanent and the sample was discarded.
-// 5xx and 429 are transient; 400 and 401 are not, and retrying a malformed row
-// or a rejected key forever would just fill the spool.
+// 5xx and 429 are transient; 400 and 401 are not.
 func (a *Agent) deliver(payloadType string, body []byte) error {
 	url := fmt.Sprintf("%s/api/ingest?type=%s", a.hubURL, payloadType)
 
@@ -279,6 +310,9 @@ func (a *Agent) deliver(payloadType string, body []byte) error {
 	case resp.StatusCode == http.StatusBadRequest:
 		// Permanent: the payload itself is wrong.
 		return fmt.Errorf("agent: hub rejected %s payload as malformed", payloadType)
+
+	case resp.StatusCode == http.StatusRequestEntityTooLarge:
+		return fmt.Errorf("agent: hub rejected %s payload as too large", payloadType)
 
 	case resp.StatusCode == http.StatusTooManyRequests:
 		wait := minBackoff
