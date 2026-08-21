@@ -55,6 +55,9 @@ type Server struct {
 	authCache *authCache
 	limiter   *rateLimiter
 
+	// alerts is set by SetAlertSource when alerting is enabled.
+	alerts AlertSource
+
 	allowedOrigins []string
 }
 
@@ -453,6 +456,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	} else {
 		body["last_metric_age_seconds"] = nil
 	}
+	if s.alerts != nil {
+		body["active_alerts"] = len(s.alerts.ActiveJSON())
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if !healthy {
@@ -502,6 +508,10 @@ func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, "# HELP wmonitor_dashboard_viewers Unique IPs seen in the last 60s.\n")
 	fmt.Fprintf(w, "# TYPE wmonitor_dashboard_viewers gauge\nwmonitor_dashboard_viewers %d\n", s.DashboardViewers())
+	if s.alerts != nil {
+		fmt.Fprintf(w, "# HELP wmonitor_active_alerts Currently firing alerts.\n")
+		fmt.Fprintf(w, "# TYPE wmonitor_active_alerts gauge\nwmonitor_active_alerts %d\n", len(s.alerts.ActiveJSON()))
+	}
 }
 
 func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
