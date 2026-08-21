@@ -1,7 +1,6 @@
 package server_test
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -74,9 +73,10 @@ func TestAPIMetrics(t *testing.T) {
 		t.Errorf("expected newest disk_iops=80.0, got %v", resp.Data[len(resp.Data)-1].DiskIOPS)
 	}
 
-	// Verify ConcurrentUsers tracking via request
-	if srv.GetConcurrentUsers() < 1 {
-		t.Errorf("expected at least 1 concurrent user after request, got %d", srv.GetConcurrentUsers())
+	// Dashboard viewers are tracked per source IP. Note this is deliberately NOT
+	// the same thing as the collector's concurrent-user metric.
+	if srv.DashboardViewers() < 1 {
+		t.Errorf("expected at least 1 dashboard viewer after a request, got %d", srv.DashboardViewers())
 	}
 
 	// --- Test empty DB returns empty array, not null ---
@@ -101,15 +101,117 @@ func TestAPIMetrics(t *testing.T) {
 		t.Error("expected empty array [], got null for empty DB")
 	}
 	t.Logf("empty DB returns: data len=%d (should be 0)", len(emptyResp.Data))
+}
 
-	// --- Test /api/health ---
-	req3 := httptest.NewRequest("GET", "/api/health", nil)
-	w3 := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w3, req3)
-	if w3.Code != http.StatusOK {
-		t.Fatalf("health: expected 200, got %d", w3.Code)
+// A healthy server reports ok with freshness information instead of the old
+// unbounded COUNT(*) row totals.
+func TestHealthReportsStatusAndFreshness(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "health_test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	t.Logf("/api/health → %s", w3.Body.String())
+	defer db.Close()
+
+	db.InsertMetric(storage.MetricRow{Timestamp: time.Now(), CPUPct: 5, MemPct: 5})
+
+	srv := server.New(db, "9995")
+	req := httptest.NewRequest("GET", "/api/health", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var body map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["status"] != "ok" {
+		t.Errorf("status = %v, want ok", body["status"])
+	}
+	if _, ok := body["last_metric_age_seconds"]; !ok {
+		t.Error("health response is missing last_metric_age_seconds")
+	}
+	if _, ok := body["uptime_seconds"]; !ok {
+		t.Error("health response is missing uptime_seconds")
+	}
+}
+
+// A closed database must not be reported as healthy. The old handler discarded
+// the error and always answered 200 "ok".
+func TestHealthReportsDegradedWhenDBIsDown(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "health_down_test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	srv := server.New(db, "9994")
+	db.Close() // simulate an unreachable backend
+
+	req := httptest.NewRequest("GET", "/api/health", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for an unreachable database, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var body map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&body)
+	if body["status"] == "ok" {
+		t.Error("a dead database was reported as healthy")
+	}
+}
+
+func TestReadyEndpoint(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "ready_test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	srv := server.New(db, "9993")
+	req := httptest.NewRequest("GET", "/api/ready", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestPrometheusEndpoint(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "prom_test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	srv := server.New(db, "9992")
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{"wmonitor_up", "wmonitor_uptime_seconds"} {
+		if !contains(body, want) {
+			t.Errorf("prometheus output missing %q\n%s", want, body)
+		}
+	}
+}
+
+func contains(haystack, needle string) bool {
+	return len(haystack) >= len(needle) && (func() bool {
+		for i := 0; i+len(needle) <= len(haystack); i++ {
+			if haystack[i:i+len(needle)] == needle {
+				return true
+			}
+		}
+		return false
+	})()
 }
 
 // TestAPIServers verifies the /api/servers endpoint returns distinct server IDs.
@@ -152,118 +254,7 @@ func TestAPIServers(t *testing.T) {
 	}
 }
 
-// TestHubIngest verifies the /api/ingest endpoint accepts metrics with an API key
-// and isolates metrics between different tenants.
-func TestHubIngest(t *testing.T) {
-	const key1 = "client-alpha-key"
-	const key2 = "client-beta-key"
-
-	tmp := filepath.Join(t.TempDir(), "hub_test.db")
-	db, err := storage.Open(tmp)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	srv := server.New(db, "9996")
-	srv.EnableHubMode("")
-
-	// 1. Ingest metric for tenant Alpha
-	m1 := storage.MetricRow{
-		Timestamp:  time.Now(),
-		ServerID:   "agent-alpha",
-		CPUPct:     77.5,
-		MemPct:     50.0,
-		DiskFreeGB: 50.0,
-	}
-	body1, _ := json.Marshal(m1)
-	req1 := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body1))
-	req1.Header.Set("Content-Type", "application/json")
-	req1.Header.Set("X-API-Key", key1)
-	w1 := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w1, req1)
-
-	if w1.Code != http.StatusAccepted {
-		t.Fatalf("expected 202 Accepted, got %d: %s", w1.Code, w1.Body.String())
-	}
-
-	// 2. Ingest metric for tenant Beta
-	m2 := storage.MetricRow{
-		Timestamp:  time.Now(),
-		ServerID:   "agent-beta",
-		CPUPct:     33.2,
-		MemPct:     25.0,
-		DiskFreeGB: 80.0,
-	}
-	body2, _ := json.Marshal(m2)
-	req2 := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body2))
-	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("X-API-Key", key2)
-	w2 := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w2, req2)
-
-	if w2.Code != http.StatusAccepted {
-		t.Fatalf("expected 202 Accepted, got %d: %s", w2.Code, w2.Body.String())
-	}
-
-	// 3. Query as tenant Alpha via API — should only see Alpha
-	reqAlpha := httptest.NewRequest("GET", "/api/metrics?range=24h", nil)
-	reqAlpha.Header.Set("X-API-Key", key1)
-	wAlpha := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(wAlpha, reqAlpha)
-
-	if wAlpha.Code != http.StatusOK {
-		t.Fatalf("Alpha query failed with code %d: %s", wAlpha.Code, wAlpha.Body.String())
-	}
-	var respAlpha struct {
-		Count int `json:"count"`
-		Data  []struct {
-			ServerID string  `json:"server_id"`
-			CPUPct   float64 `json:"cpu_pct"`
-		} `json:"data"`
-	}
-	json.NewDecoder(wAlpha.Body).Decode(&respAlpha)
-	if respAlpha.Count != 1 || respAlpha.Data[0].ServerID != "agent-alpha" {
-		t.Errorf("expected only Alpha's metric, got: %+v", respAlpha)
-	}
-
-	// 4. Query as tenant Beta via API — should only see Beta
-	reqBeta := httptest.NewRequest("GET", "/api/metrics?range=24h", nil)
-	reqBeta.Header.Set("X-API-Key", key2)
-	wBeta := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(wBeta, reqBeta)
-
-	if wBeta.Code != http.StatusOK {
-		t.Fatalf("Beta query failed with code %d: %s", wBeta.Code, wBeta.Body.String())
-	}
-	var respBeta struct {
-		Count int `json:"count"`
-		Data  []struct {
-			ServerID string  `json:"server_id"`
-			CPUPct   float64 `json:"cpu_pct"`
-		} `json:"data"`
-	}
-	json.NewDecoder(wBeta.Body).Decode(&respBeta)
-	if respBeta.Count != 1 || respBeta.Data[0].ServerID != "agent-beta" {
-		t.Errorf("expected only Beta's metric, got: %+v", respBeta)
-	}
-
-	// 5. Query without X-API-Key in hub mode → 401
-	reqNoKey := httptest.NewRequest("GET", "/api/metrics?range=24h", nil)
-	wNoKey := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(wNoKey, reqNoKey)
-	if wNoKey.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 for missing key, got %d", wNoKey.Code)
-	}
-
-	// 6. Ingest without X-API-Key in hub mode → 401
-	reqIngestNoKey := httptest.NewRequest("POST", "/api/ingest?type=metric", bytes.NewReader(body1))
-	reqIngestNoKey.Header.Set("Content-Type", "application/json")
-	wIngestNoKey := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(wIngestNoKey, reqIngestNoKey)
-	if wIngestNoKey.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 for ingest without key, got %d", wIngestNoKey.Code)
-	}
-
-	t.Logf("Multi-tenant isolation and API key enforcement verified ✓")
-}
+// Hub ingest, tenant isolation, and key rejection are covered in auth_test.go,
+// which replaced the old TestHubIngest. That test asserted the previous
+// behaviour where any non-empty X-API-Key was accepted as a valid tenant, which
+// is precisely the vulnerability that was fixed.

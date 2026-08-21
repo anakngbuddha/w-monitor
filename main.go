@@ -13,13 +13,22 @@
 //	wmonitor -agent <hub-url>                   # run as agent, push to hub (no local DB)
 //	wmonitor -hub                               # enable hub ingest endpoint (POST /api/ingest)
 //	wmonitor -external-iface <name>             # override external NIC auto-detect (Phase 10)
+//
+// Client credential management (hub only):
+//
+//	wmonitor -add-client <name>                 # generate an API key, print it once
+//	wmonitor -list-clients                      # list registered clients
+//	wmonitor -revoke-client <name>              # revoke a client's keys
+//	wmonitor -import-clients <csv>              # migrate clients_registry.csv into the DB
 package main
 
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -77,13 +86,50 @@ var (
 
 	// Key recovery
 	flagShowKey = flag.Bool("show-key", false, "Print the baked-in API key and exit")
+
+	// Phase 13 — client credential management (hub side)
+	flagAddClient     = flag.String("add-client", "", "Generate and register an API key for this client name, then exit")
+	flagListClients   = flag.Bool("list-clients", false, "List registered API clients and exit")
+	flagRevokeClient  = flag.String("revoke-client", "", "Revoke all API keys for this client name and exit")
+	flagImportClients = flag.String("import-clients", "", "Import a clients_registry.csv into the API key table and exit")
+
+	// Phase 13 — observability & tuning
+	flagUserWindow  = flag.Duration("user-window", 60*time.Second, "Sliding window for counting concurrent users")
+	flagPrintConfig = flag.Bool("print-config", false, "Print the resolved configuration (secrets masked) and exit")
 )
 
 // Build-time variables injected via -ldflags (e.g. for pre-configured client binaries)
 var (
 	defaultHubURL string
 	defaultAPIKey string
+	buildVersion  = "dev"
+	buildCommit   = "unknown"
 )
+
+// explicitFlags records which flags the operator actually typed.
+//
+// The previous config logic inferred this by comparing each flag against its
+// default value, so `-port 8080` (the default) was treated as "not set" and got
+// silently overridden by WMONITOR_PORT. flag.Visit reports only flags that were
+// present on the command line, which is the real signal.
+var explicitFlags = map[string]bool{}
+
+func recordExplicitFlags() {
+	flag.Visit(func(f *flag.Flag) { explicitFlags[f.Name] = true })
+}
+
+// envOr applies an environment variable only when the flag was not given.
+func envOr(flagName string, target *string, envNames ...string) {
+	if explicitFlags[flagName] {
+		return
+	}
+	for _, name := range envNames {
+		if v := os.Getenv(name); v != "" {
+			*target = v
+			return
+		}
+	}
+}
 
 // ── Service program ──
 
@@ -133,6 +179,17 @@ func (p *program) run() {
 
 func (p *program) Stop(s service.Service) error {
 	log.Println("[wmonitor] service stopping")
+
+	// Stop accepting new requests and let in-flight ones finish BEFORE the store
+	// is closed. Previously the store was closed while handlers were still
+	// running, so a CSV export in progress died mid-stream.
+	if p.srv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), server.ShutdownGrace())
+		defer cancel()
+		if err := p.srv.Shutdown(ctx); err != nil {
+			log.Printf("[wmonitor] http shutdown: %v", err)
+		}
+	}
 	if p.cancel != nil {
 		p.cancel()
 	}
@@ -146,7 +203,9 @@ func (p *program) Stop(s service.Service) error {
 
 func main() {
 	flag.Parse()
+	recordExplicitFlags()
 	loadConfigEnv()
+	server.BuildVersion = buildVersion
 
 	if *flagShowKey {
 		key := resolveAPIKey()
@@ -158,42 +217,17 @@ func main() {
 		return
 	}
 
-	// Apply config.env or build-time defaults if flags were not explicitly provided
-	if *flagAgentHub == "" {
-		if hub := os.Getenv("WMONITOR_AGENT_HUB"); hub != "" {
-			*flagAgentHub = hub
-		} else if defaultHubURL != "" {
-			*flagAgentHub = defaultHubURL
-		}
+	applyEnvConfig()
+
+	if *flagPrintConfig {
+		printConfig()
+		return
 	}
-	if *flagDB == "sqlite" {
-		if dbVal := os.Getenv("WMONITOR_DB"); dbVal != "" {
-			*flagDB = dbVal
-		}
-	}
-	if !*flagHub {
-		if os.Getenv("WMONITOR_MODE") == "hub" || os.Getenv("WMONITOR_HUB") == "true" {
-			*flagHub = true
-		}
-	}
-	if *flagPort == "8080" {
-		if p := os.Getenv("WMONITOR_PORT"); p != "" {
-			*flagPort = p
-		} else if p := os.Getenv("PORT"); p != "" {
-			*flagPort = p
-		}
-	}
-	if *flagExternalIface == "" {
-		if ifc := os.Getenv("WMONITOR_EXTERNAL_IFACE"); ifc != "" {
-			*flagExternalIface = ifc
-		}
-	}
-	if *flagAppPort == "" {
-		if p := os.Getenv("WMONITOR_APP_PORT"); p != "" {
-			*flagAppPort = p
-		} else if p := os.Getenv("WMONITOR_APP_PORTS"); p != "" {
-			*flagAppPort = p
-		}
+
+	// ── Client credential management (needs a store, no collector) ──
+	if *flagAddClient != "" || *flagListClients || *flagRevokeClient != "" || *flagImportClients != "" {
+		runClientAdmin()
+		return
 	}
 
 	// ── Agent mode (Phase 5): no local DB, no Aiven credentials ──
@@ -239,22 +273,11 @@ func main() {
 	}
 
 	// ── Build service components ──
-	apiKey := resolveAPIKey()
-
 	col := collector.New(store)
 	if *flagExternalIface != "" {
 		col.SetExternalIface(*flagExternalIface)
 	}
-	if *flagAppPort != "" {
-		if tracker, ok := col.UserTracker().(*collector.TCPUserTracker); ok {
-			tracker.SetAppPorts(parseAppPorts(*flagAppPort)...)
-		}
-	}
-	if srvPort, err := strconv.Atoi(*flagPort); err == nil && srvPort > 0 {
-		if tracker, ok := col.UserTracker().(*collector.TCPUserTracker); ok {
-			tracker.SetExcludePorts(uint32(srvPort))
-		}
-	}
+	configureUserTracker(col)
 
 	// Retention only works with SQLite (uses raw *sql.DB). Postgres has no retention yet.
 	var ret *retention.Job
@@ -265,7 +288,12 @@ func main() {
 	srv := server.New(store, *flagPort)
 
 	if *flagHub {
-		srv.EnableHubMode(apiKey)
+		keys, ok := store.(server.KeyStore)
+		if !ok {
+			// Fail loudly at startup rather than serving an unauthenticated hub.
+			log.Fatalf("hub mode requires a backend that can verify API keys; %T cannot", store)
+		}
+		srv.EnableHubMode(keys)
 	}
 
 	if err := dashboard.Register(srv); err != nil {
@@ -332,15 +360,14 @@ func main() {
 	}
 
 	// ── Interactive/foreground mode ──
-	isInteractive := service.Interactive()
-	if !isInteractive {
+	if !service.Interactive() {
 		if err := svc.Run(); err != nil {
 			log.Fatalf("service run: %v", err)
 		}
 		return
 	}
 
-	log.Printf("[wmonitor] starting in foreground mode, dashboard at http://localhost:%s", *flagPort)
+	log.Printf("[wmonitor] starting in foreground mode (version %s), dashboard at http://localhost:%s", buildVersion, *flagPort)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -365,7 +392,9 @@ func main() {
 	// Signal handler for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		select {
 		case sig := <-sigCh:
 			log.Printf("[wmonitor] received %v, shutting down", sig)
@@ -374,51 +403,318 @@ func main() {
 		}
 		cancel()
 
-		// Automated export on shutdown
-		if *flagExportFlt != "" || *flagRunFor > 0 {
-			var since time.Time
-			switch *flagExportFlt {
-			case "daily":
-				since = time.Now().Add(-24 * time.Hour)
-			case "weekly":
-				since = time.Now().Add(-7 * 24 * time.Hour)
-			case "monthly":
-				since = time.Now().Add(-30 * 24 * time.Hour)
-			default:
-				if *flagRunFor > 0 {
-					since = time.Now().Add(-*flagRunFor)
-				} else {
-					since = time.Now().Add(-24 * time.Hour)
-				}
-			}
+		// Drain HTTP before touching the store.
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), server.ShutdownGrace())
+		defer cancelShutdown()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[wmonitor] http shutdown: %v", err)
+		}
 
-			if runtime.GOOS == "windows" {
-				outPath := fmt.Sprintf("wmonitor_export_%s.csv", time.Now().Format("20060102_150405"))
-				n, err := export.CSVReport(store, since, outPath)
-				if err != nil {
-					log.Printf("Auto-export CSV error: %v", err)
-				} else {
-					log.Printf("Auto-exported %d rows to %s", n, outPath)
-				}
-			} else {
-				outPath := fmt.Sprintf("wmonitor_export_%s.txt", time.Now().Format("20060102_150405"))
-				s, err := export.TextReport(store, since, outPath)
-				if err != nil {
-					log.Printf("Auto-export TXT error: %v", err)
-				} else {
-					log.Printf("Auto-exported report to %s (avg CPU %.1f%%)", outPath, s.AvgCPU)
-				}
-			}
+		if *flagExportFlt != "" || *flagRunFor > 0 {
+			writeShutdownExport(store)
 		}
 
 		store.Close()
-		os.Exit(0)
 	}()
 
-	// HTTP server (blocking)
+	// HTTP server (blocking until Shutdown).
+	//
+	// The old code called os.Exit(0) from inside the signal handler, which killed
+	// the process before any of the shutdown path could complete.
 	if err := srv.Start(); err != nil {
-		log.Fatalf("server: %v", err)
+		log.Printf("[wmonitor] server: %v", err)
 	}
+	<-done
+}
+
+// writeShutdownExport performs the automatic export on shutdown.
+func writeShutdownExport(store storage.Store) {
+	var since time.Time
+	switch *flagExportFlt {
+	case "daily":
+		since = time.Now().Add(-24 * time.Hour)
+	case "weekly":
+		since = time.Now().Add(-7 * 24 * time.Hour)
+	case "monthly":
+		since = time.Now().Add(-30 * 24 * time.Hour)
+	default:
+		if *flagRunFor > 0 {
+			since = time.Now().Add(-*flagRunFor)
+		} else {
+			since = time.Now().Add(-24 * time.Hour)
+		}
+	}
+
+	if runtime.GOOS == "windows" {
+		outPath := fmt.Sprintf("wmonitor_export_%s.csv", time.Now().Format("20060102_150405"))
+		n, err := export.CSVReport(store, since, outPath)
+		if err != nil {
+			log.Printf("Auto-export CSV error: %v", err)
+			return
+		}
+		log.Printf("Auto-exported %d rows to %s", n, outPath)
+		return
+	}
+
+	outPath := fmt.Sprintf("wmonitor_export_%s.txt", time.Now().Format("20060102_150405"))
+	s, err := export.TextReport(store, since, outPath)
+	if err != nil {
+		log.Printf("Auto-export TXT error: %v", err)
+		return
+	}
+	log.Printf("Auto-exported report to %s (avg CPU %.1f%%)", outPath, s.AvgCPU)
+}
+
+// configureUserTracker applies app-port, exclusion, and window settings.
+func configureUserTracker(col *collector.Collector) {
+	tracker, ok := col.UserTracker().(*collector.TCPUserTracker)
+	if !ok {
+		return
+	}
+	if *flagAppPort != "" {
+		tracker.SetAppPorts(parseAppPorts(*flagAppPort)...)
+	}
+	// Never count viewers of our own dashboard as application users.
+	if srvPort, err := strconv.Atoi(*flagPort); err == nil && srvPort > 0 {
+		tracker.SetExcludePorts(uint32(srvPort))
+	}
+	if *flagUserWindow > 0 {
+		tracker.SetWindow(*flagUserWindow)
+	}
+}
+
+// applyEnvConfig fills in unset flags from environment variables and build-time
+// defaults, in that precedence order.
+func applyEnvConfig() {
+	if !explicitFlags["agent"] {
+		if hub := os.Getenv("WMONITOR_AGENT_HUB"); hub != "" {
+			*flagAgentHub = hub
+		} else if defaultHubURL != "" {
+			*flagAgentHub = defaultHubURL
+		}
+	}
+	envOr("db", flagDB, "WMONITOR_DB")
+	envOr("port", flagPort, "WMONITOR_PORT", "PORT")
+	envOr("external-iface", flagExternalIface, "WMONITOR_EXTERNAL_IFACE")
+	envOr("app-port", flagAppPort, "WMONITOR_APP_PORT", "WMONITOR_APP_PORTS")
+
+	if !explicitFlags["hub"] {
+		if os.Getenv("WMONITOR_MODE") == "hub" || os.Getenv("WMONITOR_HUB") == "true" {
+			*flagHub = true
+		}
+	}
+}
+
+// printConfig dumps the resolved configuration with secrets masked.
+func printConfig() {
+	fmt.Printf("version:         %s (%s)\n", buildVersion, buildCommit)
+	fmt.Printf("mode:            %s\n", resolveMode())
+	fmt.Printf("port:            %s\n", *flagPort)
+	fmt.Printf("db backend:      %s\n", *flagDB)
+	fmt.Printf("agent hub:       %s\n", orNone(*flagAgentHub))
+	fmt.Printf("api key:         %s\n", mask(resolveAPIKey()))
+	fmt.Printf("dsn:             %s\n", maskDSN())
+	fmt.Printf("app ports:       %s\n", orNone(*flagAppPort))
+	fmt.Printf("external iface:  %s\n", orNone(*flagExternalIface))
+	fmt.Printf("user window:     %s\n", *flagUserWindow)
+	fmt.Printf("allowed origins: %s\n", orNone(os.Getenv("WMONITOR_ALLOWED_ORIGINS")))
+}
+
+func resolveMode() string {
+	switch {
+	case *flagAgentHub != "":
+		return "agent"
+	case *flagHub:
+		return "hub"
+	default:
+		return "standalone"
+	}
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(not set)"
+	}
+	return s
+}
+
+// mask shows only enough of a secret to confirm which one is loaded.
+func mask(s string) string {
+	if s == "" {
+		return "(not set)"
+	}
+	if len(s) <= 8 {
+		return "********"
+	}
+	return s[:4] + "..." + s[len(s)-4:]
+}
+
+func maskDSN() string {
+	dsn, err := resolveDSN()
+	if err != nil || dsn == "" {
+		return "(not set)"
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "(unparseable)"
+	}
+	return fmt.Sprintf("postgres://***@%s%s", u.Hostname(), u.Path)
+}
+
+// ── Client credential administration ──
+
+// runClientAdmin handles -add-client / -list-clients / -revoke-client /
+// -import-clients. All of these need a credential-capable store.
+func runClientAdmin() {
+	store, _, err := openStore()
+	if err != nil {
+		log.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	keys, ok := store.(clientAdminStore)
+	if !ok {
+		log.Fatalf("backend %T does not support API key management", store)
+	}
+
+	switch {
+	case *flagAddClient != "":
+		addClient(keys, *flagAddClient)
+	case *flagListClients:
+		listClients(keys)
+	case *flagRevokeClient != "":
+		revokeClient(keys, *flagRevokeClient)
+	case *flagImportClients != "":
+		importClients(keys, *flagImportClients)
+	}
+}
+
+// clientAdminStore is the credential-management surface of a backend.
+type clientAdminStore interface {
+	UpsertAPIKey(rec storage.APIKeyRecord) error
+	ListAPIKeys() ([]storage.APIKeyRecord, error)
+	RevokeAPIKey(clientName string) (int64, error)
+}
+
+func addClient(keys clientAdminStore, name string) {
+	plaintext, err := storage.GenerateAPIKey()
+	if err != nil {
+		log.Fatalf("generate key: %v", err)
+	}
+	tenantID, err := storage.NewTenantID()
+	if err != nil {
+		log.Fatalf("generate tenant id: %v", err)
+	}
+
+	if err := keys.UpsertAPIKey(storage.APIKeyRecord{
+		KeyHash:    storage.HashAPIKey(plaintext),
+		TenantID:   tenantID,
+		ClientName: name,
+	}); err != nil {
+		log.Fatalf("register key: %v", err)
+	}
+
+	fmt.Printf("Client:    %s\n", name)
+	fmt.Printf("Tenant ID: %s\n", tenantID)
+	fmt.Printf("API Key:   %s\n\n", plaintext)
+	fmt.Println("Store this key now. Only its hash is saved, so it cannot be recovered later.")
+	fmt.Printf("Build a client binary with:\n  -ldflags \"-X main.defaultAPIKey=%s -X main.defaultHubURL=<hub-url>\"\n", plaintext)
+}
+
+func listClients(keys clientAdminStore) {
+	records, err := keys.ListAPIKeys()
+	if err != nil {
+		log.Fatalf("list keys: %v", err)
+	}
+	if len(records) == 0 {
+		fmt.Println("No API clients registered. Add one with: wmonitor -add-client <name>")
+		return
+	}
+	fmt.Printf("%-20s %-38s %-10s %-20s %s\n", "CLIENT", "TENANT", "STATUS", "LAST SEEN", "KEY HASH (prefix)")
+	for _, r := range records {
+		status := "active"
+		if r.Revoked {
+			status = "revoked"
+		}
+		lastSeen := "never"
+		if r.LastSeenAt.Unix() > 0 {
+			lastSeen = r.LastSeenAt.Format("2006-01-02 15:04:05")
+		}
+		hashPrefix := r.KeyHash
+		if len(hashPrefix) > 12 {
+			hashPrefix = hashPrefix[:12]
+		}
+		fmt.Printf("%-20s %-38s %-10s %-20s %s\n", r.ClientName, r.TenantID, status, lastSeen, hashPrefix)
+	}
+}
+
+func revokeClient(keys clientAdminStore, name string) {
+	n, err := keys.RevokeAPIKey(name)
+	if err != nil {
+		log.Fatalf("revoke: %v", err)
+	}
+	if n == 0 {
+		fmt.Printf("No active keys found for client %q.\n", name)
+		return
+	}
+	fmt.Printf("Revoked %d key(s) for client %q. Hubs may cache the decision for up to 60s.\n", n, name)
+}
+
+// importClients migrates the legacy plaintext clients_registry.csv.
+//
+// Existing metric rows were written with tenant_id set to the raw API key, so
+// the imported tenant_id must stay equal to that raw key. Assigning fresh tenant
+// IDs here would orphan every historical row belonging to these clients.
+func importClients(keys clientAdminStore, path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+
+	reader := csv.NewReader(f)
+	reader.FieldsPerRecord = -1
+
+	imported := 0
+	row := 0
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatalf("read %s: %v", path, err)
+		}
+		row++
+		if row == 1 && strings.EqualFold(strings.TrimSpace(record[0]), "ClientName") {
+			continue // header
+		}
+		if len(record) < 2 {
+			log.Printf("skipping row %d: expected at least ClientName,APIKey", row)
+			continue
+		}
+
+		name := strings.TrimSpace(record[0])
+		rawKey := strings.TrimSpace(record[1])
+		if name == "" || rawKey == "" {
+			log.Printf("skipping row %d: blank client name or key", row)
+			continue
+		}
+
+		if err := keys.UpsertAPIKey(storage.APIKeyRecord{
+			KeyHash:    storage.HashAPIKey(rawKey),
+			TenantID:   rawKey, // preserves the tenant_id already on historical rows
+			ClientName: name,
+		}); err != nil {
+			log.Printf("row %d (%s): %v", row, name, err)
+			continue
+		}
+		imported++
+		fmt.Printf("imported %s\n", name)
+	}
+
+	fmt.Printf("\nImported %d client key(s) as hashes.\n", imported)
+	fmt.Printf("Now delete %s: it holds plaintext credentials that are no longer needed.\n", path)
 }
 
 // openStore opens the appropriate backend based on -db flag and DSN resolution.
@@ -527,21 +823,15 @@ func runAgentMode() {
 	}
 
 	hubURL := strings.TrimRight(*flagAgentHub, "/")
-	log.Printf("[agent] starting — pushing to %s", hubURL)
+	log.Printf("[agent] starting (version %s) — pushing to %s", buildVersion, hubURL)
 
 	ag := agent.New(hubURL, apiKey)
 	col := collector.New(ag)
 	if *flagExternalIface != "" {
 		col.SetExternalIface(*flagExternalIface)
 	}
-	if *flagAppPort != "" {
-		if tracker, ok := col.UserTracker().(*collector.TCPUserTracker); ok {
-			tracker.SetAppPorts(parseAppPorts(*flagAppPort)...)
-		}
-	}
-	// Use hostname as server_id for identification in the hub's DB
-	h, _ := os.Hostname()
-	col.SetServerID(h)
+	configureUserTracker(col)
+	col.SetServerID(resolveServerID())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
@@ -553,6 +843,44 @@ func runAgentMode() {
 	}()
 
 	col.Run(ctx) // blocks
+}
+
+// resolveServerID returns a stable identifier for this agent.
+//
+// Hostname alone is not unique: two clients each running a machine called
+// WIN-SERVER would merge into a single series inside a tenant, and renaming a
+// host would orphan all of its history. A UUID is generated once and persisted
+// alongside the data directory.
+func resolveServerID() string {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown-host"
+	}
+
+	dir, err := storage.DataDir()
+	if err != nil {
+		return hostname
+	}
+	idPath := filepath.Join(dir, "agent_id")
+
+	if data, err := os.ReadFile(idPath); err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id
+		}
+	}
+
+	suffix, err := storage.NewTenantID()
+	if err != nil {
+		return hostname
+	}
+	// Human-readable prefix so operators can still recognise the machine.
+	id := hostname + "-" + strings.TrimPrefix(suffix, "t_")[:8]
+	if err := os.WriteFile(idPath, []byte(id), 0o600); err != nil {
+		log.Printf("[agent] could not persist server id (%v); falling back to hostname", err)
+		return hostname
+	}
+	log.Printf("[agent] generated stable server id %q", id)
+	return id
 }
 
 // loadConfigEnv attempts to load environment variables from config.env in:
