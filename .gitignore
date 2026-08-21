@@ -1,22 +1,48 @@
-# Build artifacts
-sysmon
-sysmon.exe
-sysmon_linux
-sysmon_windows.exe
-wmonitor.exe
-wmonitor_linux
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+wmonitor
+wmonitor_*
+!wmonitor_*.go
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Databases and local data
 *.db
+*.db-wal
+*.db-shm
+spool/
 
-# Graphify
-graphify-out/
-graph.json
-
-# Go
-vendor/
-
-# W-Monitor credentials — NEVER commit these
+# Credentials — never commit these.
+# clients_registry.csv held plaintext API keys; keys now live in the api_keys
+# table as hashes. Import the old file once with -import-clients, then delete it.
+clients_registry.csv
 config.env
-*.config.env
+*.dsn
+dsn.txt
+
+# Generated reports
 wmonitor_export_*.csv
 wmonitor_export_*.txt
-*.html
+*_assessment_report.html
+
+# Graphify knowledge graph output
+graphify-out/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
