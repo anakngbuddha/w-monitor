@@ -10,6 +10,7 @@ func TestSpoolAppendAndDrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSpool: %v", err)
 	}
+	defer sp.Close()
 
 	for i := 0; i < 5; i++ {
 		if err := sp.Append("metric", []byte(`{"CPUPct":10}`)); err != nil {
@@ -51,6 +52,7 @@ func TestSpoolSurvivesHubOutage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSpool: %v", err)
 	}
+	defer sp.Close()
 
 	for i := 0; i < 3; i++ {
 		sp.Append("metric", []byte(`{"CPUPct":1}`))
@@ -86,6 +88,7 @@ func TestSpoolDoesNotDuplicateOnPartialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSpool: %v", err)
 	}
+	defer sp.Close()
 
 	for i := 0; i < 5; i++ {
 		sp.Append("metric", []byte(`{"CPUPct":1}`))
@@ -119,12 +122,14 @@ func TestSpoolPersistsAcrossRestart(t *testing.T) {
 
 	sp1, _ := NewSpool(dir)
 	sp1.Append("metric", []byte(`{"CPUPct":42}`))
+	sp1.Close()
 
 	// Simulate a process restart by opening the same directory again.
 	sp2, err := NewSpool(dir)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
+	defer sp2.Close()
 	if depth, _ := sp2.Depth(); depth != 1 {
 		t.Errorf("depth after restart = %d, want 1", depth)
 	}
@@ -132,6 +137,7 @@ func TestSpoolPersistsAcrossRestart(t *testing.T) {
 
 func TestSpoolPreservesPayload(t *testing.T) {
 	sp, _ := NewSpool(t.TempDir())
+	defer sp.Close()
 	const payload = `{"ServerID":"web-01","CPUPct":93.5}`
 	sp.Append("metric", []byte(payload))
 
@@ -147,6 +153,7 @@ func TestSpoolPreservesPayload(t *testing.T) {
 
 func TestSpoolSizeReporting(t *testing.T) {
 	sp, _ := NewSpool(t.TempDir())
+	defer sp.Close()
 	if size, _ := sp.SizeBytes(); size != 0 {
 		t.Errorf("empty spool size = %d, want 0", size)
 	}

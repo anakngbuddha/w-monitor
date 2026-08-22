@@ -229,6 +229,7 @@ func (a *Agent) Close() error {
 		if depth, err := a.spool.Depth(); err == nil && depth > 0 {
 			log.Printf("[agent] %d sample(s) remain spooled; they will be sent on next start", depth)
 		}
+		a.spool.Close()
 	}
 	return nil
 }

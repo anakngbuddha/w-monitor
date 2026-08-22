@@ -515,6 +515,7 @@ func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
+	s.writeCORS(w, r)
 	tenantID, ok := s.authTenant(w, r)
 	if !ok {
 		return
@@ -531,6 +532,7 @@ func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="wmonitor_export_%s.csv"`, time.Now().Format("20060102_150405")))
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
 
 	if _, err := export.WriteCSV(w, s.db, since, tenantID); err != nil {
 		log.Printf("[server] CSV export error: %v", err)

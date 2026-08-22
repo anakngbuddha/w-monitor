@@ -369,3 +369,8 @@ For Excel financial modeling, TCO calculators, and custom pivot tables:
 #### 4. Checking recent agent logs:
 - **Windows:** View Windows Event Viewer &rarr; *Application Logs* (Source: `wmonitor`) or run interactively `wmonitor -agent <hub-url> -api-key <key>`.
 - **Linux:** `journalctl -u wmonitor -f`
+
+
+
+
+.\wmonitor.exe -db postgres -dsn "postgres://avnadmin:PASSWORD@pg-service.aivencloud.com:15432/defaultdb?sslmode=require" -add-client "ClientName"

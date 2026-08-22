@@ -1012,12 +1012,36 @@ async function authFetch(url, options = {}) {
   return resp;
 }
 
-function exportCSV() {
-  const key = getApiKey();
+async function exportCSV() {
   let url = `/api/export/csv?range=${currentRange}`;
   if (currentServer) url += `&server_id=${encodeURIComponent(currentServer)}`;
-  if (key) url += `&api_key=${encodeURIComponent(key)}`;
-  window.open(url, '_blank');
+  try {
+    const resp = await authFetch(url);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      alert(err.error || 'Failed to export CSV');
+      return;
+    }
+    const blob = await resp.blob();
+    const blobUrl = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    const disposition = resp.headers.get('Content-Disposition');
+    let filename = `wmonitor_export_${currentRange}.csv`;
+    if (disposition && disposition.indexOf('filename=') !== -1) {
+      const matches = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/.exec(disposition);
+      if (matches != null && matches[1]) {
+        filename = matches[1].replace(/['"]/g, '');
+      }
+    }
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(blobUrl);
+  } catch (e) {
+    console.error('Export CSV error:', e);
+  }
 }
 
 function setRange(r) {

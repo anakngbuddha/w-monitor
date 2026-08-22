@@ -191,6 +191,19 @@ func (s *Spool) SizeBytes() (int64, error) {
 	return total, err
 }
 
+// Close releases any open file handles held by the spool.
+func (s *Spool) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current != nil {
+		err := s.current.Close()
+		s.current = nil
+		s.curSize = 0
+		return err
+	}
+	return nil
+}
+
 // Drain delivers queued entries oldest first, stopping at the first failure.
 //
 // Stopping rather than skipping preserves ordering and prevents a persistent
@@ -226,6 +239,13 @@ func (s *Spool) Drain(deliver func(payloadType string, body []byte) error) (deli
 		for i, entry := range entries {
 			if deliverErr := deliver(entry.PayloadType, entry.Body); deliverErr != nil {
 				// Keep everything from this entry onward.
+				s.mu.Lock()
+				if s.current != nil && s.current.Name() == path {
+					s.current.Close()
+					s.current = nil
+					s.curSize = 0
+				}
+				s.mu.Unlock()
 				if rewriteErr := rewriteSegment(path, entries[i:]); rewriteErr != nil {
 					log.Printf("[spool] rewrite %s: %v", filepath.Base(path), rewriteErr)
 				}
@@ -299,5 +319,6 @@ func rewriteSegment(path string, entries []spoolEntry) error {
 	}
 	f.Sync()
 	f.Close()
+	_ = os.Remove(path)
 	return os.Rename(tmp, path)
 }

@@ -43,6 +43,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -148,7 +149,8 @@ type program struct {
 	evaluator *alerting.Evaluator
 	cancel    context.CancelFunc
 	// Keep *storage.DB around for Conn() (retention uses raw *sql.DB)
-	sqliteDB *storage.DB
+	sqliteDB    *storage.DB
+	collectorWg sync.WaitGroup
 }
 
 func (p *program) Start(s service.Service) error {
@@ -162,7 +164,13 @@ func (p *program) run() {
 	p.cancel = cancel
 
 	// Collector goroutine
-	go p.collector.Run(ctx)
+	if p.collector != nil {
+		p.collectorWg.Add(1)
+		go func() {
+			defer p.collectorWg.Done()
+			p.collector.Run(ctx)
+		}()
+	}
 
 	// Alert evaluation
 	runEvaluator(ctx, p.evaluator)
@@ -204,6 +212,8 @@ func (p *program) Stop(s service.Service) error {
 	if p.cancel != nil {
 		p.cancel()
 	}
+	// Wait for collector loop to finish before closing storage backend
+	p.collectorWg.Wait()
 	if p.store != nil {
 		p.store.Close()
 	}
