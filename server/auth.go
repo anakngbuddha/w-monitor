@@ -78,6 +78,15 @@ func (c *authCache) invalidate(hash string) {
 	delete(c.entries, hash)
 }
 
+// authorizeTenant applies controls that must run after successful key
+// resolution, including the per-tenant daily ingest quota.
+func authorizeTenant(w http.ResponseWriter, r *http.Request, tenant string) (string, bool) {
+	if !enforceDailyIngestQuota(w, r, tenant) {
+		return "", false
+	}
+	return tenant, true
+}
+
 // authTenant authenticates the request and returns the tenant it may access.
 //
 // Outside hub mode there is a single local dataset and no tenancy, so it
@@ -117,7 +126,7 @@ func (s *Server) authTenant(w http.ResponseWriter, r *http.Request) (string, boo
 			writeJSONError(w, http.StatusUnauthorized, "invalid API key")
 			return "", false
 		}
-		return entry.tenantID, true
+		return authorizeTenant(w, r, entry.tenantID)
 	}
 
 	rec, err := s.keys.ResolveAPIKey(hash)
@@ -149,7 +158,7 @@ func (s *Server) authTenant(w http.ResponseWriter, r *http.Request) (string, boo
 		}
 	}()
 
-	return rec.TenantID, true
+	return authorizeTenant(w, r, rec.TenantID)
 }
 
 // clientIP extracts the source address, preferring the proxy-provided value when
