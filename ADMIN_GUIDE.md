@@ -1,77 +1,102 @@
 # W-Monitor Administrator & Operations Guide
+## Multi-Server Cloud Migration Assessment with Centralized Multi-Tenancy
 
-This guide is intended for administrators, DevOps engineers, and cloud architects conducting pre-migration assessments with **W-Monitor**. It covers running the database locally, configuring the central Hub, managing client agents, securing credentials, and generating client-ready cloud migration assessment deliverables.
+This guide is intended for cloud architects, DevOps engineers, and system administrators managing pre-migration assessments using **W-Monitor**. It covers setting up the centralized Hub, provisioning organization-level client API keys, deploying universal agent binaries across multi-server fleets, and generating migration assessment deliverables.
 
 ---
 
 ## Table of Contents
 
 1. [Architecture & Assessment Workflow](#1-architecture--assessment-workflow)
-2. [Setting Up the Database on Your Local Machine](#2-setting-up-the-database-on-your-local-machine)
-   - [Option A: Local PostgreSQL with Docker (Recommended)](#option-a-local-postgresql-with-docker-recommended)
-   - [Option B: Native Local PostgreSQL (Windows / Linux)](#option-b-native-local-postgresql-windows--linux)
-   - [Option C: Managed Cloud PostgreSQL (Aiven Free Tier)](#option-c-managed-cloud-postgresql-aiven-free-tier)
-   - [Option D: Local SQLite (Zero-Setup Alternative)](#option-d-local-sqlite-zero-setup-alternative)
+2. [Setting Up the Central Hub Database](#2-setting-up-the-central-hub-database)
+   - [Option A: Managed Cloud PostgreSQL (Aiven / Render - Recommended)](#option-a-managed-cloud-postgresql-aiven--render-recommended)
+   - [Option B: Local PostgreSQL in Docker](#option-b-local-postgresql-in-docker)
+   - [Option C: Local SQLite (Lightweight / Testing)](#option-c-local-sqlite-lightweight--testing)
 3. [Running the Central W-Monitor Hub](#3-running-the-central-w-monitor-hub)
-   - [Environment Variables & Credential Management](#environment-variables--credential-management)
+   - [Environment Variables & Credentials](#environment-variables--credentials)
    - [Starting the Hub in Foreground](#starting-the-hub-in-foreground)
-   - [Installing the Hub as a Background Service](#installing-the-hub-as-a-background-service)
-4. [Client Agent Rollout & Management](#4-client-agent-rollout--management)
-   - [Agent Authentication Model](#agent-authentication-model)
-   - [Client Install Command Generation](#client-install-command-generation)
-   - [Network & Firewall Considerations](#network--firewall-considerations)
-5. [Generating Assessment Reports & Migration Deliverables](#5-generating-assessment-reports--migration-deliverables)
+   - [Deploying Hub on Cloud (Render.com)](#deploying-hub-on-cloud-rendercom)
+4. [Client Onboarding & API Key Management](#4-client-onboarding--api-key-management)
+   - [The Organization API Key Model](#the-organization-api-key-model)
+   - [Adding a New Client Organization](#adding-a-new-client-organization)
+   - [Auditing Registered Clients](#auditing-registered-clients)
+   - [Revoking Client Access](#revoking-client-access)
+5. [Universal Binary Distribution & Fleet Rollout](#5-universal-binary-distribution--fleet-rollout)
+   - [Building Universal Binaries](#building-universal-binaries)
+   - [Windows Server Fleet Rollout](#windows-server-fleet-rollout)
+   - [Linux Server Fleet Rollout](#linux-server-fleet-rollout)
+   - [Automated Mass Deployment (GPO, Ansible, Cloud-Init)](#automated-mass-deployment-gpo-ansible-cloud-init)
+6. [Generating Assessment Reports & Migration Deliverables](#6-generating-assessment-reports--migration-deliverables)
    - [Self-Contained HTML Assessment Report](#self-contained-html-assessment-report)
-   - [CSV Export for Custom Pivot Tables & Charts](#csv-export-for-custom-pivot-tables--charts)
-6. [Database Schema & Direct Queries](#6-database-schema--direct-queries)
-7. [Maintenance, Retention & Troubleshooting](#7-maintenance-retention--troubleshooting)
+   - [Raw CSV Data Dump for Custom Financial Modeling](#raw-csv-data-dump-for-custom-financial-modeling)
+7. [Security Model, Network Rules & Troubleshooting](#7-security-model-network-rules--troubleshooting)
 
 ---
 
 ## 1. Architecture & Assessment Workflow
 
+W-Monitor uses a **Universal Generic Binary + Organization API Key** architecture. You build the executable **once** and distribute the identical binary to all client servers.
+
 ```
-┌────────────────────────────────────────────────────────┐
-│                   CLIENT ENVIRONMENT                   │
-│                                                        │
-│   ┌──────────────┐     ┌──────────────┐                │
-│   │ Client Node 1│     │ Client Node 2│    ...         │
-│   │  (Agent)     │     │  (Agent)     │                │
-│   └──────┬───────┘     └──────┬───────┘                │
-│          │                    │                        │
-└──────────┼────────────────────┼────────────────────────┘
-           │ HTTPS POST /api/ingest                      
-           │ (X-API-Key Header, NO DB credentials)       
-           ▼                                             
-┌────────────────────────────────────────────────────────┐
-│                   ADMIN / HUB NODE                     │
-│                                                        │
-│   ┌────────────────────────────────────────────────┐   │
-│   │              W-Monitor Hub Server              │   │
-│   │   - Validates X-API-Key                        │   │
-│   │   - Serves Web Dashboard (Port 8080)           │   │
-│   │   - Generates HTML Assessment Reports          │   │
-│   └───────────────────────┬────────────────────────┘   │
-│                           │                            │
-│                           ▼                            │
-│             ┌───────────────────────────┐              │
-│             │    Database (PostgreSQL)  │              │
-│             │  Docker / Local / Aiven   │              │
-│             └───────────────────────────┘              │
-└────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       CLIENT ENVIRONMENT (e.g. Acme Corp)                   │
+│                                                                             │
+│  Universal Binary (wmonitor.exe / wmonitor_linux) on all target servers     │
+│                                                                             │
+│   ┌────────────────────┐     ┌────────────────────┐                         │
+│   │   App Server 01    │     │   Database Node    │     ... (Up to 100+)    │
+│   │   (server_id: A)   │     │   (server_id: B)   │                         │
+│   └─────────┬──────────┘     └─────────┬──────────┘                         │
+│             │                          │                                    │
+│             └─────────────┬────────────┘                                    │
+│                           │ HTTPS POST /api/ingest                          │
+│                           │ Header: X-API-Key: <AcmeCorp_APIKey>            │
+│                           │ (NO database credentials on client servers)     │
+└───────────────────────────┼─────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           CENTRAL W-MONITOR HUB                             │
+│                                                                             │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                         W-Monitor Hub Server                        │   │
+│   │  - Validates API Key via SHA-256 hash lookup in Postgres            │   │
+│   │  - Maps all Acme Corp servers to Acme Corp's isolated Tenant ID     │   │
+│   │  - Serves multi-tenant Web Dashboard & REST API                     │   │
+│   │  - Generates Cloud Migration Sizing & HTML Assessment Reports       │   │
+│   └──────────────────────────────────┬──────────────────────────────────┘   │
+│                                      │                                      │
+│                                      ▼                                      │
+│                        ┌───────────────────────────┐                        │
+│                        │    PostgreSQL Database    │                        │
+│                        │  (Aiven / Render / Docker)│                        │
+│                        └───────────────────────────┘                        │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Core Principle:** Client machines only ever receive the Hub URL and a shared API key. They **never** receive direct database credentials or network access to Postgres.
+### Core Tenancy Principles:
+1. **Universal Binary:** Binaries contain no hardcoded secrets or customer names. The same `wmonitor.exe` is deployed everywhere.
+2. **One Key Per Organization:** All servers belonging to "Acme Corp" share Acme Corp's Organization API Key.
+3. **Automatic Server Distinction:** Each server machine automatically generates its own stable, unique `server_id` (e.g. `WIN-SRV01-4f8a12`) and reports its hostname.
+4. **Data Isolation:** Metrics from different clients are strictly isolated by `TenantID` in the database.
+5. **Zero Direct DB Access:** Client servers never talk to PostgreSQL directly and never hold database passwords.
 
 ---
 
-## 2. Setting Up the Database on Your Local Machine
+## 2. Setting Up the Central Hub Database
 
-### Option A: Local PostgreSQL with Docker (Recommended)
+### Option A: Managed Cloud PostgreSQL (Aiven / Render - Recommended)
 
-Running Postgres in Docker on your local laptop or management workstation provides an isolated, repeatable backend.
+For multi-site assessments where the Hub is hosted in the cloud:
+1. Create a free/starter PostgreSQL instance on [aiven.io](https://aiven.io) or [render.com](https://render.com).
+2. Copy the Service URI (DSN). Example:
+   ```text
+   postgres://avnadmin:SecretPassword123@pg-service.aivencloud.com:15432/defaultdb?sslmode=require
+   ```
 
-#### 1. Run PostgreSQL container:
+### Option B: Local PostgreSQL in Docker
+
+For running the Hub on your management laptop or staging environment:
 ```bash
 docker run -d \
   --name wmonitor-postgres \
@@ -82,94 +107,52 @@ docker run -d \
   -v wmonitor_pgdata:/var/lib/postgresql/data \
   postgres:16-alpine
 ```
-
-#### 2. Verify connectivity:
-```bash
-docker exec -it wmonitor-postgres psql -U wmonitor -d wmonitor_db -c "SELECT 1;"
-```
-
-#### 3. Your Local DSN:
-```
+**DSN:**
+```text
 postgres://wmonitor:secretpassword@localhost:5432/wmonitor_db?sslmode=disable
 ```
 
----
+### Option C: Local SQLite (Lightweight / Testing)
 
-### Option B: Native Local PostgreSQL (Windows / Linux)
-
-If you have PostgreSQL installed natively on your OS:
-
-#### 1. Create user and database in `psql`:
-```sql
-CREATE USER wmonitor WITH PASSWORD 'secretpassword';
-CREATE DATABASE wmonitor_db OWNER wmonitor;
-GRANT ALL PRIVILEGES ON DATABASE wmonitor_db TO wmonitor;
-```
-
-#### 2. DSN string:
-```
-postgres://wmonitor:secretpassword@localhost:5432/wmonitor_db?sslmode=disable
-```
-
----
-
-### Option C: Managed Cloud PostgreSQL (Aiven Free Tier)
-
-For multi-site assessments where the Hub runs on a laptop roaming across different networks:
-
-1. Create a free-tier PostgreSQL service at [aiven.io](https://aiven.io).
-2. Retrieve the Service URI (DSN) from the Aiven console. Example:
-   ```
-   postgres://avnadmin:PASSWORD@pg-service-name.aivencloud.com:15432/defaultdb?sslmode=require
-   ```
-3. Test connectivity with `psql` or DBeaver before launching the Hub.
-
----
-
-### Option D: Local SQLite (Zero-Setup Alternative)
-
-For single-machine or early lightweight testing, SQLite requires zero setup:
-- Default DB location: `%LOCALAPPDATA%\Sysmon\wmonitor.db` (Windows) or `~/.local/share/sysmon/wmonitor.db` (Linux).
-- W-Monitor creates and migrates the database automatically on startup.
+For single-machine assessments without a central server, W-Monitor defaults to an embedded SQLite database stored in `%LOCALAPPDATA%\sysmon\wmonitor.db` (Windows) or `~/.local/share/sysmon/wmonitor.db` (Linux).
 
 ---
 
 ## 3. Running the Central W-Monitor Hub
 
-### Environment Variables & Credential Management
+### Environment Variables & Credentials
 
-W-Monitor enforces a strict credential hierarchy to prevent passwords from showing in the process list (`ps` / Task Manager) or shell history.
+W-Monitor enforces a strict credential hierarchy to prevent secrets from leaking in process lists (`ps` / Task Manager).
 
-| Priority | Method | Recommended For |
-|:---:|---|---|
-| **1 (Primary)** | `WMONITOR_DB_DSN` & `WMONITOR_API_KEY` Environment Variables | Production & Services |
-| **2** | `-dsn-file=<path>` Flag | Automated deployments with secret files |
-| **3** | `-dsn="postgres://..."` Flag | One-off local testing only (logs a warning) |
+| Variable | Description | Example |
+|---|---|---|
+| `WMONITOR_DB` | Database backend | `postgres` (or `sqlite`) |
+| `WMONITOR_DB_DSN` | PostgreSQL connection string | `postgres://user:pass@host:5432/db?sslmode=require` |
+| `WMONITOR_MODE` | Server operating mode | `hub` |
+| `WMONITOR_PORT` | HTTP dashboard port | `8080` or `10000` |
+| `WMONITOR_API_KEY` | Hub default API key (optional) | `secure-random-32-char-key` |
 
 #### Setting Environment Variables on Windows:
 ```powershell
-# In PowerShell (for current session):
-$env:WMONITOR_DB_DSN = "postgres://wmonitor:secretpassword@localhost:5432/wmonitor_db?sslmode=disable"
-$env:WMONITOR_API_KEY = "my-secure-32-char-random-api-key"
-
-# Machine-level persistent (requires Admin):
-[Environment]::SetEnvironmentVariable("WMONITOR_DB_DSN", "postgres://wmonitor:secretpassword@localhost:5432/wmonitor_db?sslmode=disable", "Machine")
-[Environment]::SetEnvironmentVariable("WMONITOR_API_KEY", "my-secure-32-char-random-api-key", "Machine")
+$env:WMONITOR_DB = "postgres"
+$env:WMONITOR_DB_DSN = "postgres://avnadmin:pass@pg-host.aivencloud.com:15432/defaultdb?sslmode=require"
+$env:WMONITOR_MODE = "hub"
+$env:WMONITOR_PORT = "8080"
 ```
 
 #### Setting Environment Variables on Linux:
 ```bash
-export WMONITOR_DB_DSN="postgres://wmonitor:secretpassword@localhost:5432/wmonitor_db?sslmode=disable"
-export WMONITOR_API_KEY="my-secure-32-char-random-api-key"
+export WMONITOR_DB="postgres"
+export WMONITOR_DB_DSN="postgres://avnadmin:pass@pg-host.aivencloud.com:15432/defaultdb?sslmode=require"
+export WMONITOR_MODE="hub"
+export WMONITOR_PORT="8080"
 ```
 
 ---
 
 ### Starting the Hub in Foreground
 
-Once the database is running and environment variables are set:
-
-```bash
+```powershell
 # Windows
 .\wmonitor.exe -hub -db postgres -port 8080
 
@@ -178,182 +161,211 @@ Once the database is running and environment variables are set:
 ```
 
 **Startup Log Output:**
+```text
+2026/08/22 16:00:00 [wmonitor] DB backend: postgres @ pg-host.aivencloud.com/defaultdb
+2026/08/22 16:00:00 [server] hub mode enabled — POST /api/ingest requires a registered API key
+2026/08/22 16:00:00 [server] listening on http://localhost:8080/
 ```
-2026/08/18 17:00:00 [wmonitor] DB backend: postgres @ localhost/wmonitor_db
-2026/08/18 17:00:00 [server] hub mode enabled — POST /api/ingest accepting agent data
-2026/08/18 17:00:00 [server] listening on http://localhost:8080
-```
-*(Notice that passwords are never printed to the logs).*
 
 ---
 
-### Installing the Hub as a Background Service
+### Deploying Hub on Cloud (Render.com)
 
-**Windows (Administrator PowerShell):**
+The repository includes a [render.yaml](file:///c:/Users/markv/Desktop/w-monitor/render.yaml) blueprint:
+1. Connect your Git repository to Render.
+2. In Render environment settings, configure:
+   - `WMONITOR_DB_DSN`: Your PostgreSQL DSN string.
+   - `WMONITOR_MODE`: `hub`
+   - `WMONITOR_DB`: `postgres`
+3. Render will deploy and expose your Hub at `https://your-service-name.onrender.com`.
+
+---
+
+## 4. Client Onboarding & API Key Management
+
+### The Organization API Key Model
+
+Instead of generating individual keys per server machine, you create **one Organization API Key per client**. All servers within that client company share this single key.
+
+- The plaintext key is shown **only once** upon generation.
+- Only the **SHA-256 hash** is saved in the database (`api_keys` table).
+- The Hub automatically allocates a unique `tenant_id` for that organization.
+
+---
+
+### Adding a New Client Organization
+
+Run the `-add-client` command pointing to your PostgreSQL database:
+
 ```powershell
-.\install.ps1 -Mode hub -Db postgres -Dsn "postgres://wmonitor:secretpassword@localhost:5432/wmonitor_db?sslmode=disable" -ApiKey "my-secure-api-key"
+.\wmonitor.exe -db postgres -add-client "AcmeCorp"
 ```
 
-**Linux (root):**
-```bash
-sudo ./install.sh --mode hub --db postgres --dsn "postgres://wmonitor:secretpassword@localhost:5432/wmonitor_db?sslmode=disable" --api-key "my-secure-api-key"
+**Output:**
+```text
+Client:    AcmeCorp
+Tenant ID: t_a8f3b219c0de447192bc55ef812034aa
+API Key:   J8q7xKv9mP2LzY10aB+cdE4fGhIjKlMnOpQrStUvWxY=
+
+Store this key now. Only its hash is saved, so it cannot be recovered later.
 ```
+
+Copy the generated **API Key** (`J8q7x...`). This key will be used for all AcmeCorp servers.
 
 ---
 
-## 4. Client Agent Rollout & Management
+### Auditing Registered Clients
 
-### Agent Authentication Model
+To view all active client organizations and their last activity timestamps:
 
-- Agents authenticate to the Hub via HTTP header:
-  `X-API-Key: <WMONITOR_API_KEY>`
-- The Hub uses **constant-time string comparison** (`crypto/subtle.ConstantTimeCompare`) to defend against timing attacks.
-- Unauthorized requests return `401 Unauthorized` before executing any database queries.
-
----
-
-### Client Install Command Generation
-
-Generate an install command for your client machines:
-
-#### For Windows Client Servers:
 ```powershell
-# Execute in Administrator PowerShell on client node:
-.\install.ps1 -Mode agent -HubUrl "https://<your-hub-ip-or-dns>:8080" -ApiKey "my-secure-api-key"
+.\wmonitor.exe -db postgres -list-clients
 ```
 
-#### For Linux Client Servers:
+**Output:**
+```text
+CLIENT               TENANT                                 STATUS     LAST SEEN            KEY HASH (prefix)
+AcmeCorp             t_a8f3b219c0de447192bc55ef812034aa     active     2026-08-22 15:45:10  7a1f89bc430e
+DemoClient           t_6f1c432098ba418301ec99901452abcd     active     2026-08-22 14:12:00  8cdb1d068df8
+```
+
+---
+
+### Revoking Client Access
+
+If an assessment is concluded or credentials need immediate invalidation:
+
+```powershell
+.\wmonitor.exe -db postgres -revoke-client "AcmeCorp"
+```
+*Hub instances update their authorization cache and reject all requests from revoked clients within 60 seconds.*
+
+---
+
+## 5. Universal Binary Distribution & Fleet Rollout
+
+### Building Universal Binaries
+
+Run the universal builder script from the repository root:
+
+```powershell
+.\build_release.ps1
+```
+
+This compiles:
+- `wmonitor.exe` (Windows x64 generic binary)
+- `wmonitor_linux` (Linux x64 generic binary)
+
+Package these binaries alongside `install.ps1` and `install.sh` to provide to client teams.
+
+---
+
+### Windows Server Fleet Rollout
+
+Provide the following single-line command to the client's Windows administrator (runs in Administrator PowerShell):
+
+```powershell
+.\install.ps1 -Mode agent -HubUrl "https://your-hub.onrender.com" -ApiKey "J8q7xKv9mP2LzY10aB+cdE4fGhIjKlMnOpQrStUvWxY="
+```
+
+**What `install.ps1` does automatically:**
+1. Installs `wmonitor.exe` to `C:\Program Files\Sysmon\`.
+2. Creates and locks `%LOCALAPPDATA%\Sysmon\config.env` with Windows ACLs (SYSTEM and current admin only).
+3. Registers and starts the `wmonitor` Windows Service with startup type *Automatic*.
+4. Generates a persistent local server identifier in `%LOCALAPPDATA%\Sysmon\agent_id`.
+
+---
+
+### Linux Server Fleet Rollout
+
+For Linux target servers (Ubuntu, Debian, RHEL, Rocky, CentOS, Alma):
+
 ```bash
-# Execute as root on client node:
-sudo ./install.sh --mode agent --hub-url "https://<your-hub-ip-or-dns>:8080" --api-key "my-secure-api-key"
+sudo ./install.sh --mode agent --hub-url "https://your-hub.onrender.com" --api-key "J8q7xKv9mP2LzY10aB+cdE4fGhIjKlMnOpQrStUvWxY="
+```
+
+**What `install.sh` does automatically:**
+1. Installs binary to `/usr/local/bin/wmonitor`.
+2. Writes credentials to `/etc/wmonitor/config.env` (permissions `0600` root-only).
+3. Installs and enables the `systemd` service (`wmonitor.service`).
+
+---
+
+### Automated Mass Deployment (GPO, Ansible, Cloud-Init)
+
+#### Active Directory Group Policy (GPO Startup Script):
+```powershell
+\\domain.local\sysvol\wmonitor\install.ps1 -Mode agent -HubUrl "https://hub.example.com" -ApiKey "J8q7x..."
+```
+
+#### Ansible Playbook Task:
+```yaml
+- name: Deploy W-Monitor Agent
+  win_shell: |
+    C:\Temp\install.ps1 -Mode agent -HubUrl "https://hub.example.com" -ApiKey "{{ wmonitor_api_key }}"
 ```
 
 ---
 
-### Network & Firewall Considerations
+## 6. Generating Assessment Reports & Migration Deliverables
 
-- Open incoming port `8080` (or your chosen `-port`) on the Hub host's firewall / security group:
-  ```powershell
-  # Windows Defender Firewall rule for Hub (Admin PowerShell):
-  New-NetFirewallRule -DisplayName "W-Monitor Hub" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow
-  ```
-  ```bash
-  # Linux ufw:
-  sudo ufw allow 8080/tcp
-  ```
-- Agents require **outbound** TCP access to `<hub-host>:8080`.
-- No inbound ports need to be opened on client agent servers.
-
----
-
-## 5. Generating Assessment Reports & Migration Deliverables
+At the conclusion of the monitoring period (e.g. 7 days, 14 days, or 30 days), generate deliverables directly from the PostgreSQL backend.
 
 ### Self-Contained HTML Assessment Report
 
-Generate a cloud-sizing assessment report at the end of the assessment window:
+Generates a publication-ready, interactive HTML report with resource percentiles, disk IOPS distributions, bandwidth analysis, and target cloud VM sizing recommendations:
 
-```bash
-# Generate HTML assessment report covering the last 30 days (720 hours)
-wmonitor -db postgres -assessment-report client_assessment_report.html -since 720h
+```powershell
+# Generate report for the last 30 days (720 hours)
+.\wmonitor.exe -db postgres -assessment-report AcmeCorp_Migration_Assessment.html -since 720h
 ```
 
-**Report Features:**
-1. **System Baseline:** vCPU, RAM, Disk capacities.
-2. **CPU & Memory Trends:** Average and peak utilization percentages.
-3. **Disk IOPS Profile:** Peak and average read/write IOPS.
-4. **Traffic Breakdown:** Total sent/received GB, peak bandwidth rate.
-5. **Concurrent User Activity:** Peak active client sessions.
-6. **Target Sizing Recommendations:**
-   - **Minimum Cloud Specs:** Peak observed resource usage + 20% safety margin.
-   - **Recommended Cloud Specs:** Peak observed usage &times; 2.0 (for growth and traffic burst headroom).
-7. **Printable to PDF:** Clean CSS styling designed for browser print-to-PDF.
+**Report Highlights:**
+1. **Executive Fleet Summary:** Total physical/virtual cores, total fleet RAM, aggregated disk usage.
+2. **Per-Server Sizing Recommendations:**
+   - **Minimum Cloud VM Spec:** Peak observed usage + 20% buffer.
+   - **Recommended Cloud VM Spec:** Peak observed usage &times; 2.0 (for headroom and traffic bursts).
+3. **Network & IOPS Profile:** Ingress/egress split, average vs peak IOPS.
+4. **Print-to-PDF Ready:** Fully self-contained CSS layout for browser PDF export.
 
 ---
 
-### CSV Export for Custom Pivot Tables & Charts
+### Raw CSV Data Dump for Custom Financial Modeling
 
-Export granular timestamped data to CSV for custom Excel modeling:
+For Excel financial modeling, TCO calculators, and custom pivot tables:
 
-```bash
-wmonitor -db postgres -export-csv client_data_dump.csv -since 720h
+```powershell
+.\wmonitor.exe -db postgres -export-csv AcmeCorp_Metrics_Dump.csv -since 720h
 ```
 
 ---
 
-## 6. Database Schema & Direct Queries
+## 7. Security Model, Network Rules & Troubleshooting
 
-The Postgres backend automatically provisions and migrates the schema on startup:
+### Network & Firewall Rules
 
-### `metrics` Table Structure
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | `SERIAL PRIMARY KEY` | Auto-incrementing row ID |
-| `timestamp` | `BIGINT NOT NULL` | Epoch seconds (`idx_metrics_ts`) |
-| `server_id` | `TEXT NOT NULL` | Identifier of agent (`idx_metrics_server`) |
-| `hostname` | `TEXT NOT NULL` | Node OS hostname |
-| `cpu_pct` | `DOUBLE PRECISION` | CPU usage percentage |
-| `mem_pct` | `DOUBLE PRECISION` | Memory usage percentage |
-| `disk_free_gb` | `DOUBLE PRECISION` | Free storage on root disk |
-| `net_sent_bytes` | `BIGINT` | Cumulative network bytes sent |
-| `net_recv_bytes` | `BIGINT` | Cumulative network bytes received |
-| `net_sent_external`| `BIGINT` | Public/External NIC bytes sent |
-| `net_recv_external`| `BIGINT` | Public/External NIC bytes received |
-| `net_sent_internal`| `BIGINT` | VPC/Internal NIC bytes sent |
-| `net_recv_internal`| `BIGINT` | VPC/Internal NIC bytes received |
-| `disk_iops` | `DOUBLE PRECISION` | Measured IOPS (read + write) |
-| `net_mbps` | `DOUBLE PRECISION` | Instantaneous bandwidth rate (MB/s) |
-| `concurrent_users`| `INT` | Active connections / user count |
+| Endpoint | Direction | Protocol | Port | Description |
+|---|---|---|---|---|
+| **Client Servers (Agents)** | **Outbound only** | HTTPS/TCP | `443` or `8080` | Pushes metrics to Hub. **Zero inbound ports needed.** |
+| **Central Hub Server** | **Inbound** | HTTPS/TCP | `8080` or `443` | Accepts ingest POSTs and serves dashboard. |
+| **PostgreSQL Database** | **Inbound from Hub only** | TCP | `5432` or `15432` | Storage backend. Client agents never connect to DB. |
 
 ---
-
-### Useful SQL Queries for Analysis
-
-```sql
--- 1. List all active servers sending metrics in the last 24 hours:
-SELECT server_id, hostname, to_timestamp(MAX(timestamp)) AS last_seen, COUNT(*) AS samples
-FROM metrics
-WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '24 hours'))
-GROUP BY server_id, hostname
-ORDER BY last_seen DESC;
-
--- 2. Peak resource utilization per server:
-SELECT 
-    server_id,
-    ROUND(MAX(cpu_pct)::numeric, 2) AS peak_cpu_pct,
-    ROUND(MAX(mem_pct)::numeric, 2) AS peak_mem_pct,
-    ROUND(MAX(disk_iops)::numeric, 1) AS peak_iops,
-    ROUND(MAX(net_mbps)::numeric, 2) AS peak_net_mbps
-FROM metrics
-GROUP BY server_id;
-
--- 3. External vs Internal Traffic totals (GB) across the fleet:
-SELECT 
-    server_id,
-    ROUND((MAX(net_sent_external) - MIN(net_sent_external)) / (1024.0^3)::numeric, 2) AS ext_sent_gb,
-    ROUND((MAX(net_recv_external) - MIN(net_recv_external)) / (1024.0^3)::numeric, 2) AS ext_recv_gb,
-    ROUND((MAX(net_sent_internal) - MIN(net_sent_internal)) / (1024.0^3)::numeric, 2) AS int_sent_gb,
-    ROUND((MAX(net_recv_internal) - MIN(net_recv_internal)) / (1024.0^3)::numeric, 2) AS int_recv_gb
-FROM metrics
-GROUP BY server_id;
-```
-
----
-
-## 7. Maintenance, Retention & Troubleshooting
 
 ### Troubleshooting Checklist
 
-1. **Agent shows `401 Unauthorized` in logs:**
-   - Verify that `WMONITOR_API_KEY` on the Hub matches the `-ApiKey` parameter given to the client agent.
-2. **Agent cannot connect to Hub (`connection refused` or timeout):**
-   - Check if the Hub machine firewall has port `8080` open.
-   - Test connectivity from the client node: `Test-NetConnection -ComputerName <hub-ip> -Port 8080` (Windows) or `nc -zv <hub-ip> 8080` (Linux).
-3. **Database connection error on Hub startup:**
-   - Verify Postgres is running: `docker ps` or `pg_isready`.
-   - Test DSN using `psql "<dsn-string>"`.
-4. **Database Backup:**
-   ```bash
-   # Backup Postgres database:
-   docker exec -t wmonitor-postgres pg_dump -U wmonitor wmonitor_db > wmonitor_backup_$(date +%Y%m%d).sql
-   ```
+#### 1. Agent logs `[server] rejected unknown API key`:
+- **Cause:** The API key passed to the agent has not been registered in PostgreSQL.
+- **Fix:** Run `.\wmonitor.exe -db postgres -add-client "<ClientName>"` on the Hub or verify with `.\wmonitor.exe -db postgres -list-clients`.
+
+#### 2. Agent fails with `connection refused` or timeout:
+- **Cause:** Firewall blocking Hub port or incorrect Hub URL.
+- **Fix:** Test connectivity from client: `Test-NetConnection -ComputerName <hub-host> -Port 8080` (Windows) or `nc -zv <hub-host> 8080` (Linux).
+
+#### 3. Service status check on client server:
+- **Windows:** `Get-Service wmonitor`
+- **Linux:** `systemctl status wmonitor`
+
+#### 4. Checking recent agent logs:
+- **Windows:** View Windows Event Viewer &rarr; *Application Logs* (Source: `wmonitor`) or run interactively `wmonitor -agent <hub-url> -api-key <key>`.
+- **Linux:** `journalctl -u wmonitor -f`

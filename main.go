@@ -316,6 +316,7 @@ func main() {
 			// Fail loudly at startup rather than serving an unauthenticated hub.
 			log.Fatalf("hub mode requires a backend that can verify API keys; %T cannot", store)
 		}
+		autoSeedHubKeys(store)
 		srv.EnableHubMode(keys)
 	}
 
@@ -690,15 +691,11 @@ func revokeClient(keys clientAdminStore, name string) {
 	fmt.Printf("Revoked %d key(s) for client %q. Hubs may cache the decision for up to 60s.\n", n, name)
 }
 
-// importClients migrates the legacy plaintext clients_registry.csv.
-//
-// Existing metric rows were written with tenant_id set to the raw API key, so
-// the imported tenant_id must stay equal to that raw key. Assigning fresh tenant
-// IDs here would orphan every historical row belonging to these clients.
-func importClients(keys clientAdminStore, path string) {
+// importClientsFromCSV reads a clients_registry.csv and upserts all keys into the database.
+func importClientsFromCSV(keys clientAdminStore, path string) (int, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		log.Fatalf("open %s: %v", path, err)
+		return 0, err
 	}
 	defer f.Close()
 
@@ -713,21 +710,19 @@ func importClients(keys clientAdminStore, path string) {
 			break
 		}
 		if err != nil {
-			log.Fatalf("read %s: %v", path, err)
+			return imported, fmt.Errorf("read %s: %w", path, err)
 		}
 		row++
 		if row == 1 && strings.EqualFold(strings.TrimSpace(record[0]), "ClientName") {
 			continue // header
 		}
 		if len(record) < 2 {
-			log.Printf("skipping row %d: expected at least ClientName,APIKey", row)
 			continue
 		}
 
 		name := strings.TrimSpace(record[0])
 		rawKey := strings.TrimSpace(record[1])
 		if name == "" || rawKey == "" {
-			log.Printf("skipping row %d: blank client name or key", row)
 			continue
 		}
 
@@ -740,11 +735,76 @@ func importClients(keys clientAdminStore, path string) {
 			continue
 		}
 		imported++
-		fmt.Printf("imported %s\n", name)
+	}
+	return imported, nil
+}
+
+// importClients migrates the legacy plaintext clients_registry.csv.
+//
+// Existing metric rows were written with tenant_id set to the raw API key, so
+// the imported tenant_id must stay equal to that raw key. Assigning fresh tenant
+// IDs here would orphan every historical row belonging to these clients.
+func importClients(keys clientAdminStore, path string) {
+	imported, err := importClientsFromCSV(keys, path)
+	if err != nil {
+		log.Fatalf("open %s: %v", path, err)
 	}
 
 	fmt.Printf("\nImported %d client key(s) as hashes.\n", imported)
 	fmt.Printf("Now delete %s: it holds plaintext credentials that are no longer needed.\n", path)
+}
+
+// autoSeedHubKeys automatically registers the configured hub API key and any client keys
+// found in clients_registry.csv when running in Hub mode.
+func autoSeedHubKeys(store storage.Store) {
+	adminStore, ok := store.(clientAdminStore)
+	if !ok {
+		return
+	}
+
+	// 1. If an API key is configured on the Hub (via WMONITOR_API_KEY, -api-key, or baked in), ensure it's registered
+	if apiKey := resolveAPIKey(); apiKey != "" {
+		keyHash := storage.HashAPIKey(apiKey)
+		if keyStore, ok := store.(server.KeyStore); ok {
+			if _, err := keyStore.ResolveAPIKey(keyHash); err != nil {
+				if err := adminStore.UpsertAPIKey(storage.APIKeyRecord{
+					KeyHash:    keyHash,
+					TenantID:   apiKey,
+					ClientName: "default",
+				}); err == nil {
+					log.Printf("[server] registered configured API key for client \"default\"")
+				} else {
+					log.Printf("[server] failed to register configured API key: %v", err)
+				}
+			}
+		}
+	}
+
+	// 2. If clients_registry.csv exists in current dir, exe dir, or data dir, auto-import any keys from it.
+	var candidates []string
+	if d, err := storage.DataDir(); err == nil {
+		candidates = append(candidates, filepath.Join(d, "clients_registry.csv"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "clients_registry.csv"))
+	}
+	candidates = append(candidates, "clients_registry.csv")
+
+	seen := make(map[string]bool)
+	for _, p := range candidates {
+		abs, err := filepath.Abs(p)
+		if err != nil || seen[abs] {
+			continue
+		}
+		seen[abs] = true
+
+		if _, err := os.Stat(abs); err == nil {
+			n, err := importClientsFromCSV(adminStore, abs)
+			if err == nil && n > 0 {
+				log.Printf("[server] auto-imported %d client key(s) from %s", n, filepath.Base(abs))
+			}
+		}
+	}
 }
 
 // openStore opens the appropriate backend based on -db flag and DSN resolution.
