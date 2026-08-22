@@ -34,13 +34,11 @@ func (persistentServerIDFlag) Set(raw string) error {
 		return fmt.Errorf("resolve data directory: %w", err)
 	}
 	path := filepath.Join(dir, "agent_id")
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(id+"\n"), 0o600); err != nil {
+	// Write directly rather than rename over the existing file: Windows does not
+	// allow os.Rename to replace a destination, which made overrides fail on the
+	// platform that needs this option most often.
+	if err := os.WriteFile(path, []byte(id+"\n"), 0o600); err != nil {
 		return fmt.Errorf("write server-id: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("commit server-id: %w", err)
 	}
 	return nil
 }
