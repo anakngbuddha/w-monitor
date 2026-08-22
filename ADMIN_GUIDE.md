@@ -374,3 +374,6 @@ For Excel financial modeling, TCO calculators, and custom pivot tables:
 
 
 .\wmonitor.exe -db postgres -dsn "postgres://avnadmin:PASSWORD@pg-service.aivencloud.com:15432/defaultdb?sslmode=require" -add-client "ClientName"
+
+
+.\install.ps1 -Mode agent -HubUrl https://wmonitor-hub.onrender.com -ApiKey 3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0=
