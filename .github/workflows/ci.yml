@@ -17,6 +17,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -42,12 +43,14 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # -short skips the collector test that sleeps for 35 seconds.
+      # Run the complete suite, including the real collector cadence test. The
+      # Phase 13 definition of done is go test -race ./... on both supported OSes.
       - name: Test
-        run: go test -race -short ./...
+        run: go test -race ./...
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
