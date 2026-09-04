@@ -95,6 +95,7 @@ func (s *Server) EnableHubMode(keys KeyStore) {
 	s.mux.HandleFunc("/api/enroll", s.handleEnroll)
 	s.mux.HandleFunc("/api/admin/enroll-codes", s.handleAdminEnrollCodes)
 	s.mux.HandleFunc("/api/admin/agents", s.handleAdminAgents)
+	s.mux.HandleFunc("/api/admin/clients", s.handleAdminClients)
 	if keys == nil {
 		log.Println("[server] WARNING: hub mode enabled with no key store — all requests will be rejected")
 		return

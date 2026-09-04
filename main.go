@@ -96,10 +96,17 @@ var (
 	flagShowKey = flag.Bool("show-key", false, "Print the baked-in API key and exit")
 
 	// Phase 13 — client credential management (hub side)
-	flagAddClient     = flag.String("add-client", "", "Generate and register an API key for this client name, then exit")
+	flagAddClient     = flag.String("add-client", "", "Generate and register a dashboard read token for this client name, then exit")
 	flagListClients   = flag.Bool("list-clients", false, "List registered API clients and exit")
 	flagRevokeClient  = flag.String("revoke-client", "", "Revoke all API keys for this client name and exit")
 	flagImportClients = flag.String("import-clients", "", "Import a clients_registry.csv into the API key table and exit")
+	flagNewEnrollCode = flag.String("new-enroll-code", "", "Generate an enrollment code for a client name and exit (hub only)")
+	flagTTL           = flag.Duration("ttl", 336*time.Hour, "Time-to-live for new enrollment code (default 14d / 336h)")
+	flagMaxUses       = flag.Int("max-uses", 25, "Maximum number of uses for enrollment code (default 25)")
+	flagEnrollCode    = flag.String("enroll-code", "", "Enrollment code for agent self-provisioning (or use WMONITOR_ENROLL_CODE)")
+	flagNewAdminToken = flag.Bool("new-admin-token", false, "Generate and register a new admin token (wmk_...) and exit")
+	flagListAgents    = flag.String("list-agents", "", "List enrolled agents for a client or tenant and exit")
+	flagRevokeAgent   = flag.String("revoke-agent", "", "Revoke agent token for a server ID and exit")
 
 	// Phase 13 — observability & tuning
 	flagUserWindow  = flag.Duration("user-window", 60*time.Second, "Sliding window for counting concurrent users")
@@ -108,10 +115,12 @@ var (
 
 // Build-time variables injected via -ldflags (e.g. for pre-configured client binaries)
 var (
-	defaultHubURL string
-	defaultAPIKey string
-	buildVersion  = "dev"
-	buildCommit   = "unknown"
+	defaultHubURL      string
+	defaultAPIKey      string
+	defaultEnrollCode  string
+	defaultClientLabel string
+	buildVersion       = "dev"
+	buildCommit        = "unknown"
 )
 
 // explicitFlags records which flags the operator actually typed.
@@ -253,7 +262,8 @@ func main() {
 	}
 
 	// ── Client credential management (needs a store, no collector) ──
-	if *flagAddClient != "" || *flagListClients || *flagRevokeClient != "" || *flagImportClients != "" {
+	if *flagAddClient != "" || *flagListClients || *flagRevokeClient != "" || *flagImportClients != "" ||
+		*flagNewEnrollCode != "" || *flagNewAdminToken || *flagListAgents != "" || *flagRevokeAgent != "" {
 		runClientAdmin()
 		return
 	}
@@ -529,6 +539,7 @@ func applyEnvConfig() {
 			*flagAgentHub = defaultHubURL
 		}
 	}
+	envOr("enroll-code", flagEnrollCode, "WMONITOR_ENROLL_CODE")
 	envOr("db", flagDB, "WMONITOR_DB")
 	envOr("port", flagPort, "WMONITOR_PORT", "PORT")
 	envOr("external-iface", flagExternalIface, "WMONITOR_EXTERNAL_IFACE")
@@ -549,6 +560,7 @@ func printConfig() {
 	fmt.Printf("db backend:      %s\n", *flagDB)
 	fmt.Printf("agent hub:       %s\n", orNone(*flagAgentHub))
 	fmt.Printf("api key:         %s\n", mask(resolveAPIKey()))
+	fmt.Printf("enroll code:     %s\n", mask(resolveEnrollCode()))
 	fmt.Printf("dsn:             %s\n", maskDSN())
 	fmt.Printf("app ports:       %s\n", orNone(*flagAppPort))
 	fmt.Printf("external iface:  %s\n", orNone(*flagExternalIface))
@@ -617,6 +629,14 @@ func runClientAdmin() {
 	}
 
 	switch {
+	case *flagNewEnrollCode != "":
+		newEnrollCode(keys, *flagNewEnrollCode, *flagTTL, *flagMaxUses)
+	case *flagNewAdminToken:
+		newAdminToken(keys)
+	case *flagListAgents != "":
+		listAgents(keys, *flagListAgents)
+	case *flagRevokeAgent != "":
+		revokeAgent(keys, *flagRevokeAgent)
 	case *flagAddClient != "":
 		addClient(keys, *flagAddClient)
 	case *flagListClients:
@@ -633,12 +653,147 @@ type clientAdminStore interface {
 	UpsertAPIKey(rec storage.APIKeyRecord) error
 	ListAPIKeys() ([]storage.APIKeyRecord, error)
 	RevokeAPIKey(clientName string) (int64, error)
+	ConsumeEnrollCode(codeHash string) (storage.APIKeyRecord, error)
+	RevokeAgent(tenantID, serverID string) (int64, error)
+	ListAgents(tenantID string) ([]storage.APIKeyRecord, error)
+}
+
+func newEnrollCode(keys clientAdminStore, name string, ttl time.Duration, maxUses int) {
+	code, err := storage.GenerateEnrollCode()
+	if err != nil {
+		log.Fatalf("generate enroll code: %v", err)
+	}
+
+	var tenantID string
+	allKeys, _ := keys.ListAPIKeys()
+	for _, k := range allKeys {
+		if strings.EqualFold(k.ClientName, name) && k.TenantID != "" {
+			tenantID = k.TenantID
+			break
+		}
+	}
+	if tenantID == "" {
+		tenantID, err = storage.NewTenantID()
+		if err != nil {
+			log.Fatalf("generate tenant id: %v", err)
+		}
+	}
+
+	codeHash := storage.HashAPIKey(code)
+	expiresAt := time.Now().Add(ttl)
+
+	if err := keys.UpsertAPIKey(storage.APIKeyRecord{
+		TenantID:   tenantID,
+		ClientName: name,
+		KeyHash:    codeHash,
+		KeyPrefix:  "wme_",
+		Kind:       storage.KindEnroll,
+		Scope:      storage.ScopeIngest,
+		ExpiresAt:  expiresAt,
+		MaxUses:    maxUses,
+		IssuedBy:   "cli",
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		log.Fatalf("save enroll code: %v", err)
+	}
+
+	fmt.Printf("Enrollment Code: %s\n", code)
+	fmt.Printf("Client:          %s\n", name)
+	fmt.Printf("Tenant ID:       %s\n", tenantID)
+	fmt.Printf("Expires:         %s (%v)\n", expiresAt.Format("2006-01-02 15:04:05"), ttl)
+	fmt.Printf("Max Uses:        %d\n\n", maxUses)
+	fmt.Println("Agents can enroll with this code using:")
+	fmt.Printf("  wmonitor.exe -agent <hub-url> -enroll-code %s\n", code)
+}
+
+func newAdminToken(keys clientAdminStore) {
+	token, err := storage.GenerateToken(storage.KindAdmin)
+	if err != nil {
+		log.Fatalf("generate admin token: %v", err)
+	}
+	hash := storage.HashAPIKey(token)
+	prefix := storage.ExtractKeyPrefix(token)
+
+	if err := keys.UpsertAPIKey(storage.APIKeyRecord{
+		TenantID:   "admin",
+		ClientName: "Admin",
+		KeyHash:    hash,
+		KeyPrefix:  prefix,
+		Kind:       storage.KindAdmin,
+		Scope:      storage.ScopeAdmin,
+		IssuedBy:   "cli",
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		log.Fatalf("save admin token: %v", err)
+	}
+
+	fmt.Printf("Admin Token: %s\n\n", token)
+	fmt.Println("Store this admin token securely. Set it as WMONITOR_ADMIN_TOKEN in CI/build scripts.")
+}
+
+func listAgents(keys clientAdminStore, filter string) {
+	var tenantID string
+	if filter != "" && filter != "all" && filter != "*" {
+		allKeys, _ := keys.ListAPIKeys()
+		for _, k := range allKeys {
+			if strings.EqualFold(k.ClientName, filter) || strings.EqualFold(k.TenantID, filter) {
+				tenantID = k.TenantID
+				break
+			}
+		}
+		if tenantID == "" {
+			tenantID = filter
+		}
+	}
+
+	agents, err := keys.ListAgents(tenantID)
+	if err != nil {
+		log.Fatalf("list agents: %v", err)
+	}
+	if len(agents) == 0 {
+		fmt.Printf("No enrolled agents found for %q.\n", filter)
+		return
+	}
+	fmt.Printf("%-24s %-20s %-10s %-20s %s\n", "SERVER ID", "CLIENT", "STATUS", "LAST SEEN", "TOKEN PREFIX")
+	for _, a := range agents {
+		status := "active"
+		if a.Revoked {
+			status = "revoked"
+		}
+		lastSeen := "never"
+		if a.LastSeenAt.Unix() > 0 {
+			lastSeen = a.LastSeenAt.Format("2006-01-02 15:04:05")
+		}
+		fmt.Printf("%-24s %-20s %-10s %-20s %s\n", a.ServerID, a.ClientName, status, lastSeen, a.KeyPrefix)
+	}
+}
+
+func revokeAgent(keys clientAdminStore, serverID string) {
+	agents, err := keys.ListAgents("")
+	if err != nil {
+		log.Fatalf("list agents: %v", err)
+	}
+	var count int64
+	for _, a := range agents {
+		if strings.EqualFold(a.ServerID, serverID) && !a.Revoked {
+			n, err := keys.RevokeAgent(a.TenantID, a.ServerID)
+			if err != nil {
+				log.Fatalf("revoke agent: %v", err)
+			}
+			count += n
+		}
+	}
+	if count == 0 {
+		fmt.Printf("No active agent token found for server ID %q.\n", serverID)
+		return
+	}
+	fmt.Printf("Revoked %d agent token(s) for server ID %q.\n", count, serverID)
 }
 
 func addClient(keys clientAdminStore, name string) {
-	plaintext, err := storage.GenerateAPIKey()
+	readToken, err := storage.GenerateToken(storage.KindRead)
 	if err != nil {
-		log.Fatalf("generate key: %v", err)
+		log.Fatalf("generate read token: %v", err)
 	}
 	tenantID, err := storage.NewTenantID()
 	if err != nil {
@@ -646,18 +801,24 @@ func addClient(keys clientAdminStore, name string) {
 	}
 
 	if err := keys.UpsertAPIKey(storage.APIKeyRecord{
-		KeyHash:    storage.HashAPIKey(plaintext),
+		KeyHash:    storage.HashAPIKey(readToken),
+		KeyPrefix:  storage.ExtractKeyPrefix(readToken),
+		Kind:       storage.KindRead,
+		Scope:      storage.ScopeRead,
 		TenantID:   tenantID,
 		ClientName: name,
+		IssuedBy:   "cli",
+		CreatedAt:  time.Now(),
 	}); err != nil {
 		log.Fatalf("register key: %v", err)
 	}
 
-	fmt.Printf("Client:    %s\n", name)
-	fmt.Printf("Tenant ID: %s\n", tenantID)
-	fmt.Printf("API Key:   %s\n\n", plaintext)
-	fmt.Println("Store this key now. Only its hash is saved, so it cannot be recovered later.")
-	fmt.Printf("Build a client binary with:\n  -ldflags \"-X main.defaultAPIKey=%s -X main.defaultHubURL=<hub-url>\"\n", plaintext)
+	fmt.Printf("Client:     %s\n", name)
+	fmt.Printf("Tenant ID:  %s\n", tenantID)
+	fmt.Printf("Read Token (Dashboard): %s\n\n", readToken)
+	fmt.Println("Store this token now. Use it to log in to the central dashboard.")
+	fmt.Printf("\nTo create an agent enrollment code for this client, run:\n")
+	fmt.Printf("  wmonitor.exe -new-enroll-code %q\n", name)
 }
 
 func listClients(keys clientAdminStore) {
@@ -788,7 +949,31 @@ func autoSeedHubKeys(store storage.Store) {
 		}
 	}
 
-	// 2. If clients_registry.csv exists in current dir, exe dir, or data dir, auto-import any keys from it.
+	// 2. If an admin token is configured on the Hub (via WMONITOR_ADMIN_TOKEN env var), ensure it's registered with admin scope
+	if adminToken := strings.TrimSpace(os.Getenv("WMONITOR_ADMIN_TOKEN")); adminToken != "" {
+		adminHash := storage.HashAPIKey(adminToken)
+		if keyStore, ok := store.(server.KeyStore); ok {
+			if _, err := keyStore.ResolveAPIKey(adminHash); err != nil {
+				prefix := storage.ExtractKeyPrefix(adminToken)
+				if err := adminStore.UpsertAPIKey(storage.APIKeyRecord{
+					KeyHash:    adminHash,
+					KeyPrefix:  prefix,
+					TenantID:   "admin",
+					ClientName: "Admin",
+					Kind:       storage.KindAdmin,
+					Scope:      storage.ScopeAdmin,
+					IssuedBy:   "env",
+					CreatedAt:  time.Now(),
+				}); err == nil {
+					log.Printf("[server] registered configured WMONITOR_ADMIN_TOKEN")
+				} else {
+					log.Printf("[server] failed to register admin token: %v", err)
+				}
+			}
+		}
+	}
+
+	// 3. If clients_registry.csv exists in current dir, exe dir, or data dir, auto-import any keys from it.
 	var candidates []string
 	if d, err := storage.DataDir(); err == nil {
 		candidates = append(candidates, filepath.Join(d, "clients_registry.csv"))
@@ -897,6 +1082,17 @@ func resolveAPIKey() string {
 	return defaultAPIKey
 }
 
+// resolveEnrollCode reads enrollment code from -enroll-code flag, WMONITOR_ENROLL_CODE env var, or build-time default.
+func resolveEnrollCode() string {
+	if *flagEnrollCode != "" {
+		return *flagEnrollCode
+	}
+	if v := os.Getenv("WMONITOR_ENROLL_CODE"); v != "" {
+		return v
+	}
+	return defaultEnrollCode
+}
+
 // parseAppPorts parses a comma-separated list of port numbers.
 func parseAppPorts(raw string) []uint32 {
 	if raw == "" {
@@ -915,13 +1111,38 @@ func parseAppPorts(raw string) []uint32 {
 // runAgentMode starts the collector in agent mode — no local DB, no dashboard.
 // Metrics are POSTed to the hub's /api/ingest endpoint.
 func runAgentMode() {
+	hubURL := strings.TrimRight(*flagAgentHub, "/")
+	serverID := resolveServerID()
+	hostname, _ := os.Hostname()
+
 	apiKey := resolveAPIKey()
+	enrollCode := resolveEnrollCode()
+
+	// 1. If explicit API key provided via flag or env var, use it
 	if apiKey == "" {
-		log.Fatal("[agent] API key required: set -api-key flag or WMONITOR_API_KEY env var")
+		// 2. Check if machine already has stored DPAPI/0600 credentials
+		if creds, err := agent.LoadCredentials(); err == nil && creds != nil && creds.Token != "" {
+			apiKey = creds.Token
+			log.Printf("[agent] using previously enrolled credentials (server_id=%s)", creds.ServerID)
+		} else if enrollCode != "" {
+			// 3. First run auto-enrollment using enrollment code
+			log.Printf("[agent] performing first-run enrollment with hub %s...", hubURL)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			creds, err := agent.Enroll(ctx, hubURL, enrollCode, serverID, hostname, buildVersion)
+			cancel()
+			if err != nil {
+				log.Fatalf("[agent] enrollment failed: %v", err)
+			}
+			apiKey = creds.Token
+			log.Printf("[agent] successfully enrolled! Machine token saved to local credential store.")
+		}
 	}
 
-	hubURL := strings.TrimRight(*flagAgentHub, "/")
-	log.Printf("[agent] starting (version %s) — pushing to %s", buildVersion, hubURL)
+	if apiKey == "" {
+		log.Fatal("[agent] API key or enrollment code required: use -enroll-code <code or -api-key <key>")
+	}
+
+	log.Printf("[agent] starting (version %s) — pushing to %s (server: %s)", buildVersion, hubURL, serverID)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -936,7 +1157,7 @@ func runAgentMode() {
 		col.SetExternalIface(*flagExternalIface)
 	}
 	configureUserTracker(col)
-	col.SetServerID(resolveServerID())
+	col.SetServerID(serverID)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)

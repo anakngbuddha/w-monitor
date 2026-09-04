@@ -320,3 +320,102 @@ func (s *Server) handleAdminAgents(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
+
+// handleAdminClients creates a new client read token or lists clients (POST/GET /api/admin/clients).
+func (s *Server) handleAdminClients(w http.ResponseWriter, r *http.Request) {
+	s.writeCORS(w, r)
+	_, ok := s.authTenantScope(w, r, storage.ScopeAdmin)
+	if !ok {
+		return
+	}
+
+	adminStore, ok := s.keys.(AdminStore)
+	if !ok {
+		writeJSONError(w, http.StatusServiceUnavailable, "admin store unavailable")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		allKeys, err := adminStore.ListAPIKeys()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to list clients")
+			return
+		}
+		type clientInfo struct {
+			ClientName string `json:"client_name"`
+			TenantID   string `json:"tenant_id"`
+			Kind       string `json:"kind"`
+			KeyPrefix  string `json:"key_prefix"`
+			Revoked    bool   `json:"revoked"`
+		}
+		var out []clientInfo
+		for _, k := range allKeys {
+			if k.Kind == storage.KindRead || k.Kind == storage.KindLegacy {
+				out = append(out, clientInfo{
+					ClientName: k.ClientName,
+					TenantID:   k.TenantID,
+					Kind:       k.Kind,
+					KeyPrefix:  k.KeyPrefix,
+					Revoked:    k.Revoked,
+				})
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"clients": out})
+
+	case http.MethodPost:
+		var req struct {
+			ClientName string `json:"client_name"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		req.ClientName = strings.TrimSpace(req.ClientName)
+		if req.ClientName == "" {
+			writeJSONError(w, http.StatusBadRequest, "client_name is required")
+			return
+		}
+
+		readToken, err := storage.GenerateToken(storage.KindRead)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to generate read token")
+			return
+		}
+
+		tenantID, err := storage.NewTenantID()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to generate tenant ID")
+			return
+		}
+
+		hash := storage.HashAPIKey(readToken)
+		prefix := storage.ExtractKeyPrefix(readToken)
+
+		if err := adminStore.UpsertAPIKey(storage.APIKeyRecord{
+			TenantID:   tenantID,
+			ClientName: req.ClientName,
+			KeyHash:    hash,
+			KeyPrefix:  prefix,
+			Kind:       storage.KindRead,
+			Scope:      storage.ScopeRead,
+			IssuedBy:   "admin_api",
+			CreatedAt:  time.Now(),
+		}); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to save client")
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{
+			"client_name": req.ClientName,
+			"tenant_id":   tenantID,
+			"read_token":  readToken,
+		})
+
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
