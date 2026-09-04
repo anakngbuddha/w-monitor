@@ -1,177 +1,287 @@
-# W-Monitor User & Operator Guide
-## Universal System Monitoring & Pre-Migration Cloud Sizing Agent
+# W-Monitor Complete User & Operator Guide
+## Centralized Multi-Server Fleet Monitoring & Cloud Migration Assessment
 
-Welcome to **W-Monitor**, a lightweight, high-performance, single-binary system monitoring and pre-migration assessment tool. W-Monitor collects granular utilization metrics (CPU, RAM, Disk, IOPS, Network bandwidth, and Top Processes) and provides an embedded real-time web dashboard, automated export utilities, and publication-ready cloud migration assessment reports.
+Welcome to **W-Monitor**, a lightweight, high-performance Go monitoring suite and pre-migration sizing agent designed for enterprise multi-server assessments.
+
+This guide covers the **Method B (Universal Generic Binary)** workflow, deploying collector agents across Windows and Linux server fleets, using the centralized web dashboard on Render, and generating cloud migration deliverables.
 
 ---
 
 ## Table of Contents
 
-1. [Architecture & Deployment Modes](#1-architecture--deployment-modes)
-2. [How the Organization API Key Works](#2-how-the-organization-api-key-works)
-3. [Quick Start: Windows Client Servers](#3-quick-start-windows-client-servers)
-4. [Quick Start: Linux Client Servers](#4-quick-start-linux-client-servers)
-5. [Standalone Local Monitoring (Zero-Cloud / Offline)](#5-standalone-local-monitoring-zero-cloud--offline)
-6. [Time-Bounded Assessments (e.g. 1 hour, 24 hours, 7 days)](#6-time-bounded-assessments)
-7. [Managing the Background Service](#7-managing-the-background-service)
-8. [Generating Assessment Reports & Data Exports](#8-generating-assessment-reports--data-exports)
-9. [Web Dashboard Walkthrough](#9-web-dashboard-walkthrough)
-10. [Cloud Sizing Metrics & Cost Forecasting](#10-cloud-sizing-metrics--cost-forecasting)
+1. [Architecture & The Method B Standard](#1-architecture--the-method-b-standard)
+2. [Operating Modes Overview](#2-operating-modes-overview)
+3. [End-to-End Quick Start (Method B Fleet Rollout)](#3-end-to-end-quick-start-method-b-fleet-rollout)
+   - [Step 1: Build the Universal Binaries](#step-1-build-the-universal-binaries)
+   - [Step 2: Generate an Organization API Key on the Hub](#step-2-generate-an-organization-api-key-on-the-hub)
+   - [Step 3: Deploy Agents on Windows Servers](#step-3-deploy-agents-on-windows-servers)
+   - [Step 4: Deploy Agents on Linux Servers](#step-4-deploy-agents-on-linux-servers)
+4. [Centralized Web Dashboard Guide](#4-centralized-web-dashboard-guide)
+5. [Standalone / Solo Mode (Offline / Single Machine)](#5-standalone--solo-mode-offline--single-machine)
+6. [Generating Assessment Reports & Data Exports](#6-generating-assessment-reports--data-exports)
+7. [Client Key Auditing & Access Revocation](#7-client-key-auditing--access-revocation)
+8. [Background Service Operations & Maintenance](#8-background-service-operations--maintenance)
+9. [CLI Flags & Environment Variables Reference](#9-cli-flags--environment-variables-reference)
+10. [Troubleshooting & FAQ](#10-troubleshooting--faq)
 
 ---
 
-## 1. Architecture & Deployment Modes
+## 1. Architecture & The Method B Standard
 
-W-Monitor uses **universal, generic binaries** (`wmonitor.exe` for Windows, `wmonitor_linux` for Linux). The same binary runs in two modes:
-
-### Mode 1: Client Agent Mode *(Recommended for Cloud Migration Assessments)*
-- Deployed across target client servers (1 to 100+ servers per client).
-- **Zero Database Footprint:** No database engine or local storage required on target machines.
-- **Zero Inbound Ports:** Agents only make outbound HTTPS requests to the central Hub.
-- **No Database Passwords:** Agents only hold an Organization API Key and never see PostgreSQL credentials.
-- Pushes metric snapshots every 10 seconds to the central Hub via `POST /api/ingest`.
-
-### Mode 2: Standalone / Hub Mode
-- Runs on a central server (e.g., Render, cloud VM, or laptop).
-- Accepts metric streams from all client agents, isolated by organization/tenant.
-- Serves the real-time web dashboard on port `8080` (configurable).
-- Stores data in **PostgreSQL** (centralized multi-tenant) or **SQLite** (local single-server).
-
----
-
-## 2. How the Organization API Key Works
-
-When assessing a client company (e.g., *Acme Corp*):
+W-Monitor is built around the **Universal Generic Binary + Organization API Key** standard:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                  ACME CORP SERVERS (Fleet)                 │
-│                                                            │
-│  All servers run standard wmonitor.exe                     │
-│  All servers use SAME Acme Corp API Key                    │
-│                                                            │
-│   Server 01          Server 02          Server 03 ...      │
-│  (ID: srv-01)       (ID: srv-02)       (ID: srv-03)        │
-│       │                  │                  │              │
-│       └──────────────────┼──────────────────┘              │
-│                          │ Outbound HTTPS                  │
-│                          │ Header: X-API-Key: <Acme_Key>   │
-│                          ▼                                 │
-│             ┌─────────────────────────┐                    │
-│             │  Central W-Monitor Hub  │                    │
-│             │  (PostgreSQL Backend)   │                    │
-│             └─────────────────────────┘                    │
-└────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CLIENT ENVIRONMENT (e.g. Acme Corp)                  │
+│                                                                         │
+│   Same wmonitor binary deployed to all Windows & Linux servers          │
+│   All servers configured with Acme Corp's Organization API Key          │
+│                                                                         │
+│    ┌──────────────────┐    ┌──────────────────┐    ┌─────────────────┐  │
+│    │  App Server 01   │    │  App Server 02   │    │  Database Node  │  │
+│    │ (ID: SRV-APP-01) │    │ (ID: SRV-APP-02) │    │ (ID: SRV-DB-01) │  │
+│    └────────┬─────────┘    └────────┬─────────┘    └────────┬────────┘  │
+│             │                       │                       │           │
+│             └───────────────────────┼───────────────────────┘           │
+│                                     │ HTTPS POST /api/ingest            │
+│                                     │ Header: X-API-Key: <Acme_Key>     │
+│                                     │ (Outbound ONLY — 0 inbound ports) │
+└─────────────────────────────────────┼───────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      CENTRAL W-MONITOR HUB (Render.com)                 │
+│                      https://wmonitor-hub.onrender.com                  │
+│                                                                         │
+│  - Validates Org API Key via SHA-256 hash lookup in PostgreSQL          │
+│  - Maps all client servers to Acme Corp's isolated Tenant ID            │
+│  - Serves multi-server Web Dashboard with individual server selector    │
+│  - Generates consolidated HTML assessment & cloud sizing deliverables   │
+│                                     │                                   │
+│                                     ▼                                   │
+│                        ┌────────────────────────┐                       │
+│                        │  PostgreSQL Database   │                       │
+│                        │ (Render / Aiven Cloud) │                       │
+│                        └────────────────────────┘                       │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-1. **One Key Per Client:** The assessment team generates **one API key for the entire client organization** on the Hub.
-2. **Every Server is Identified Automatically:** Each server generates a persistent `server_id` and reports its hostname.
-3. **Automatic Fleet Grouping:** All servers with the same organization key appear grouped together under that client's dashboard and assessment reports.
+### Core Principles:
+* **One Key per Client Organization:** You generate **one** API key per client company. All servers in that company share this key.
+* **Automatic Server Distinction:** Each machine automatically derives a unique, persistent `server_id` (e.g. `WIN-SRV01-4f8a12`) stored in `agent_id`.
+* **Zero Database Exposure:** Monitored client servers never communicate with PostgreSQL and never store database credentials.
+* **Spooling Resilience:** If the central Hub or network is temporarily offline, agents buffer metrics on local disk and automatically drain them once reconnected.
 
 ---
 
-## 3. Quick Start: Windows Client Servers
+## 2. Operating Modes Overview
 
-### Step 1: Package Contents
-You will receive:
-- `wmonitor.exe` (Universal Windows 64-bit binary)
-- `install.ps1` (Automated service installer)
+W-Monitor operates in three distinct modes resolved at runtime:
 
-### Step 2: One-Line Service Installation
-Open **PowerShell as Administrator** and execute:
+| Mode | Flag / Trigger | Purpose | Local DB | Dashboard |
+| :--- | :--- | :--- | :--- | :--- |
+| **`agent`** | `-agent <hub_url>` or `install.ps1 -Mode agent` | Collects OS metrics on client machines and pushes them to the Hub | None (disk spool buffer) | None (zero open ports) |
+| **`hub`** | `-hub` or `WMONITOR_MODE=hub` | Central server on Render/cloud that receives metrics and serves dashboard | PostgreSQL (`-db postgres`) | Hosted at your Render URL |
+| **`standalone`** | Default (no flags) | Single-machine assessment with local storage | Embedded SQLite (`wmonitor.db`) | Hosted at `http://localhost:8080` |
+
+---
+
+## 3. End-to-End Quick Start (Method B Fleet Rollout)
+
+### Step 1: Build the Universal Binaries
+
+Run the builder script in PowerShell:
 
 ```powershell
-.\install.ps1 -Mode agent -HubUrl "https://your-hub.example.com" -ApiKey "your-organization-api-key"
+.\build_release.ps1
 ```
 
-### What Happens Automatically:
-- Copies `wmonitor.exe` to `C:\Program Files\Sysmon\wmonitor.exe`.
-- Adds `C:\Program Files\Sysmon` to the System `PATH`.
-- Writes credentials securely to `%LOCALAPPDATA%\Sysmon\config.env` locked with Windows ACLs (SYSTEM & Admin only).
-- Registers and starts the `wmonitor` Windows Service with startup type *Automatic*.
-- The agent immediately begins pushing metrics to your Hub.
+This compiles two clean, generic binaries with zero hardcoded credentials:
+* `wmonitor.exe` (Windows 64-bit universal binary)
+* `wmonitor_linux` (Linux 64-bit universal binary)
 
-### Step 3: Interactive / Foreground Testing (Optional)
-If you want to test running in the terminal without installing a service:
+---
+
+### Step 2: Generate an Organization API Key on the Hub
+
+On the machine connecting to your PostgreSQL database (or directly against your cloud database):
 
 ```powershell
-.\wmonitor.exe -agent "https://your-hub.example.com" -api-key "your-organization-api-key"
+.\wmonitor.exe -db postgres -dsn "postgres://user:password@host:port/dbname?sslmode=require" -add-client "AcmeCorp"
+```
+
+**Output:**
+```text
+Client:    AcmeCorp
+Tenant ID: t_a8f3b219c0de447192bc55ef812034aa
+API Key:   3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0=
+
+Store this key now. Only its hash is saved, so it cannot be recovered later.
+```
+
+Copy the generated **API Key**. Distribute this single key to all servers belonging to AcmeCorp.
+
+---
+
+### Step 3: Deploy Agents on Windows Servers
+
+Package `wmonitor.exe` and `install.ps1` and provide them to the client's Windows admin.
+
+#### A. Install as a Background Windows Service (Production)
+Run in **PowerShell as Administrator**:
+
+```powershell
+.\install.ps1 -ApiKey "3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0="
+```
+
+*(Note: `-HubUrl` automatically defaults to `https://wmonitor-hub.onrender.com`. You only need to pass `-HubUrl` if using a custom domain).*
+
+**What this does automatically:**
+1. Installs binary to `C:\Program Files\W-Monitor\wmonitor.exe`.
+2. Stores credentials securely in `%LOCALAPPDATA%\Sysmon\config.env` locked with Windows ACLs (SYSTEM & Admin only).
+3. Registers and starts the `wmonitor` Windows Service with startup type *Automatic*.
+4. Generates a persistent local server identifier in `%LOCALAPPDATA%\Sysmon\agent_id`.
+5. Begins streaming metrics immediately.
+
+#### B. Interactive Foreground Run (Testing Only)
+If you want to test without installing a service:
+```powershell
+.\wmonitor.exe -agent "https://wmonitor-hub.onrender.com" -api-key "3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0="
 ```
 
 ---
 
-## 4. Quick Start: Linux Client Servers
+### Step 4: Deploy Agents on Linux Servers
 
-### Step 1: Package Contents
-You will receive:
-- `wmonitor_linux` (Universal Linux 64-bit binary)
-- `install.sh` (Automated systemd installer)
+Package `wmonitor_linux` and `install.sh` and transfer them to the target Linux machine.
 
-### Step 2: One-Line Service Installation
-Make `install.sh` executable and run as `root`:
+#### A. Install as a systemd Background Service (Production)
+Run in terminal as `root`:
 
 ```bash
 chmod +x install.sh
-sudo ./install.sh --mode agent --hub-url "https://your-hub.example.com" --api-key "your-organization-api-key"
+sudo ./install.sh --api-key "3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0="
 ```
 
-### What Happens Automatically:
-- Installs binary to `/usr/local/bin/sysmon`.
-- Stores credentials in `/etc/wmonitor/config.env` (permissions `0600` root-only).
-- Registers and enables the `systemd` service (`sysmon.service`).
-- Starts collecting and streaming metrics immediately.
+*(Note: `--hub-url` automatically defaults to `https://wmonitor-hub.onrender.com`).*
+
+**What this does automatically:**
+1. Copies binary to `/usr/local/bin/wmonitor`.
+2. Writes credentials to `/etc/wmonitor/config.env` with `0600` permissions (root-only).
+3. Registers, enables, and starts `wmonitor.service` via `systemd`.
+4. Generates a persistent server identifier in `~/.local/share/sysmon/agent_id`.
+
+#### B. Interactive Foreground Run (Testing Only)
+```bash
+chmod +x wmonitor_linux
+./wmonitor_linux -agent "https://wmonitor-hub.onrender.com" -api-key "3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0="
+```
 
 ---
 
-## 5. Standalone Local Monitoring (Zero-Cloud / Offline)
+## 4. Centralized Web Dashboard Guide
 
-If you are performing an offline assessment on a single isolated machine with no internet connection:
+1. Open your browser and navigate to your deployed Central Hub:
+   ```text
+   https://wmonitor-hub.onrender.com
+   ```
+2. **Organization Key Authentication:**
+   * An authentication modal will appear: `🔐 W-Monitor Client Access`.
+   * Paste your client's **Organization API Key** and click **Access Dashboard**.
+   * The dashboard saves your key in browser storage and activates your isolated tenant session.
+3. **Filtering by Server:**
+   * Look at the top navigation bar for the **Server Dropdown** (`All Servers`).
+   * Choose **All Servers** to view aggregated fleet metrics.
+   * Or click the dropdown to select a specific server (e.g. `WIN-SRV01`, `LINUX-DB-02`) to view that machine's isolated utilization.
+4. **Time Window Ranges:**
+   * Click **24h** for real-time 10-second metric resolution.
+   * Click **7d** or **30d** for historical trends with automatic hourly downsampling.
+5. **Observed Metrics:**
+   * **CPU Usage:** Average vs. Peak utilization.
+   * **Memory Usage:** Average vs. Peak RAM consumed.
+   * **Disk Free:** Minimum storage headroom remaining.
+   * **Network Bandwidth:** Ingress/egress throughput with automatic isolation of **External Internet** vs. **Internal VPC** traffic.
+   * **Disk IOPS:** Real-time read and write IOPS.
+   * **Active Users:** Application concurrent user tracking.
+   * **Top Processes:** Live rankings of processes by CPU and RAM consumption.
 
-### Windows:
+---
+
+## 5. Standalone / Solo Mode (Offline / Single Machine)
+
+For offline, single-machine evaluations where no central Hub is needed:
+
 ```powershell
-# Run in terminal (SQLite database created automatically in %LOCALAPPDATA%\Sysmon\wmonitor.db)
+# Windows:
 .\wmonitor.exe
 
-# Or install as local background service:
-.\install.ps1 -Mode hub -Db sqlite -ApiKey "local-pass"
-```
-
-### Linux:
-```bash
-# Run in terminal
+# Linux:
 ./wmonitor_linux
-
-# Or install as local systemd service:
-sudo ./install.sh --mode hub --db sqlite --api-key "local-pass"
 ```
 
-Open your browser to `http://localhost:8080` to view the local real-time dashboard.
+* W-Monitor creates a local embedded SQLite database in `%LOCALAPPDATA%\Sysmon\wmonitor.db` (Windows) or `~/.local/share/sysmon/wmonitor.db` (Linux).
+* The real-time web dashboard is served directly at:
+  ```text
+  http://localhost:8080
+  ```
 
 ---
 
-## 6. Time-Bounded Assessments
+## 6. Generating Assessment Reports & Data Exports
 
-To run W-Monitor for an exact duration (e.g. 1 hour load test, 24-hour baseline, or 7-day migration assessment) and have it automatically stop and generate reports upon completion:
+At the conclusion of your monitoring period (e.g. 7 days, 14 days, or 30 days), generate deliverables directly from the PostgreSQL backend:
 
-Use the **`-run-for`** flag:
+### 1. Publication-Ready HTML Assessment Report
+Generates an interactive HTML report complete with resource percentiles, IOPS distribution, network egress breakdowns, and cloud VM sizing recommendations (printable directly to PDF via browser):
 
 ```powershell
-# 1. Run for 1 hour as an Agent pushing to Hub, then stop:
-.\wmonitor.exe -agent "https://hub.example.com" -api-key "your-key" -run-for 1h
+.\wmonitor.exe -db postgres -dsn "YOUR_POSTGRES_DSN" -assessment-report AcmeCorp_Cloud_Assessment.html -since 720h
+```
 
-# 2. Run for 24 hours locally, then auto-export a daily CSV upon exit:
-.\wmonitor.exe -run-for 24h -export-filter daily
+### 2. Granular CSV Metrics Export
+Generates a raw data dump for custom financial modeling, TCO calculators, and Excel pivot tables:
 
-# 3. Run for 7 days (168 hours):
-.\wmonitor.exe -run-for 168h
+```powershell
+.\wmonitor.exe -db postgres -dsn "YOUR_POSTGRES_DSN" -export-csv AcmeCorp_Metrics_Dump.csv -since 720h
+```
+
+### 3. Plain-Text Terminal Summary
+```powershell
+.\wmonitor.exe -db postgres -dsn "YOUR_POSTGRES_DSN" -export-txt summary.txt -since 168h
 ```
 
 ---
 
-## 7. Managing the Background Service
+## 7. Client Key Auditing & Access Revocation
 
-### Windows Service Management
+Run these administrative commands against PostgreSQL:
 
+### Audit Registered Clients & Last-Seen Activity
+```powershell
+.\wmonitor.exe -db postgres -dsn "YOUR_POSTGRES_DSN" -list-clients
+```
+
+**Example Output:**
+```text
+CLIENT               TENANT                                 STATUS     LAST SEEN            KEY HASH (prefix)
+AcmeCorp             t_a8f3b219c0de447192bc55ef812034aa     active     2026-09-04 08:30:12  7a1f89bc430e
+BetaLLC              t_4e1c2219b1aa448301ec99901452efgh     active     2026-09-03 22:15:00  9bd183f01ca2
+```
+
+### Revoke a Client Organization
+To immediately stop accepting metrics from a client and block dashboard access:
+```powershell
+.\wmonitor.exe -db postgres -dsn "YOUR_POSTGRES_DSN" -revoke-client "AcmeCorp"
+```
+*The Hub invalidates its authorization cache within 60 seconds.*
+
+---
+
+## 8. Background Service Operations & Maintenance
+
+### Windows Service Management (`wmonitor`)
+
+Run in PowerShell:
 ```powershell
 # Check service status
 Get-Service wmonitor
@@ -183,75 +293,77 @@ Restart-Service wmonitor
 Stop-Service wmonitor
 
 # Uninstall service completely
-wmonitor -uninstall
+.\wmonitor.exe -uninstall
 ```
 
-### Linux systemd Service Management
+### Linux systemd Service Management (`wmonitor.service`)
 
+Run in terminal:
 ```bash
 # Check service status
-sudo systemctl status sysmon
+sudo systemctl status wmonitor
 
-# View real-time streaming logs
-sudo journalctl -u sysmon -f
+# View live streaming logs
+sudo journalctl -u wmonitor -f
 
 # Restart service
-sudo systemctl restart sysmon
+sudo systemctl restart wmonitor
 
 # Stop service
-sudo systemctl stop sysmon
+sudo systemctl stop wmonitor
+
+# Uninstall service completely
+sudo /usr/local/bin/wmonitor -uninstall
 ```
 
 ---
 
-## 8. Generating Assessment Reports & Data Exports
+## 9. CLI Flags & Environment Variables Reference
 
-Generate cloud sizing reports directly from the collected data:
+W-Monitor enforces a strict configuration precedence:
+`CLI Flag` > `Environment Variable` > `config.env file` > `Build-time default (-ldflags)` > `Built-in default`.
 
-### 1. Self-Contained HTML Assessment Report (Printable to PDF)
-Generates an interactive, publication-ready HTML deliverable with resource percentiles, IOPS distributions, bandwidth analysis, and target cloud VM recommendations:
-
-```powershell
-# Generate report covering the last 30 days (720 hours)
-wmonitor -assessment-report cloud_assessment_report.html -since 720h
-```
-
-### 2. Granular CSV Export
-Exports raw timestamped data suitable for custom Excel financial modeling:
-
-```powershell
-wmonitor -export-csv fleet_metrics_dump.csv -since 720h
-```
-
-### 3. Quick Plain-Text Terminal Summary
-```powershell
-wmonitor -export-txt summary.txt -since 168h
-```
-
----
-
-## 9. Web Dashboard Walkthrough
-
-When viewing the dashboard at `http://localhost:8080` (or your Hub URL):
-
-1. **Server Fleet Selector:** Filter between viewing the entire aggregated fleet or an individual server node.
-2. **Time Window Filters:** Toggle between **24h** (raw 10s high-res data), **7d**, and **30d** (downsampled hourly).
-3. **Core Metric Gauges & Trends:**
-   - **CPU:** Average vs Peak core consumption.
-   - **Memory:** Average vs Peak RAM utilization.
-   - **Disk Free:** Minimum remaining storage headroom.
-   - **Network Throughput:** Ingress/egress bandwidth with automatic split for **External (Internet)** vs **Internal (VPC)** traffic.
-   - **Disk IOPS:** Measured real-time read and write IOPS.
-   - **Concurrent Users:** Active application connections.
-4. **Top Processes:** Real-time top 10 processes ranked by CPU and RAM consumption.
-5. **Instant CSV Export:** Download data directly from the top navigation bar.
+| Flag | Env Variable | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `-agent <url>` | `WMONITOR_AGENT_HUB` | `""` | Run in Agent mode, forwarding metrics to this Hub URL |
+| `-api-key <key>` | `WMONITOR_API_KEY` | `""` | Organization API key for authentication |
+| `-hub` | `WMONITOR_MODE=hub` | `false` | Enable Hub ingest endpoint (`POST /api/ingest`) |
+| `-port <port>` | `WMONITOR_PORT` / `PORT` | `8080` | HTTP port for the web dashboard |
+| `-db <type>` | `WMONITOR_DB` | `sqlite` | Database backend (`sqlite` or `postgres`) |
+| `-dsn <dsn>` | `WMONITOR_DB_DSN` | `""` | PostgreSQL connection string |
+| `-app-port <p>` | `WMONITOR_APP_PORT` | `""` | Ports to monitor for concurrent active users (e.g. `80,443,3000`) |
+| `-external-iface`| `WMONITOR_EXTERNAL_IFACE`| `""` | Override network interface for cloud egress tracking |
+| `-assessment-report`| — | `""` | Generate HTML cloud assessment report and exit |
+| `-export-csv` | — | `""` | Export raw metric rows to CSV and exit |
+| `-since <dur>` | — | `720h` (30d) | Time window for assessment & export reports |
+| `-add-client <name>`| — | `""` | Generate Organization API Key for a new client (Hub only) |
+| `-list-clients` | — | `false` | Audit all registered clients and activity timestamps |
+| `-revoke-client` | — | `""` | Revoke all API keys for a client organization |
+| `-print-config` | — | `false` | Print resolved runtime config (secrets masked) and exit |
+| `-show-key` | — | `false` | Display configured API key and exit |
 
 ---
 
-## 10. Cloud Sizing Metrics & Cost Forecasting
+## 10. Troubleshooting & FAQ
 
-W-Monitor automatically calculates target cloud specifications:
+### 1. The dashboard opens `localhost:8080` and displays "Sysmon" instead of "W-Monitor"
+* **Cause:** A legacy background process (`sysmon.exe`) from before the project rebranding is running on your machine and holding port 8080.
+* **Fix:** Stop the legacy process and remove the startup file:
+  ```powershell
+  Stop-Process -Name "sysmon", "wmonitor*" -Force -ErrorAction SilentlyContinue
+  Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\Sysmon.vbs" -Force -ErrorAction SilentlyContinue
+  ```
+  Then, navigate directly to your Render URL: `https://wmonitor-hub.onrender.com`.
 
-- **Minimum Cloud VM Specs:** Peak measured utilization + 20% safety headroom.
-- **Recommended Cloud VM Specs:** Peak measured utilization &times; 2.0 (for burst traffic and annual business growth).
-- **Network Egress Isolation:** Automatically identifies public network interfaces to provide exact cloud egress bandwidth projections for AWS, Azure, and Google Cloud cost estimation.
+### 2. Agent logs: `[server] rejected unknown API key`
+* **Cause:** The API key passed to the agent has not been registered in PostgreSQL.
+* **Fix:** Run `.\wmonitor.exe -db postgres -add-client "ClientName"` against your database, and verify the client status with `.\wmonitor.exe -db postgres -list-clients`.
+
+### 3. Agent cannot connect to Hub (`connection refused` or timeout)
+* **Cause:** Outbound firewall rule blocking HTTPS or incorrect Hub URL.
+* **Fix:** Verify connectivity from the agent machine:
+  * Windows: `Test-NetConnection -ComputerName wmonitor-hub.onrender.com -Port 443`
+  * Linux: `curl -I https://wmonitor-hub.onrender.com/api/health`
+
+### 4. How much disk space does an agent use?
+* **Answer:** **Zero database footprint.** The agent stores no persistent metric database. It only maintains a tiny in-memory circular buffer and a disk spool directory in `%LOCALAPPDATA%\Sysmon` / `~/.local/share/sysmon` that is only populated if the network drops.

@@ -9,13 +9,13 @@
 set -e
 
 INSTALL_DIR="/usr/local/bin"
-EXE_NAME="sysmon"
+EXE_NAME="wmonitor"
 SOURCE_EXE="./wmonitor_linux"
 TARGET_EXE="$INSTALL_DIR/$EXE_NAME"
 
 # Defaults
 MODE="agent"
-HUB_URL=""
+HUB_URL="https://wmonitor-hub.onrender.com"
 API_KEY=""
 DSN=""
 DB="sqlite"
@@ -44,7 +44,7 @@ if [ "$MODE" = "agent" ] && [ -z "$HUB_URL" ]; then
     exit 1
 fi
 if [ -z "$API_KEY" ]; then
-    echo "Error: --api-key is required"
+    echo "Error: --api-key is required (e.g. sudo ./install.sh --api-key <key>)"
     exit 1
 fi
 if [ "$MODE" = "hub" ] && [ "$DB" = "postgres" ] && [ -z "$DSN" ]; then
@@ -57,16 +57,20 @@ if [ ! -f "$SOURCE_EXE" ]; then
     exit 1
 fi
 
-# 3. Stop existing service
-if systemctl is-active --quiet sysmon 2>/dev/null; then
-    echo "Stopping existing sysmon service..."
-    systemctl stop sysmon
-fi
-if systemctl is-enabled --quiet sysmon 2>/dev/null; then
-    echo "Uninstalling old service registration..."
-    if [ -f "$TARGET_EXE" ]; then
-        "$TARGET_EXE" -uninstall || true
+# 3. Stop existing services (wmonitor or legacy sysmon)
+for svc in wmonitor sysmon; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo "Stopping existing $svc service..."
+        systemctl stop "$svc"
     fi
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+        echo "Uninstalling old $svc service registration..."
+        systemctl disable "$svc" 2>/dev/null || true
+    fi
+done
+
+if [ -f "$TARGET_EXE" ]; then
+    "$TARGET_EXE" -uninstall 2>/dev/null || true
 fi
 
 # 4. Copy binary
@@ -113,5 +117,5 @@ else
     echo "  DB:        $DB"
     echo "  Config:    $CONFIG_FILE"
 fi
-echo "Check status: systemctl status sysmon"
-echo "View logs:    journalctl -u sysmon -f"
+echo "Check status: systemctl status wmonitor"
+echo "View logs:    journalctl -u wmonitor -f"

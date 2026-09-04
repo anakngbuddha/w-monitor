@@ -41,7 +41,7 @@ Example: postgres://user:pass@host:5432/dbname?sslmode=require
 
 param(
     [string]$Mode    = "agent",   # "agent" or "hub"
-    [string]$HubUrl  = "",
+    [string]$HubUrl  = "https://wmonitor-hub.onrender.com",
     [string]$ApiKey  = "",
     [string]$Dsn     = "",
     [string]$Db      = "sqlite"   # "sqlite" or "postgres"
@@ -58,11 +58,11 @@ if (-not $isAdmin) {
 
 # 2. Validate parameters
 if ($Mode -eq "agent" -and $HubUrl -eq "") {
-    Write-Error "Agent mode requires -HubUrl. Example: -HubUrl 'https://hub:8080'"
+    Write-Error "Agent mode requires -HubUrl. Example: -HubUrl 'https://wmonitor-hub.onrender.com'"
     exit 1
 }
 if ($ApiKey -eq "") {
-    Write-Error "-ApiKey is required for both agent and hub modes."
+    Write-Error "-ApiKey is required for both agent and hub modes. Example: .\install.ps1 -ApiKey <Key>"
     exit 1
 }
 if ($Mode -eq "hub" -and $Db -eq "postgres" -and $Dsn -eq "") {
@@ -70,7 +70,7 @@ if ($Mode -eq "hub" -and $Db -eq "postgres" -and $Dsn -eq "") {
     exit 1
 }
 
-$installDir = "$env:ProgramFiles\Sysmon"
+$installDir = "$env:ProgramFiles\W-Monitor"
 $exeName    = "wmonitor.exe"
 $sourceExe  = Join-Path $PSScriptRoot $exeName
 $targetExe  = Join-Path $installDir $exeName
@@ -84,8 +84,13 @@ if (-not (Test-Path $sourceExe)) {
     exit 1
 }
 
-# 3. Stop and uninstall existing service
-Write-Host "Checking for existing wmonitor service..."
+# 3. Stop and uninstall existing wmonitor or legacy sysmon service
+Write-Host "Checking for existing services..."
+$legacySysmon = Get-Service -Name "sysmon" -ErrorAction SilentlyContinue
+if ($legacySysmon) {
+    Write-Host "Stopping legacy sysmon service..."
+    Stop-Service -Name "sysmon" -Force -ErrorAction SilentlyContinue
+}
 $existingService = Get-Service -Name "wmonitor" -ErrorAction SilentlyContinue
 if ($existingService) {
     Write-Host "Stopping wmonitor service..."
