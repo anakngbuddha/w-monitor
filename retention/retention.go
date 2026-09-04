@@ -15,29 +15,51 @@ const (
 	downsampleAfter = 24 * time.Hour
 )
 
-// Job holds a reference to the underlying *sql.DB for direct queries.
-type Job struct {
-	conn *sql.DB
+// Pruner is implemented by storage backends that can delete rows older than a cutoff (e.g. PostgresDB).
+type Pruner interface {
+	PurgeOld(cutoff time.Time) (mDel, pDel int64, err error)
 }
 
-// New creates a retention Job.
+// Job holds a reference to the underlying *sql.DB for SQLite queries or a Pruner for Postgres.
+type Job struct {
+	conn   *sql.DB
+	pruner Pruner
+}
+
+// New creates a retention Job for SQLite.
 func New(conn *sql.DB) *Job {
 	return &Job{conn: conn}
 }
 
-// Run executes one retention pass: purge old rows then downsample.
+// NewWithPruner creates a retention Job for any backend implementing Pruner.
+func NewWithPruner(pruner Pruner) *Job {
+	return &Job{pruner: pruner}
+}
+
+// Run executes one retention pass: purge old rows then downsample (if supported).
 func (j *Job) Run() error {
 	cutoff30d := time.Now().Add(-retentionDays * 24 * time.Hour)
 	cutoff24h := time.Now().Add(-downsampleAfter)
 
-	if err := j.purgeOld(cutoff30d); err != nil {
-		return fmt.Errorf("purge: %w", err)
+	if j.pruner != nil {
+		mDel, pDel, err := j.pruner.PurgeOld(cutoff30d)
+		if err != nil {
+			return fmt.Errorf("purge: %w", err)
+		}
+		log.Printf("[retention] purged %d metric rows, %d process rows older than %s", mDel, pDel, cutoff30d.Format(time.RFC3339))
+		return nil
 	}
-	if err := j.downsampleMetrics(cutoff24h); err != nil {
-		return fmt.Errorf("downsample metrics: %w", err)
-	}
-	if err := j.downsampleProcesses(cutoff24h); err != nil {
-		return fmt.Errorf("downsample processes: %w", err)
+
+	if j.conn != nil {
+		if err := j.purgeOld(cutoff30d); err != nil {
+			return fmt.Errorf("purge: %w", err)
+		}
+		if err := j.downsampleMetrics(cutoff24h); err != nil {
+			return fmt.Errorf("downsample metrics: %w", err)
+		}
+		if err := j.downsampleProcesses(cutoff24h); err != nil {
+			return fmt.Errorf("downsample processes: %w", err)
+		}
 	}
 	return nil
 }

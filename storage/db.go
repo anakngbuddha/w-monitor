@@ -332,3 +332,38 @@ func (db *DB) QueryServers(tenantID string) ([]string, error) {
 func (db *DB) Conn() *sql.DB {
 	return db.conn
 }
+
+// PurgeOld deletes metric and process rows older than cutoff timestamp.
+func (db *DB) PurgeOld(cutoff time.Time) (int64, int64, error) {
+	ts := cutoff.Unix()
+	res1, err := db.conn.Exec("DELETE FROM metrics WHERE timestamp < ?", ts)
+	if err != nil {
+		return 0, 0, fmt.Errorf("purge metrics: %w", err)
+	}
+	mDel, _ := res1.RowsAffected()
+
+	res2, err := db.conn.Exec("DELETE FROM processes WHERE timestamp < ?", ts)
+	if err != nil {
+		return 0, 0, fmt.Errorf("purge processes: %w", err)
+	}
+	pDel, _ := res2.RowsAffected()
+
+	return mDel, pDel, nil
+}
+
+// MigrateTenantID reassigns all metric and process rows from oldTenant to newTenant.
+func (db *DB) MigrateTenantID(oldTenant, newTenant string) (int64, error) {
+	res1, err := db.conn.Exec("UPDATE metrics SET tenant_id = ? WHERE tenant_id = ?", newTenant, oldTenant)
+	if err != nil {
+		return 0, fmt.Errorf("migrate metrics tenant: %w", err)
+	}
+	mAff, _ := res1.RowsAffected()
+
+	res2, err := db.conn.Exec("UPDATE processes SET tenant_id = ? WHERE tenant_id = ?", newTenant, oldTenant)
+	if err != nil {
+		return 0, fmt.Errorf("migrate processes tenant: %w", err)
+	}
+	pAff, _ := res2.RowsAffected()
+
+	return mAff + pAff, nil
+}

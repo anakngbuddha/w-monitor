@@ -307,15 +307,13 @@ func main() {
 	}
 	configureUserTracker(col)
 
-	// Retention only works with SQLite (uses raw *sql.DB).
+	// Retention: downsampling & purge for SQLite, automated purge for Postgres.
 	var ret *retention.Job
 	if sqliteDB != nil {
 		ret = retention.New(sqliteDB.Conn())
-	} else {
-		// Called out loudly: the hub is the deployment that accumulates data from
-		// every agent, and it is the one with no pruning. See D5 in
-		// IMPLEMENTATION_PLAN.md.
-		log.Println("[wmonitor] WARNING: retention is not implemented for the Postgres backend — this database will grow without bound")
+	} else if pruner, ok := store.(retention.Pruner); ok {
+		ret = retention.NewWithPruner(pruner)
+		log.Println("[wmonitor] retention enabled for Postgres backend (hourly purge older than 30 days)")
 	}
 
 	srv := server.New(store, *flagPort)

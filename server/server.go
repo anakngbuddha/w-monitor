@@ -59,6 +59,12 @@ type Server struct {
 	alerts AlertSource
 
 	allowedOrigins []string
+
+	healthCheckedAt  time.Time
+	healthHealthy    bool
+	healthDBErr      error
+	healthLastAge    time.Duration
+	healthHaveMetric bool
 }
 
 // New creates a Server bound to the given port (e.g. "8080").
@@ -86,11 +92,14 @@ func (s *Server) EnableHubMode(keys KeyStore) {
 	s.hubMode = true
 	s.keys = keys
 	s.mux.HandleFunc("/api/ingest", s.handleIngest)
+	s.mux.HandleFunc("/api/enroll", s.handleEnroll)
+	s.mux.HandleFunc("/api/admin/enroll-codes", s.handleAdminEnrollCodes)
+	s.mux.HandleFunc("/api/admin/agents", s.handleAdminAgents)
 	if keys == nil {
 		log.Println("[server] WARNING: hub mode enabled with no key store — all requests will be rejected")
 		return
 	}
-	log.Println("[server] hub mode enabled — POST /api/ingest requires a registered API key")
+	log.Println("[server] hub mode enabled — POST /api/ingest requires ingest-scoped token; enrollment at /api/enroll")
 }
 
 // SetAllowedOrigins overrides the CORS allowlist.
@@ -107,6 +116,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/metrics", s.handlePrometheus)
 	s.mux.HandleFunc("/api/export/csv", s.handleExportCSV)
 	s.mux.HandleFunc("/api/servers", s.handleServers)
+	s.mux.HandleFunc("/api/session", s.handleSession)
 	// Dashboard served at root — registered by dashboard package via RegisterStatic
 }
 
@@ -415,14 +425,27 @@ type pinger interface {
 	Ping(ctx context.Context) error
 }
 
-// healthSnapshot gathers the facts the health endpoints report on.
+// healthSnapshot gathers the facts the health endpoints report on (cached for 10s to prevent leakage and overhead).
 func (s *Server) healthSnapshot() (healthy bool, dbErr error, lastMetricAge time.Duration, haveMetric bool) {
+	s.mu.Lock()
+	if time.Since(s.healthCheckedAt) < 10*time.Second && s.healthCheckedAt.Unix() > 0 {
+		h, err, age, hm := s.healthHealthy, s.healthDBErr, s.healthLastAge, s.healthHaveMetric
+		s.mu.Unlock()
+		return h, err, age, hm
+	}
+	s.mu.Unlock()
+
 	healthy = true
 
 	if p, ok := s.db.(pinger); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), healthPingLimit)
 		defer cancel()
 		if err := p.Ping(ctx); err != nil {
+			s.mu.Lock()
+			s.healthCheckedAt = time.Now()
+			s.healthHealthy = false
+			s.healthDBErr = err
+			s.mu.Unlock()
 			return false, err, 0, false
 		}
 	}
@@ -431,6 +454,11 @@ func (s *Server) healthSnapshot() (healthy bool, dbErr error, lastMetricAge time
 	// new data for an hour is broken, and COUNT(*) would happily report "ok".
 	rows, err := s.db.QueryMetrics(time.Now().Add(-10*time.Minute), "")
 	if err != nil {
+		s.mu.Lock()
+		s.healthCheckedAt = time.Now()
+		s.healthHealthy = false
+		s.healthDBErr = err
+		s.mu.Unlock()
 		return false, err, 0, false
 	}
 	if len(rows) > 0 {
@@ -438,6 +466,15 @@ func (s *Server) healthSnapshot() (healthy bool, dbErr error, lastMetricAge time
 		lastMetricAge = time.Since(newest)
 		haveMetric = true
 	}
+
+	s.mu.Lock()
+	s.healthCheckedAt = time.Now()
+	s.healthHealthy = healthy
+	s.healthDBErr = nil
+	s.healthLastAge = lastMetricAge
+	s.healthHaveMetric = haveMetric
+	s.mu.Unlock()
+
 	return healthy, nil, lastMetricAge, haveMetric
 }
 
@@ -490,6 +527,17 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 // handlePrometheus exposes basic internals in Prometheus text format so the
 // monitor can itself be monitored.
 func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
+	if s.hubMode {
+		ip := clientIP(r)
+		isLoopback := ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
+		if !isLoopback {
+			// Require admin scope if scraped over the public network
+			if _, ok := s.authTenantScope(w, r, storage.ScopeAdmin); !ok {
+				return
+			}
+		}
+	}
+
 	healthy, _, lastAge, haveMetric := s.healthSnapshot()
 
 	up := 0
@@ -574,7 +622,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenantID, ok := s.authTenant(w, r)
+	tenantID, ok := s.authTenantScope(w, r, storage.ScopeIngest)
 	if !ok {
 		return
 	}

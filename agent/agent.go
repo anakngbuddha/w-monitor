@@ -66,6 +66,18 @@ type Agent struct {
 	spool     *Spool
 	drainOnce sync.Once
 	drainWake chan struct{}
+
+	reauth func() error
+}
+
+// SetReauth registers a callback to refresh or re-enroll credentials on 401 Unauthorized.
+func (a *Agent) SetReauth(fn func() error) {
+	a.reauth = fn
+}
+
+// SetAPIKey updates the active credential used for requests.
+func (a *Agent) SetAPIKey(apiKey string) {
+	a.apiKey = apiKey
 }
 
 // New creates an Agent targeting hubURL (e.g. "https://hub.example.com:8080").
@@ -305,7 +317,16 @@ func (a *Agent) deliver(payloadType string, body []byte) error {
 		return nil
 
 	case resp.StatusCode == http.StatusUnauthorized:
-		// Permanent: retrying a rejected credential cannot succeed.
+		if a.reauth != nil {
+			log.Printf("[agent] hub rejected API key (401); attempting re-enrollment...")
+			if err := a.reauth(); err == nil {
+				log.Printf("[agent] re-enrollment successful; retrying delivery")
+				// Re-attempt delivery once with refreshed key
+				return a.deliver(payloadType, body)
+			}
+			log.Printf("[agent] re-enrollment failed: %v", err)
+		}
+		// Permanent: retrying a rejected credential without reauth cannot succeed.
 		return fmt.Errorf("agent: hub rejected API key — check that this client's key is registered on the hub")
 
 	case resp.StatusCode == http.StatusBadRequest:

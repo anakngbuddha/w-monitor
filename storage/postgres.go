@@ -275,3 +275,30 @@ func (pg *PostgresDB) QueryServers(tenantID string) ([]string, error) {
 	}
 	return servers, rows.Err()
 }
+
+// PurgeOld deletes metric and process rows older than cutoff timestamp.
+func (pg *PostgresDB) PurgeOld(cutoff time.Time) (int64, int64, error) {
+	ts := cutoff.Unix()
+	tag1, err := pg.pool.Exec(context.Background(), "DELETE FROM metrics WHERE timestamp < $1", ts)
+	if err != nil {
+		return 0, 0, fmt.Errorf("purge postgres metrics: %w", err)
+	}
+	tag2, err := pg.pool.Exec(context.Background(), "DELETE FROM processes WHERE timestamp < $1", ts)
+	if err != nil {
+		return 0, 0, fmt.Errorf("purge postgres processes: %w", err)
+	}
+	return tag1.RowsAffected(), tag2.RowsAffected(), nil
+}
+
+// MigrateTenantID reassigns all metric and process rows from oldTenant to newTenant.
+func (pg *PostgresDB) MigrateTenantID(oldTenant, newTenant string) (int64, error) {
+	tag1, err := pg.pool.Exec(context.Background(), "UPDATE metrics SET tenant_id = $1 WHERE tenant_id = $2", newTenant, oldTenant)
+	if err != nil {
+		return 0, fmt.Errorf("migrate postgres metrics tenant: %w", err)
+	}
+	tag2, err := pg.pool.Exec(context.Background(), "UPDATE processes SET tenant_id = $1 WHERE tenant_id = $2", newTenant, oldTenant)
+	if err != nil {
+		return 0, fmt.Errorf("migrate postgres processes tenant: %w", err)
+	}
+	return tag1.RowsAffected() + tag2.RowsAffected(), nil
+}

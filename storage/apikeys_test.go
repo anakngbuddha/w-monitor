@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func testDB(t *testing.T) *DB {
@@ -202,5 +204,188 @@ func TestNewTenantIDIsUnique(t *testing.T) {
 	}
 	if len(a) < 10 {
 		t.Errorf("tenant id too short: %q", a)
+	}
+}
+
+func TestTokenGenerationAndPrefixes(t *testing.T) {
+	agentToken, err := GenerateToken(KindAgent)
+	if err != nil {
+		t.Fatalf("GenerateToken(agent): %v", err)
+	}
+	if !strings.HasPrefix(agentToken, PrefixAgent) {
+		t.Errorf("agent token = %s, want prefix %s", agentToken, PrefixAgent)
+	}
+	if ExtractKeyPrefix(agentToken) != PrefixAgent {
+		t.Errorf("ExtractKeyPrefix = %s, want %s", ExtractKeyPrefix(agentToken), PrefixAgent)
+	}
+
+	readToken, err := GenerateToken(KindRead)
+	if err != nil {
+		t.Fatalf("GenerateToken(read): %v", err)
+	}
+	if !strings.HasPrefix(readToken, PrefixRead) {
+		t.Errorf("read token = %s, want prefix %s", readToken, PrefixRead)
+	}
+
+	adminToken, err := GenerateToken(KindAdmin)
+	if err != nil {
+		t.Fatalf("GenerateToken(admin): %v", err)
+	}
+	if !strings.HasPrefix(adminToken, PrefixAdmin) {
+		t.Errorf("admin token = %s, want prefix %s", adminToken, PrefixAdmin)
+	}
+}
+
+func TestGenerateAndNormalizeEnrollCode(t *testing.T) {
+	code, err := GenerateEnrollCode()
+	if err != nil {
+		t.Fatalf("GenerateEnrollCode: %v", err)
+	}
+	if !strings.HasPrefix(code, "WM-") {
+		t.Errorf("code = %s, want WM- prefix", code)
+	}
+	if len(code) != 16 { // WM-XXXX-XXXX-XXXX = 3 + 4 + 1 + 4 + 1 + 4 = 16 (actually 3 + 4 + 1 + 4 + 1 + 4 - wait: "WM-" is 3, 4, "-", 4, "-", 4 = 3+4+1+4+1+4 = 17)
+		if len(code) != 17 {
+			t.Errorf("code length = %d, want 17", len(code))
+		}
+	}
+
+	// Normalization
+	rawInput := "wm-4f2k-9qx7-tr31"
+	norm := NormalizeEnrollCode(rawInput)
+	if norm != "WM-4F2K-9QX7-TR31" {
+		t.Errorf("NormalizeEnrollCode(%q) = %q, want WM-4F2K-9QX7-TR31", rawInput, norm)
+	}
+
+	rawNoDashes := "wm4f2k9qx7tr31"
+	normNoDashes := NormalizeEnrollCode(rawNoDashes)
+	if normNoDashes != "WM-4F2K-9QX7-TR31" {
+		t.Errorf("NormalizeEnrollCode(%q) = %q, want WM-4F2K-9QX7-TR31", rawNoDashes, normNoDashes)
+	}
+}
+
+func TestConsumeEnrollCodeAtomicAndExhaustion(t *testing.T) {
+	db := testDB(t)
+
+	code, _ := GenerateEnrollCode()
+	codeHash := HashAPIKey(code)
+
+	// Register code with max_uses = 3
+	if err := db.UpsertAPIKey(APIKeyRecord{
+		KeyHash:    codeHash,
+		TenantID:   "t_test_tenant",
+		ClientName: "TestClient",
+		Kind:       KindEnroll,
+		Scope:      ScopeIngest,
+		MaxUses:    3,
+		ExpiresAt:  time.Now().Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertAPIKey: %v", err)
+	}
+
+	// Consume 3 times successfully
+	for i := 1; i <= 3; i++ {
+		rec, err := db.ConsumeEnrollCode(codeHash)
+		if err != nil {
+			t.Fatalf("ConsumeEnrollCode attempt %d failed: %v", i, err)
+		}
+		if rec.Uses != i {
+			t.Errorf("rec.Uses = %d, want %d", rec.Uses, i)
+		}
+		if rec.TenantID != "t_test_tenant" {
+			t.Errorf("rec.TenantID = %s, want t_test_tenant", rec.TenantID)
+		}
+	}
+
+	// 4th attempt must be rejected as exhausted
+	_, err := db.ConsumeEnrollCode(codeHash)
+	if !errors.Is(err, ErrAPIKeyNotFound) {
+		t.Fatalf("4th consume expected ErrAPIKeyNotFound, got %v", err)
+	}
+}
+
+func TestRevokeAgentAndListAgents(t *testing.T) {
+	db := testDB(t)
+
+	agentKey1, _ := GenerateToken(KindAgent)
+	agentKey2, _ := GenerateToken(KindAgent)
+
+	db.UpsertAPIKey(APIKeyRecord{
+		KeyHash:    HashAPIKey(agentKey1),
+		TenantID:   "t_agent_test",
+		ClientName: "ClientA",
+		Kind:       KindAgent,
+		Scope:      ScopeIngest,
+		ServerID:   "SRV-01",
+	})
+	db.UpsertAPIKey(APIKeyRecord{
+		KeyHash:    HashAPIKey(agentKey2),
+		TenantID:   "t_agent_test",
+		ClientName: "ClientA",
+		Kind:       KindAgent,
+		Scope:      ScopeIngest,
+		ServerID:   "SRV-02",
+	})
+
+	agents, err := db.ListAgents("t_agent_test")
+	if err != nil {
+		t.Fatalf("ListAgents: %v", err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("got %d agents, want 2", len(agents))
+	}
+
+	// Revoke SRV-01
+	revoked, err := db.RevokeAgent("t_agent_test", "SRV-01")
+	if err != nil {
+		t.Fatalf("RevokeAgent: %v", err)
+	}
+	if revoked != 1 {
+		t.Errorf("revoked %d rows, want 1", revoked)
+	}
+
+	// SRV-01 must now be rejected
+	_, err = db.ResolveAPIKey(HashAPIKey(agentKey1))
+	if !errors.Is(err, ErrAPIKeyNotFound) {
+		t.Errorf("revoked agent key still resolved: %v", err)
+	}
+
+	// SRV-02 must still work
+	_, err = db.ResolveAPIKey(HashAPIKey(agentKey2))
+	if err != nil {
+		t.Errorf("active agent key failed to resolve: %v", err)
+	}
+}
+
+func TestMigrateTenantID(t *testing.T) {
+	db := testDB(t)
+
+	now := time.Now()
+	// Insert raw metric
+	db.InsertMetric(MetricRow{
+		Timestamp: now,
+		TenantID:  "old_raw_key",
+		ServerID:  "srv1",
+		Hostname:  "host1",
+	})
+
+	aff, err := db.MigrateTenantID("old_raw_key", "t_migrated")
+	if err != nil {
+		t.Fatalf("MigrateTenantID: %v", err)
+	}
+	if aff != 1 {
+		t.Errorf("affected rows = %d, want 1", aff)
+	}
+
+	// Query under new tenant
+	rows, err := db.QueryMetrics(now.Add(-time.Minute), "t_migrated")
+	if err != nil {
+		t.Fatalf("QueryMetrics: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if rows[0].TenantID != "t_migrated" {
+		t.Errorf("TenantID = %s, want t_migrated", rows[0].TenantID)
 	}
 }

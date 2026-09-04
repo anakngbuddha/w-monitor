@@ -102,24 +102,38 @@ This compiles two clean, generic binaries with zero hardcoded credentials:
 
 ---
 
-### Step 2: Generate an Organization API Key on the Hub
+### Step 2: Generate Credentials on the Hub
 
-On the machine connecting to your PostgreSQL database (or directly against your cloud database):
+On your Hub machine, run these commands (the hub doesn't need to be running for CLI commands):
 
+**A. Create an admin token** (once — needed for CI/CD automation):
 ```powershell
-.\wmonitor.exe -db postgres -dsn "postgres://user:password@host:port/dbname?sslmode=require" -add-client "AcmeCorp"
+.\wmonitor.exe -new-admin-token
+# Output: wmk_aBcDeFgH...  -- save this, shown only once
 ```
 
-**Output:**
-```text
-Client:    AcmeCorp
-Tenant ID: t_a8f3b219c0de447192bc55ef812034aa
-API Key:   3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0=
-
-Store this key now. Only its hash is saved, so it cannot be recovered later.
+**B. Create a dashboard read token** for the client:
+```powershell
+.\wmonitor.exe -add-client "AcmeCorp"
+# Output: wmr_xxxxxx  -- give this to AcmeCorp for dashboard login
 ```
 
-Copy the generated **API Key**. Distribute this single key to all servers belonging to AcmeCorp.
+**C. Create an enrollment code** so the agent binary can self-register on first run:
+```powershell
+.\wmonitor.exe -new-enroll-code "AcmeCorp" -ttl 72h -max-uses 25
+# Output: WM-XXXX-XXXX-XXXX  -- use this in Step 2B below
+```
+
+**D. Build a client binary with the enrollment code baked in:**
+```powershell
+.\build_release.ps1 -ClientName "AcmeCorp" -HubUrl "https://wmonitor-hub.onrender.com" -EnrollCode "WM-XXXX-XXXX-XXXX"
+# Output: dist\AcmeCorp\wmonitor_AcmeCorp.exe  (Windows)
+#         dist\AcmeCorp\wmonitor_AcmeCorp_linux (Linux)
+#         .\wmonitor.exe (copy to root for install.ps1)
+```
+
+Distribute the built binary (`wmonitor_AcmeCorp.exe` / `wmonitor_AcmeCorp_linux`) to AcmeCorp's servers.
+No API key or secret needs to be shared — the enrollment code is embedded in the binary and consumed on first run.
 
 ---
 
@@ -131,22 +145,24 @@ Package `wmonitor.exe` and `install.ps1` and provide them to the client's Window
 Run in **PowerShell as Administrator**:
 
 ```powershell
-.\install.ps1 -ApiKey "3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0="
+# No API key needed -- the binary auto-enrolls on first start
+.\install.ps1 -Mode agent -HubUrl "https://wmonitor-hub.onrender.com"
 ```
 
-*(Note: `-HubUrl` automatically defaults to `https://wmonitor-hub.onrender.com`. You only need to pass `-HubUrl` if using a custom domain).*
+*(Note: `-HubUrl` automatically defaults to `https://wmonitor-hub.onrender.com`. You only need to pass `-HubUrl` if using a custom domain.)*
 
 **What this does automatically:**
 1. Installs binary to `C:\Program Files\W-Monitor\wmonitor.exe`.
-2. Stores credentials securely in `%LOCALAPPDATA%\Sysmon\config.env` locked with Windows ACLs (SYSTEM & Admin only).
-3. Registers and starts the `wmonitor` Windows Service with startup type *Automatic*.
-4. Generates a persistent local server identifier in `%LOCALAPPDATA%\Sysmon\agent_id`.
-5. Begins streaming metrics immediately.
+2. Registers and starts the `wmonitor` Windows Service with startup type *Automatic*.
+3. On first start, the agent calls `POST /api/enroll` with the baked enrollment code.
+4. The Hub returns a scoped `wma_` ingest token, saved to `%ProgramData%\wmonitor\token.dat` (DPAPI-encrypted, SYSTEM + Administrators only).
+5. Subsequent runs load the token from the credential store — no re-enrollment needed.
 
 #### B. Interactive Foreground Run (Testing Only)
 If you want to test without installing a service:
 ```powershell
-.\wmonitor.exe -agent "https://wmonitor-hub.onrender.com" -api-key "3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0="
+# The binary auto-enrolls on first run and saves the token to the credential store
+.\wmonitor.exe -agent "https://wmonitor-hub.onrender.com"
 ```
 
 ---
@@ -160,21 +176,24 @@ Run in terminal as `root`:
 
 ```bash
 chmod +x install.sh
-sudo ./install.sh --api-key "3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0="
+# No API key needed -- the binary auto-enrolls on first start
+sudo ./install.sh --mode agent --hub-url https://wmonitor-hub.onrender.com
 ```
 
-*(Note: `--hub-url` automatically defaults to `https://wmonitor-hub.onrender.com`).*
+*(Note: `--hub-url` automatically defaults to `https://wmonitor-hub.onrender.com`.)*
 
 **What this does automatically:**
 1. Copies binary to `/usr/local/bin/wmonitor`.
-2. Writes credentials to `/etc/wmonitor/config.env` with `0600` permissions (root-only).
-3. Registers, enables, and starts `wmonitor.service` via `systemd`.
-4. Generates a persistent server identifier in `~/.local/share/sysmon/agent_id`.
+2. Registers, enables, and starts `wmonitor.service` via `systemd`.
+3. On first start, the agent calls `POST /api/enroll` with the baked enrollment code.
+4. The Hub returns a scoped `wma_` ingest token, saved to `/etc/wmonitor/token.json` (`0600`, root-only).
+5. Subsequent runs load the token from the credential file -- no re-enrollment needed.
 
 #### B. Interactive Foreground Run (Testing Only)
 ```bash
 chmod +x wmonitor_linux
-./wmonitor_linux -agent "https://wmonitor-hub.onrender.com" -api-key "3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0="
+# Auto-enrolls on first run, saves token to /etc/wmonitor/token.json
+./wmonitor_linux -agent "https://wmonitor-hub.onrender.com"
 ```
 
 ---

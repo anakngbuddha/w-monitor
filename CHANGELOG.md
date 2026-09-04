@@ -4,6 +4,68 @@ All notable changes, architectural updates, CLI modifications, and documentation
 
 ---
 
+## [2026-09-04] - Phase 13: Credential & Provisioning Overhaul
+
+### Summary
+Replaced the static baked-key model with a **hub-issued, per-agent token system**. Agents now auto-enroll on first run using a short-lived enrollment code, receive a scoped `wma_*` ingest-only token, and persist it via OS-native credential storage (DPAPI on Windows, `0600` file on Linux). The dashboard switches from `localStorage` API keys to `HttpOnly` session cookies. All four previously identified security vulnerabilities are closed.
+
+### Security Vulnerabilities Closed
+| CVE-class | Location | Fix |
+|-----------|----------|-----|
+| File-drop auth bypass | `autoSeedHubKeys` CSV auto-import | Removed automatic CSV import from disk |
+| Plaintext key exfiltration | `build_release.ps1 -ApiKey` | Replaced with enrollment code; plaintext never baked |
+| Privilege escalation (ingest→read) | `server/auth.go` | Scope enforcement: `ingest` tokens get 403 on read routes |
+| `localStorage` token theft | `dashboard/static/index.html` | Session cookie (`HttpOnly; Secure; SameSite=Strict`) |
+
+### New Files
+| File | Purpose |
+|------|---------|
+| [`server/enroll.go`](file:///c:/Users/markmv/Desktop/Zeus/server/enroll.go) | `POST /api/enroll`, `POST /api/admin/enroll-codes`, `GET+DELETE /api/admin/agents` |
+| [`server/session.go`](file:///c:/Users/markmv/Desktop/Zeus/server/session.go) | `POST /api/session` — issues `HttpOnly` cookie from `wmr_` read token |
+| [`agent/credstore.go`](file:///c:/Users/markmv/Desktop/Zeus/agent/credstore.go) | `StoredCredentials` struct and `ErrNoCredentials` sentinel |
+| [`agent/credstore_windows.go`](file:///c:/Users/markmv/Desktop/Zeus/agent/credstore_windows.go) | DPAPI `CryptProtectData` (`CRYPTPROTECT_LOCAL_MACHINE`) at `%ProgramData%\wmonitor\token.dat` |
+| [`agent/credstore_unix.go`](file:///c:/Users/markmv/Desktop/Zeus/agent/credstore_unix.go) | JSON at `/etc/wmonitor/token.json` or `~/.local/share/sysmon/token.json` with `0600` perms |
+| [`agent/enroll.go`](file:///c:/Users/markmv/Desktop/Zeus/agent/enroll.go) | `Enroll()` — HTTP handshake + credential persistence |
+
+### Modified Files
+| File | Changes |
+|------|---------|
+| [`storage/apikeys.go`](file:///c:/Users/markmv/Desktop/Zeus/storage/apikeys.go) | Extended `APIKeyRecord` with `Kind`, `Scope`, `KeyPrefix`, `ExpiresAt`, `MaxUses`, `Uses`, `ServerID`, `IssuedBy`; added `GenerateToken()`, `GenerateEnrollCode()` (Crockford Base32), `ConsumeEnrollCode()` (atomic), `NewTenantID()`, `ExtractKeyPrefix()`, `NormalizeEnrollCode()` |
+| [`storage/db.go`](file:///c:/Users/markmv/Desktop/Zeus/storage/db.go) | `MigrateTenantID()` for historical data migration |
+| [`storage/postgres.go`](file:///c:/Users/markmv/Desktop/Zeus/storage/postgres.go) | `MigrateTenantID()` + `PurgeOld()` (Postgres retention) |
+| [`server/auth.go`](file:///c:/Users/markmv/Desktop/Zeus/server/auth.go) | `authTenantScope()` scope enforcement; `authCache.invalidate()` on revoke; cookie auth fallback; `AdminStore` interface |
+| [`server/server.go`](file:///c:/Users/markmv/Desktop/Zeus/server/server.go) | Routes: `/api/enroll`, `/api/admin/enroll-codes`, `/api/admin/agents`, `/api/session`; `EnableHubMode()` |
+| [`retention/retention.go`](file:///c:/Users/markmv/Desktop/Zeus/retention/retention.go) | `NewWithPruner()` — Postgres retention via `Pruner` interface; fixes Render storage exhaustion |
+| [`build_release.ps1`](file:///c:/Users/markmv/Desktop/Zeus/build_release.ps1) | `-ApiKey` → `-EnrollCode`; auto-request from Hub via `WMONITOR_ADMIN_TOKEN`; outputs to `dist/<ClientName>/`; build log records fingerprint only |
+| [`install.ps1`](file:///c:/Users/markmv/Desktop/Zeus/install.ps1) | `-ApiKey` now optional for agent mode (enrollment-code binaries self-provision) |
+| [`main.go`](file:///c:/Users/markmv/Desktop/Zeus/main.go) | New CLI: `-new-enroll-code`, `-list-agents`, `-revoke-agent`, `-new-admin-token`; `defaultEnrollCode` ldflag replaces `defaultAPIKey` |
+
+### New Token Kinds & Prefixes
+| Prefix | Kind | Scope | Usage |
+|--------|------|-------|-------|
+| `wma_` | `agent` | `ingest` | Machine-bound agent token (hub-issued, stored via DPAPI/0600) |
+| `wmr_` | `read` | `read` | Dashboard read token (issued by operator, used for session login) |
+| `wmk_` | `admin` | `admin` | Admin token (operator only; for build automation + CLI management) |
+| `wme_` | `enroll` | `ingest` | Short-lived enrollment code — consumed once to mint `wma_` |
+
+### New CLI Commands (hub side)
+```
+wmonitor -new-enroll-code "AcmeCorp" [-ttl 72h] [-max-uses 25]
+wmonitor -new-admin-token
+wmonitor -list-clients
+wmonitor -list-agents "AcmeCorp"
+wmonitor -revoke-agent <server-id>
+wmonitor -revoke-client "AcmeCorp"
+wmonitor -add-client "AcmeCorp"         # issues wmr_ read token
+```
+
+### Breaking Changes
+- **Existing agents** with baked-in `defaultAPIKey` continue to work during this release via `kind=legacy, scope=all`. The next major release will remove legacy key acceptance.
+- **`build_release.ps1 -ApiKey`** emits a deprecation warning. Switch to `-EnrollCode`.
+- **`install.ps1 -ApiKey`** is now optional for agent mode. Remove it from deployment scripts that use enrollment-code binaries.
+
+---
+
 ## [2026-09-04] - Method B Universal Standard & Codebase Documenter Skill
 
 ### Summary

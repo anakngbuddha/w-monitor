@@ -6,7 +6,7 @@ Installs W-Monitor as a Windows Service (hub or agent mode).
 This script must be run as Administrator. It will:
 1. Check for administrative privileges
 2. Stop the wmonitor service if it already exists
-3. Copy wmonitor.exe to %ProgramFiles%\Sysmon
+3. Copy wmonitor.exe to %ProgramFiles%\W-Monitor
 4. Write agent/hub credentials to a locked config.env file
 5. Install and start the wmonitor service
 
@@ -19,7 +19,9 @@ The URL of the Hub (required when -Mode agent).
 Example: https://hub.example.com:8080
 
 .PARAMETER ApiKey
-Shared API key for hub authentication.
+Optional. Legacy API key for backward-compatible agent binaries.
+Binaries built with build_release.ps1 -EnrollCode auto-enroll on first run
+and do NOT need this parameter.
 
 .PARAMETER Dsn
 Postgres DSN (required only when -Mode hub -Db postgres).
@@ -29,20 +31,23 @@ Example: postgres://user:pass@host:5432/dbname?sslmode=require
 "sqlite" (default) or "postgres" - only relevant for hub mode.
 
 .EXAMPLE
-# Install as agent, pushing to a hub:
+# Install an enrollment-code agent (no API key needed — binary auto-enrolls):
+.\install.ps1 -Mode agent -HubUrl "https://hub.example.com:8080"
+
+# Install a legacy agent with a baked API key:
 .\install.ps1 -Mode agent -HubUrl "https://hub.example.com:8080" -ApiKey "abc123"
 
 # Install as hub with SQLite:
-.\install.ps1 -Mode hub -ApiKey "abc123"
+.\install.ps1 -Mode hub
 
 # Install as hub with Postgres:
-.\install.ps1 -Mode hub -Db postgres -Dsn "postgres://user:pass@host:5432/wmonitor?sslmode=require" -ApiKey "abc123"
+.\install.ps1 -Mode hub -Db postgres -Dsn "postgres://user:pass@host:5432/wmonitor?sslmode=require"
 #>
 
 param(
     [string]$Mode    = "agent",   # "agent" or "hub"
     [string]$HubUrl  = "https://wmonitor-hub.onrender.com",
-    [string]$ApiKey  = "",
+    [string]$ApiKey  = "",        # optional; not needed for enrollment-code binaries
     [string]$Dsn     = "",
     [string]$Db      = "sqlite"   # "sqlite" or "postgres"
 )
@@ -59,10 +64,6 @@ if (-not $isAdmin) {
 # 2. Validate parameters
 if ($Mode -eq "agent" -and $HubUrl -eq "") {
     Write-Error "Agent mode requires -HubUrl. Example: -HubUrl 'https://wmonitor-hub.onrender.com'"
-    exit 1
-}
-if ($ApiKey -eq "") {
-    Write-Error "-ApiKey is required for both agent and hub modes. Example: .\install.ps1 -ApiKey <Key>"
     exit 1
 }
 if ($Mode -eq "hub" -and $Db -eq "postgres" -and $Dsn -eq "") {
@@ -148,7 +149,11 @@ icacls $configFile /inheritance:r /grant:r "SYSTEM:(R)" /grant:r "${env:USERNAME
 # 7. Determine service arguments from mode
 $serviceArgs = @("-port", "8080")
 if ($Mode -eq "agent") {
-    $serviceArgs += @("-agent", $HubUrl, "-api-key", $ApiKey)
+    $serviceArgs += @("-agent", $HubUrl)
+    # Legacy: only pass -api-key when explicitly provided (enrollment-code binaries don't need it)
+    if ($ApiKey -ne "") {
+        $serviceArgs += @("-api-key", $ApiKey)
+    }
 } else {
     # hub mode
     $serviceArgs += @("-hub")

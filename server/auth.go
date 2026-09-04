@@ -12,13 +12,20 @@ import (
 )
 
 // KeyStore is the subset of the storage backend needed to authenticate clients.
-//
-// Declared here as a narrow interface rather than bolted onto storage.Store so
-// that agent mode (which is write-only and holds no credentials) is not forced
-// to implement authentication methods it can never satisfy.
 type KeyStore interface {
 	ResolveAPIKey(keyHash string) (storage.APIKeyRecord, error)
 	TouchAPIKey(keyHash string) error
+}
+
+// AdminStore is the full credential and provisioning management interface.
+type AdminStore interface {
+	KeyStore
+	ConsumeEnrollCode(codeHash string) (storage.APIKeyRecord, error)
+	UpsertAPIKey(rec storage.APIKeyRecord) error
+	RevokeAgent(tenantID, serverID string) (int64, error)
+	ListAgents(tenantID string) ([]storage.APIKeyRecord, error)
+	RevokeAPIKey(clientName string) (int64, error)
+	ListAPIKeys() ([]storage.APIKeyRecord, error)
 }
 
 const (
@@ -35,6 +42,8 @@ const (
 type authCacheEntry struct {
 	tenantID string
 	client   string
+	kind     string
+	scope    string
 	valid    bool
 	expires  time.Time
 }
@@ -87,33 +96,49 @@ func authorizeTenant(w http.ResponseWriter, r *http.Request, tenant string) (str
 	return tenant, true
 }
 
-// authTenant authenticates the request and returns the tenant it may access.
-//
-// Outside hub mode there is a single local dataset and no tenancy, so it
-// returns an empty tenant ID and allows the request.
-//
-// On failure it has already written the response; the caller must simply return.
+// checkScope checks whether the granted scope satisfies the required scope.
+func checkScope(granted, required string) bool {
+	if granted == storage.ScopeAll || granted == storage.ScopeAdmin {
+		return true
+	}
+	if granted == required {
+		return true
+	}
+	return false
+}
+
+// authTenant authenticates the request with default read scope for backward compatibility.
 func (s *Server) authTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	return s.authTenantScope(w, r, storage.ScopeRead)
+}
+
+// authTenantScope authenticates the request and enforces the required scope.
+func (s *Server) authTenantScope(w http.ResponseWriter, r *http.Request, requiredScope string) (string, bool) {
 	if !s.hubMode {
 		return "", true
 	}
 
-	// Keys are header-only. Accepting them as a query parameter meant every
-	// request logged a working credential into access logs and browser history.
+	// Keys are header or session-cookie only. Accepting them as a query parameter
+	// meant every request logged a working credential into access logs and browser history.
 	if r.URL.Query().Get("api_key") != "" {
-		writeJSONError(w, http.StatusUnauthorized, "api_key query parameter is not accepted; send the key in the X-API-Key header")
+		writeJSONError(w, http.StatusUnauthorized, "api_key query parameter is not accepted; send the key in the X-API-Key header or session cookie")
 		return "", false
 	}
 
 	presented := r.Header.Get("X-API-Key")
 	if presented == "" {
-		writeJSONError(w, http.StatusUnauthorized, "X-API-Key header required")
+		// Fallback to HttpOnly session cookie
+		if cookie, err := r.Cookie("wmonitor_session"); err == nil && cookie.Value != "" {
+			presented = cookie.Value
+		}
+	}
+
+	if presented == "" {
+		writeJSONError(w, http.StatusUnauthorized, "X-API-Key header or session cookie required")
 		return "", false
 	}
 
 	if s.keys == nil {
-		// Fail closed. An unconfigured key store previously meant "accept
-		// everything", which is exactly the bug being fixed.
 		log.Printf("[server] hub mode enabled without a key store — rejecting request from %s", r.RemoteAddr)
 		writeJSONError(w, http.StatusServiceUnavailable, "authentication unavailable")
 		return "", false
@@ -126,6 +151,11 @@ func (s *Server) authTenant(w http.ResponseWriter, r *http.Request) (string, boo
 			writeJSONError(w, http.StatusUnauthorized, "invalid API key")
 			return "", false
 		}
+		if !checkScope(entry.scope, requiredScope) {
+			log.Printf("[server] forbidden: credential %s has scope %q, needs %q", presented[:min(4, len(presented))], entry.scope, requiredScope)
+			writeJSONError(w, http.StatusForbidden, "insufficient credential scope")
+			return "", false
+		}
 		return authorizeTenant(w, r, entry.tenantID)
 	}
 
@@ -133,12 +163,10 @@ func (s *Server) authTenant(w http.ResponseWriter, r *http.Request) (string, boo
 	if err != nil {
 		if errors.Is(err, storage.ErrAPIKeyNotFound) {
 			s.authCache.put(hash, authCacheEntry{valid: false, expires: time.Now().Add(authNegativeTTL)})
-			log.Printf("[server] rejected unknown API key from %s", clientIP(r))
+			log.Printf("[server] rejected unknown or expired API key from %s", clientIP(r))
 			writeJSONError(w, http.StatusUnauthorized, "invalid API key")
 			return "", false
 		}
-		// A database failure must not be reported as an auth failure, or operators
-		// will spend the outage hunting for a credential problem.
 		log.Printf("[server] API key lookup failed: %v", err)
 		writeJSONError(w, http.StatusServiceUnavailable, "authentication temporarily unavailable")
 		return "", false
@@ -147,9 +175,17 @@ func (s *Server) authTenant(w http.ResponseWriter, r *http.Request) (string, boo
 	s.authCache.put(hash, authCacheEntry{
 		tenantID: rec.TenantID,
 		client:   rec.ClientName,
+		kind:     rec.Kind,
+		scope:    rec.Scope,
 		valid:    true,
 		expires:  time.Now().Add(authCacheTTL),
 	})
+
+	if !checkScope(rec.Scope, requiredScope) {
+		log.Printf("[server] forbidden: client %q has scope %q, needs %q", rec.ClientName, rec.Scope, requiredScope)
+		writeJSONError(w, http.StatusForbidden, "insufficient credential scope")
+		return "", false
+	}
 
 	// Best-effort usage tracking; never block or fail a valid request on it.
 	go func() {
