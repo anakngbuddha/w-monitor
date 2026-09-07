@@ -2,8 +2,11 @@ package agent_test
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,28 +14,37 @@ import (
 	"Zeus/storage"
 )
 
-// TestAgentIngestMetric starts a mock hub server and verifies the agent
-// correctly POSTs a MetricRow with the right API key and payload.
+func newAgentFixture(t *testing.T, hubURL, key string) *agent.Agent {
+	t.Helper()
+	a, err := agent.NewWithDataDir(hubURL, key, t.TempDir())
+	if err != nil {
+		t.Fatalf("construct isolated agent: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := a.Close(); err != nil {
+			t.Errorf("close isolated agent: %v", err)
+		}
+	})
+	return a
+}
+
+type receivedRequest struct {
+	payloadType string
+	key         string
+	body        []byte
+	err         error
+}
+
 func TestAgentIngestMetric(t *testing.T) {
 	const testKey = "test-api-key-12345"
-
-	var receivedType string
-	var receivedKey string
-	var receivedBody []byte
-
+	received := make(chan receivedRequest, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedType = r.URL.Query().Get("type")
-		receivedKey = r.Header.Get("X-API-Key")
-		var buf [4096]byte
-		n, _ := r.Body.Read(buf[:])
-		receivedBody = buf[:n]
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		received <- receivedRequest{r.URL.Query().Get("type"), r.Header.Get("X-API-Key"), body, err}
 		w.WriteHeader(http.StatusAccepted)
-		w.Write([]byte(`{"status":"accepted"}`))
 	}))
 	defer ts.Close()
-
-	ag := agent.New(ts.URL, testKey)
-
+	ag := newAgentFixture(t, ts.URL, testKey)
 	m := storage.MetricRow{
 		Timestamp:       time.Now(),
 		ServerID:        "srv-001",
@@ -45,40 +57,35 @@ func TestAgentIngestMetric(t *testing.T) {
 	if err := ag.InsertMetric(m); err != nil {
 		t.Fatalf("InsertMetric: %v", err)
 	}
-
-	if receivedType != "metric" {
-		t.Errorf("expected type=metric, got %q", receivedType)
+	var got receivedRequest
+	select {
+	case got = <-received:
+	case <-time.After(time.Second):
+		t.Fatal("hub did not receive metric")
 	}
-	if receivedKey != testKey {
-		t.Errorf("expected X-API-Key=%q, got %q", testKey, receivedKey)
+	if got.err != nil {
+		t.Fatal(got.err)
 	}
-
+	if got.payloadType != "metric" || got.key != testKey {
+		t.Fatal("incorrect request type or credential")
+	}
 	var decoded storage.MetricRow
-	if err := json.Unmarshal(receivedBody, &decoded); err != nil {
-		t.Fatalf("unmarshal body: %v", err)
+	if err := json.Unmarshal(got.body, &decoded); err != nil {
+		t.Fatal(err)
 	}
-	if decoded.ServerID != "srv-001" {
-		t.Errorf("expected ServerID=srv-001, got %q", decoded.ServerID)
-	}
-	if decoded.CPUPct != 42.5 {
-		t.Errorf("expected CPUPct=42.5, got %v", decoded.CPUPct)
+	if decoded.ServerID != m.ServerID || decoded.CPUPct != m.CPUPct {
+		t.Fatal("metric payload changed")
 	}
 }
 
-// TestAgentIngestProcess verifies process rows are POSTed correctly.
 func TestAgentIngestProcess(t *testing.T) {
-	const testKey = "test-key"
-
-	var receivedType string
+	received := make(chan string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedType = r.URL.Query().Get("type")
+		received <- r.URL.Query().Get("type")
 		w.WriteHeader(http.StatusAccepted)
-		w.Write([]byte(`{"status":"accepted"}`))
 	}))
 	defer ts.Close()
-
-	ag := agent.New(ts.URL, testKey)
-
+	ag := newAgentFixture(t, ts.URL, "test-key")
 	p := storage.ProcessRow{
 		Timestamp: time.Now(),
 		ServerID:  "srv-001",
@@ -88,25 +95,81 @@ func TestAgentIngestProcess(t *testing.T) {
 		MemMB:     128.0,
 	}
 	if err := ag.InsertProcess(p); err != nil {
-		t.Fatalf("InsertProcess: %v", err)
+		t.Fatal(err)
 	}
-	if receivedType != "process" {
-		t.Errorf("expected type=process, got %q", receivedType)
+	select {
+	case got := <-received:
+		if got != "process" {
+			t.Fatalf("request type = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hub did not receive process")
 	}
 }
 
-// TestAgentUnauthorized verifies the agent returns an error on 401.
 func TestAgentUnauthorized(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"error":"unauthorized"}`))
 	}))
 	defer ts.Close()
-
-	ag := agent.New(ts.URL, "wrong-key")
-	err := ag.InsertMetric(storage.MetricRow{Timestamp: time.Now()})
-	if err == nil {
-		t.Fatal("expected error on 401, got nil")
+	ag := newAgentFixture(t, ts.URL, "wrong-key")
+	if err := ag.InsertMetric(storage.MetricRow{Timestamp: time.Now()}); err == nil {
+		t.Fatal("expected error on 401")
 	}
-	t.Logf("Got expected error: %v", err)
+}
+
+func TestAgentExplicitDirectoryPersistsOnlyItsBacklog(t *testing.T) {
+	root := t.TempDir()
+	canary := filepath.Join(root, "outside-canary")
+	if err := os.WriteFile(canary, []byte("unchanged"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "agent")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+	a, err := agent.NewWithDataDir(ts.URL, "test-key", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	if err := a.InsertMetric(storage.MetricRow{Timestamp: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if a.SpoolDepth() != 1 {
+		t.Fatal("failed delivery not present in isolated spool")
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := agent.NewWithDataDir(ts.URL, "test-key", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if b.SpoolDepth() != 1 {
+		t.Fatal("isolated backlog did not survive reopen")
+	}
+	got, err := os.ReadFile(canary)
+	if err != nil || string(got) != "unchanged" {
+		t.Fatal("agent changed outside canary")
+	}
+}
+
+func TestAgentExplicitDirectoryRejectsFallback(t *testing.T) {
+	for _, dir := range []string{"", ".", "relative"} {
+		if a, err := agent.NewWithDataDir("https://hub.example.com", "test-key", dir); err == nil {
+			_ = a.Close()
+			t.Errorf("accepted implicit directory %q", dir)
+		}
+	}
+	file := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(file, []byte("canary"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if a, err := agent.NewWithDataDir("https://hub.example.com", "test-key", file); err == nil {
+		_ = a.Close()
+		t.Fatal("filesystem error silently disabled spooling")
+	}
 }
