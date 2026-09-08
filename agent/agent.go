@@ -1,22 +1,17 @@
-// Package agent implements the Zeus agent mode.
-//
-// In agent mode, the binary collects local system metrics but instead of
-// writing to a local database, it POSTs each row as JSON to a central Hub
-// over HTTPS, authenticated with a shared API key.
-//
-// Delivery is durable: a retryable failure is written to a bounded on-disk spool
-// and retried with exponential backoff, so a hub outage costs latency rather
-// than data.
-//
-// Agent machines never receive or store Aiven/Postgres credentials.
+// Package agent implements outbound, durable, authenticated collection.
 package agent
 
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -26,365 +21,273 @@ import (
 
 	"Zeus/internal/fsroot"
 	"Zeus/storage"
+	"github.com/shirou/gopsutil/v3/host"
 )
 
-// BuildVersion is set from main via -ldflags so the hub can tell which build a
-// client is running.
 var BuildVersion = "dev"
 
-// Backoff bounds for the spool drainer.
 const (
-	minBackoff  = 1 * time.Second
-	maxBackoff  = 5 * time.Minute
+	minBackoff = time.Second
+	maxBackoff = 5 * time.Minute
 	postTimeout = 15 * time.Second
 )
 
-// retryableError marks a failure worth retrying later.
-//
-// The distinction is load-bearing: retryable failures get spooled, permanent
-// ones do not. Spooling a permanent failure would fill the disk with rows that
-// can never be accepted, and because Drain stops at the first failure to
-// preserve ordering, a single poison entry would block the whole backlog.
-type retryableError struct {
-	err        error
-	retryAfter time.Duration
-}
-
+type retryableError struct { err error; retryAfter time.Duration }
 func (e *retryableError) Error() string { return e.err.Error() }
 func (e *retryableError) Unwrap() error { return e.err }
+func isRetryable(err error) bool { var re *retryableError; return errors.As(err, &re) }
 
-func isRetryable(err error) bool {
-	var re *retryableError
-	return errors.As(err, &re)
-}
-
-// Agent POSTs metric and process rows to a Zeus Hub.
 type Agent struct {
-	hubURL     string
-	apiKey     string
+	hubURL string
+	apiKey string
 	httpClient *http.Client
-
-	spool     *Spool
+	spool *Spool
 	drainOnce sync.Once
 	drainWake chan struct{}
-
 	reauth func() error
+	mu sync.Mutex
+	ctx context.Context
+	cancel context.CancelFunc
+	workers sync.WaitGroup
+	initErr error
+	closed bool
+	bound bool
+	bootID string
+	sequence uint64
 }
 
-// SetReauth registers a callback to refresh or re-enroll credentials on 401 Unauthorized.
-func (a *Agent) SetReauth(fn func() error) {
-	a.reauth = fn
-}
+func (a *Agent) SetReauth(fn func() error) { a.mu.Lock(); a.reauth = fn; a.mu.Unlock() }
+func (a *Agent) SetAPIKey(key string) { a.mu.Lock(); a.apiKey = key; a.mu.Unlock() }
 
-// SetAPIKey updates the active credential used for requests.
-func (a *Agent) SetAPIKey(apiKey string) {
-	a.apiKey = apiKey
-}
-
-// New creates an Agent targeting hubURL (e.g. "https://hub.example.com:8080").
-// apiKey is sent in the X-API-Key request header.
-//
-// If a spool directory is available, delivery becomes durable and a background
-// drainer can be started with StartDrainer. If it is not, the agent still runs
-// but drops rows on failure, exactly as it did before, and says so.
 func New(hubURL, apiKey string) *Agent {
-	dir := ""
-	if d, err := storage.DataDir(); err == nil {
-		dir = d
-	} else {
-		log.Printf("[agent] WARNING: no data directory (%v) — samples will be dropped if the hub is unreachable", err)
-	}
+	dir, err := storage.DataDir()
+	if err != nil { a := newAgent(hubURL, apiKey, ""); a.initErr = err; return a }
 	return newAgent(hubURL, apiKey, dir)
 }
 
-// NewWithSpoolRoot is New with an explicit data/spool root. Tests must pass a
-// temporary directory; production paths are refused.
 func NewWithSpoolRoot(hubURL, apiKey, spoolRoot string) *Agent {
-	if spoolRoot != "" {
-		if err := fsroot.RejectProductionPath(spoolRoot); err != nil {
-			log.Printf("[agent] WARNING: refusing production spool root (%v) — samples will be dropped if the hub is unreachable", err)
-			return newAgent(hubURL, apiKey, "")
-		}
+	if err := fsroot.RejectProductionPath(spoolRoot); err != nil {
+		a := newAgent(hubURL, apiKey, "")
+		a.initErr = err
+		return a
 	}
 	return newAgent(hubURL, apiKey, spoolRoot)
 }
 
 func newAgent(hubURL, apiKey, dataDir string) *Agent {
-	a := &Agent{
-		hubURL: hubURL,
-		apiKey: apiKey,
-		httpClient: newHubHTTPClient(postTimeout),
-		drainWake: make(chan struct{}, 1),
-	}
-
-	if dataDir == "" {
-		return a
-	}
-	if sp, err := NewSpool(dataDir); err == nil {
-		a.spool = sp
-		if err := sp.BindDestination(hubURL, "", ""); err != nil {
-			log.Printf("[agent] WARNING: spool destination bind failed (%v)", err)
-		}
-		if depth, err := sp.Depth(); err == nil && depth > 0 {
-			log.Printf("[agent] %d spooled samples pending from a previous run", depth)
-		}
-	} else {
-		log.Printf("[agent] WARNING: could not open spool (%v) — samples will be dropped if the hub is unreachable", err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a := &Agent{hubURL: CanonicalHubURL(hubURL), apiKey: apiKey, httpClient: newHubHTTPClient(postTimeout), drainWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel}
+	if err := RequireHTTPSHub(hubURL); err != nil { a.initErr = err; return a }
+	if dataDir == "" { a.initErr = errors.New("agent: durable spool is required"); return a }
+	sp, err := NewSpool(dataDir)
+	if err != nil { a.initErr = err; return a }
+	a.spool = sp
+	boot, err := host.BootTime()
+	if err != nil || boot == 0 { a.initErr = errors.New("agent: OS boot identity unavailable"); return a }
+	a.bootID = fmt.Sprintf("boot-%d", boot)
+	var seed [8]byte
+	if _, err := crand.Read(seed[:]); err != nil { a.initErr = err; return a }
+	// Preserve the OS boot identity across process restarts without restarting
+	// sequence at one. Event IDs are independently random and durably spooled.
+	a.sequence = binary.BigEndian.Uint64(seed[:]) & ((1<<62)-1)
 	return a
 }
 
-// BindIdentity ties the spool to tenant and server. A mismatch quarantines
-// backlog instead of sending it to a different identity.
-func (a *Agent) BindIdentity(tenantID, serverID string) {
-	if a.spool == nil {
-		return
-	}
-	if err := a.spool.BindDestination(a.hubURL, tenantID, serverID); err != nil {
-		log.Printf("[agent] spool identity bind failed: %v", err)
-	}
+// InitializationError lets service startup fail before a collection loop runs.
+func (a *Agent) InitializationError() error { a.mu.Lock(); defer a.mu.Unlock(); return a.initErr }
+
+func (a *Agent) BindIdentity(tenant, server string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.spool == nil || tenant == "" || server == "" { a.initErr = errors.New("agent: complete spool identity is required"); return }
+	if err := a.spool.BindDestination(a.hubURL, tenant, server); err != nil { a.initErr = err; return }
+	a.bound = true
 }
 
-// StartDrainer launches the background retry loop. Safe to call more than once.
-func (a *Agent) StartDrainer(ctx context.Context) {
-	if a.spool == nil {
-		return
-	}
-	a.drainOnce.Do(func() { go a.drainLoop(ctx) })
+func (a *Agent) StartDrainer(parent context.Context) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed || a.spool == nil || a.initErr != nil || !a.bound { return }
+	a.drainOnce.Do(func() {
+		a.workers.Add(1)
+		go func() { defer a.workers.Done(); a.drainLoop(a.ctx) }()
+		if parent != nil {
+			a.workers.Add(1)
+			go func() { defer a.workers.Done(); select { case <-parent.Done(): a.cancel(); case <-a.ctx.Done(): } }()
+		}
+	})
 }
 
-// SpoolDepth reports how many samples are waiting for delivery.
 func (a *Agent) SpoolDepth() int {
-	if a.spool == nil {
-		return 0
-	}
+	if a.spool == nil { return 0 }
 	depth, err := a.spool.Depth()
-	if err != nil {
-		return 0
-	}
+	if err != nil { return -1 }
 	return depth
 }
 
-// drainLoop retries spooled samples with exponential backoff and jitter.
-//
-// Jitter matters at scale: without it, a fleet of agents that all failed during
-// the same hub outage would retry in lockstep and stampede the hub the moment it
-// came back, knocking it over again.
 func (a *Agent) drainLoop(ctx context.Context) {
 	backoff := minBackoff
-
 	for {
-		if depth, err := a.spool.Depth(); err == nil && depth > 0 {
-			delivered, drainErr := a.spool.Drain(a.deliverOrDrop)
-			if delivered > 0 {
-				log.Printf("[agent] delivered %d spooled sample(s)", delivered)
-			}
-			if drainErr == nil {
-				backoff = minBackoff
-			} else {
-				var re *retryableError
-				if errors.As(drainErr, &re) && re.retryAfter > 0 {
-					// The hub told us how long to wait.
-					backoff = re.retryAfter
-				} else {
-					backoff *= 2
-				}
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-				log.Printf("[agent] spool drain failed (%v); retrying in %s", drainErr, backoff.Round(time.Second))
-			}
-		}
-
-		wait := backoff
-		if jitter := backoff / 4; jitter > 0 {
-			wait = backoff - jitter + time.Duration(rand.Int63n(int64(2*jitter)))
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-a.drainWake:
-		case <-time.After(wait):
+		if ctx.Err() != nil { return }
+		_, err := a.spool.DrainBatches(ctx, storage.MaxBatchEvents, a.deliverBatch)
+		wait := 250*time.Millisecond
+		failed := err != nil
+		if failed {
+			backoff *= 2
+			if backoff > maxBackoff { backoff = maxBackoff }
+			wait = backoff
+			var retry *retryableError
+			if errors.As(err, &retry) && retry.retryAfter > wait { wait = retry.retryAfter }
+			// Jitter is nonnegative: never violate the server's minimum wait.
+			wait += time.Duration(rand.Int63n(int64(time.Second)))
+			log.Print("[agent] delivery blocked; queued evidence retained for retry or operator review")
+		} else { backoff = minBackoff }
+		timer := time.NewTimer(wait)
+		if failed {
+			select { case <-ctx.Done(): timer.Stop(); return; case <-timer.C: }
+		} else {
+			select { case <-ctx.Done(): timer.Stop(); return; case <-timer.C: case <-a.drainWake: timer.Stop() }
 		}
 	}
 }
 
-// deliverOrDrop delivers a spooled entry, discarding it if the hub rejects it
-// permanently.
-//
-// Returning nil for a permanent rejection looks odd but is correct here:
-// Drain halts at the first error to preserve ordering, so returning the error
-// would park the queue behind an entry that can never succeed.
-func (a *Agent) deliverOrDrop(payloadType string, body []byte) error {
-	err := a.deliver(payloadType, body)
-	if err == nil || isRetryable(err) {
-		return err
-	}
-	log.Printf("[agent] discarding spooled %s: hub rejected it permanently (%v)", payloadType, err)
-	return nil
-}
+func (a *Agent) wakeDrainer() { select { case a.drainWake <- struct{}{}: default: } }
+func (a *Agent) InsertMetric(m storage.MetricRow) error { m.TenantID = ""; return a.enqueue("metric", m) }
+func (a *Agent) InsertProcess(p storage.ProcessRow) error { p.TenantID = ""; return a.enqueue("process", p) }
+func (a *Agent) QueryMetrics(time.Time, string) ([]storage.MetricRow, error) { return nil, errors.New("agent: read unsupported") }
+func (a *Agent) QueryProcesses(time.Time, string) ([]storage.ProcessRow, error) { return nil, errors.New("agent: read unsupported") }
+func (a *Agent) CountMetrics() (int, error) { return 0, errors.New("agent: read unsupported") }
+func (a *Agent) CountProcesses() (int, error) { return 0, errors.New("agent: read unsupported") }
+func (a *Agent) QueryServers(string) ([]string, error) { return nil, errors.New("agent: read unsupported") }
 
-func (a *Agent) wakeDrainer() {
-	select {
-	case a.drainWake <- struct{}{}:
-	default: // already pending
-	}
-}
-
-// InsertMetric POSTs a MetricRow to the Hub's /api/ingest?type=metric endpoint.
-// Implements storage.Store so Agent can be used as the collector's store.
-func (a *Agent) InsertMetric(m storage.MetricRow) error {
-	return a.enqueue("metric", m)
-}
-
-// InsertProcess POSTs a ProcessRow to the Hub's /api/ingest?type=process endpoint.
-func (a *Agent) InsertProcess(p storage.ProcessRow) error {
-	return a.enqueue("process", p)
-}
-
-// QueryMetrics is not supported in agent mode — agents are write-only.
-func (a *Agent) QueryMetrics(since time.Time, tenantID string) ([]storage.MetricRow, error) {
-	return nil, fmt.Errorf("agent: QueryMetrics not supported in agent mode")
-}
-
-// QueryProcesses is not supported in agent mode.
-func (a *Agent) QueryProcesses(since time.Time, tenantID string) ([]storage.ProcessRow, error) {
-	return nil, fmt.Errorf("agent: QueryProcesses not supported in agent mode")
-}
-
-// CountMetrics is not supported in agent mode.
-func (a *Agent) CountMetrics() (int, error) {
-	return 0, fmt.Errorf("agent: CountMetrics not supported in agent mode")
-}
-
-// CountProcesses is not supported in agent mode.
-func (a *Agent) CountProcesses() (int, error) {
-	return 0, fmt.Errorf("agent: CountProcesses not supported in agent mode")
-}
-
-// QueryServers is not supported in agent mode.
-func (a *Agent) QueryServers(tenantID string) ([]string, error) {
-	return nil, fmt.Errorf("agent: QueryServers not supported in agent mode")
-}
-
-// Close reports any undelivered backlog and releases resources.
 func (a *Agent) Close() error {
-	if a.spool != nil {
-		if depth, err := a.spool.Depth(); err == nil && depth > 0 {
-			log.Printf("[agent] %d sample(s) remain spooled; they will be sent on next start", depth)
-		}
-		a.spool.Close()
-	}
+	a.mu.Lock()
+	if a.closed { a.mu.Unlock(); return nil }
+	a.closed = true
+	if a.cancel != nil { a.cancel() }
+	a.mu.Unlock()
+	a.workers.Wait()
+	if a.spool != nil { return a.spool.Close() }
 	return nil
 }
 
-// enqueue attempts immediate delivery, spooling the payload on a retryable
-// failure.
-//
-// A retryable failure returns nil: the sample is safely queued, and reporting an
-// error would make the collector log a loss that did not happen. A permanent
-// failure is returned, because the operator needs to know their key is wrong.
-func (a *Agent) enqueue(payloadType string, v interface{}) error {
-	body, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Errorf("agent: marshal %s: %w", payloadType, err)
+// enqueue promises success only after a complete event is durably spooled.
+// No HTTP call runs on the collection goroutine. When unavailable/full, it
+// returns an explicit error instead of falling back to lossy synchronous sends.
+func (a *Agent) enqueue(payloadType string, value interface{}) error {
+	a.mu.Lock()
+	if a.closed { a.mu.Unlock(); return errors.New("agent: closed") }
+	if a.initErr != nil { err := a.initErr; a.mu.Unlock(); return err }
+	var server string
+	event := storage.IngestEvent{BootID: a.bootID}
+	switch row := value.(type) {
+	case storage.MetricRow: row.TenantID = ""; event.Metric = &row; server = row.ServerID
+	case storage.ProcessRow: row.TenantID = ""; event.Process = &row; server = row.ServerID
+	default: a.mu.Unlock(); return errors.New("agent: unsupported event type")
 	}
-
-	// With a backlog present, append instead of jumping the queue: delivering the
-	// newest sample first would reorder the client's history.
-	if a.spool != nil {
-		if depth, err := a.spool.Depth(); err == nil && depth > 0 {
-			a.wakeDrainer()
-			return a.spool.Append(payloadType, body)
-		}
+	if !a.bound {
+		// Explicit-token deployments without enrollment metadata are bound to
+		// the credential fingerprint. Changing it quarantines previous backlog
+		// rather than assuming that an identical hostname is the same tenant.
+		fingerprint := sha256.Sum256([]byte(a.apiKey))
+		if a.spool == nil || server == "" { a.mu.Unlock(); return errors.New("agent: spool and stable server identity required") }
+		if err := a.spool.BindDestination(a.hubURL, "credential:"+hex.EncodeToString(fingerprint[:]), server); err != nil { a.mu.Unlock(); return err }
+		a.bound = true
 	}
-
-	deliverErr := a.deliver(payloadType, body)
-	if deliverErr == nil {
-		return nil
-	}
-
-	if !isRetryable(deliverErr) {
-		// Bad key or malformed payload. Retrying cannot help, and spooling would
-		// fill the disk with rows the hub will never accept.
-		return deliverErr
-	}
-
-	if a.spool == nil {
-		return fmt.Errorf("agent: %s dropped (no spool available): %w", payloadType, deliverErr)
-	}
-	if appendErr := a.spool.Append(payloadType, body); appendErr != nil {
-		return fmt.Errorf("agent: %s lost — delivery failed (%v) and spooling failed: %w", payloadType, deliverErr, appendErr)
-	}
-	log.Printf("[agent] hub unreachable (%v); sample spooled for retry", deliverErr)
+	if a.sequence >= (1<<63)-1 { a.mu.Unlock(); return errors.New("agent: sequence exhausted") }
+	a.sequence++
+	event.Sequence = a.sequence
+	var id [16]byte
+	if _, err := crand.Read(id[:]); err != nil { a.mu.Unlock(); return err }
+	event.EventID = hex.EncodeToString(id[:])
+	body, err := json.Marshal(event)
+	if err == nil { err = a.spool.Append("event", body) }
+	a.mu.Unlock()
+	if err != nil { return err }
+	a.StartDrainer(nil)
 	a.wakeDrainer()
 	return nil
 }
 
-// deliver performs a single POST attempt.
-//
-// Retry classification is deliberate. The previous implementation retried
-// network errors but broke out of its loop on any HTTP error status, so a hub
-// restart returning 502 was treated as permanent and the sample was discarded.
-// 5xx and 429 are transient; 400 and 401 are not.
+func (a *Agent) deliverBatch(entries []spoolEntry) error {
+	batch := storage.IngestBatch{SchemaVersion: storage.IngestSchema}
+	for _, entry := range entries {
+		var event storage.IngestEvent
+		if entry.PayloadType == "event" {
+			if err := storage.DecodeIngest(entry.Body, &event); err != nil { return errors.New("agent: invalid spooled event") }
+		} else {
+			// Old queue records acquire a stable legacy identity, identical to
+			// the Hub compatibility endpoint, so lost ACKs are deduplicated.
+			event.BootID = "legacy"
+			var identity string
+			switch entry.PayloadType {
+			case "metric": event.Metric = &storage.MetricRow{}; if err := storage.DecodeIngest(entry.Body, event.Metric); err != nil { return err }; event.Metric.TenantID = ""; identity = "metric:"+event.Metric.Timestamp.UTC().Format(time.RFC3339Nano)
+			case "process": event.Process = &storage.ProcessRow{}; if err := storage.DecodeIngest(entry.Body, event.Process); err != nil { return err }; event.Process.TenantID = ""; identity = fmt.Sprintf("process:%s:%d", event.Process.Timestamp.UTC().Format(time.RFC3339Nano), event.Process.PID)
+			default: return errors.New("agent: unsupported spooled event")
+			}
+			hash := sha256.Sum256([]byte(identity))
+			event.EventID = "legacy-"+hex.EncodeToString(hash[:])
+			event.Sequence = (binary.BigEndian.Uint64(hash[:8]) & ((1<<63)-1)) | 1
+		}
+		batch.Events = append(batch.Events, event)
+	}
+	body, err := json.Marshal(batch)
+	if err != nil { return err }
+	if len(body) > storage.MaxBatchBytes { return errors.New("agent: batch exceeds byte limit") }
+	return a.deliver("batch", body)
+}
+
+// Compatibility helper for old fixtures. Production draining never calls this
+// lossy function: even a rejected credential leaves the durable queue intact.
+func (a *Agent) deliverOrDrop(payloadType string, body []byte) error {
+	err := a.deliver(payloadType, body)
+	if err == nil || isRetryable(err) { return err }
+	return nil
+}
+
 func (a *Agent) deliver(payloadType string, body []byte) error {
-	url := fmt.Sprintf("%s/api/ingest?type=%s", a.hubURL, payloadType)
-
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("agent: build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", a.apiKey)
-	req.Header.Set("X-Agent-Version", BuildVersion)
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return &retryableError{err: fmt.Errorf("agent: POST %s: %w", payloadType, err)}
-	}
-	defer resp.Body.Close()
-
-	switch {
-	case resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusOK:
-		return nil
-
-	case resp.StatusCode == http.StatusUnauthorized:
-		if a.reauth != nil {
-			log.Printf("[agent] hub rejected API key (401); attempting re-enrollment...")
-			if err := a.reauth(); err == nil {
-				log.Printf("[agent] re-enrollment successful; retrying delivery")
-				// Re-attempt delivery once with refreshed key
-				return a.deliver(payloadType, body)
-			}
-			log.Printf("[agent] re-enrollment failed: %v", err)
+	ctx := a.ctx
+	if ctx == nil { ctx = context.Background() }
+	path := "/api/ingest?type="+payloadType
+	if payloadType == "batch" { path = "/api/v1/ingest/batches" }
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.hubURL+path, bytes.NewReader(body))
+		if err != nil { return errors.New("agent: invalid destination") }
+		a.mu.Lock()
+		key, reauth := a.apiKey, a.reauth
+		a.mu.Unlock()
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", key)
+		req.Header.Set("X-Agent-Version", BuildVersion)
+		resp, err := a.httpClient.Do(req)
+		if err != nil { return &retryableError{err: errors.New("agent: transport failed")} }
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, storage.MaxBatchBytes+1))
+		resp.Body.Close()
+		if readErr != nil || len(responseBody) > storage.MaxBatchBytes { return &retryableError{err: errors.New("agent: incomplete or oversized acknowledgement")} }
+		switch {
+		case resp.StatusCode == http.StatusAccepted || resp.StatusCode == http.StatusOK:
+			if payloadType != "batch" { return nil }
+			var sent storage.IngestBatch
+			var ack struct { Status string `json:"status"`; Outcomes []storage.IngestOutcome `json:"outcomes"` }
+			if json.Unmarshal(body, &sent) != nil || storage.DecodeIngest(responseBody, &ack) != nil || ack.Status != "accepted" || len(ack.Outcomes) != len(sent.Events) { return &retryableError{err: errors.New("agent: invalid acknowledgement")} }
+			for i, outcome := range ack.Outcomes { if outcome.EventID != sent.Events[i].EventID || (outcome.Status != "accepted" && outcome.Status != "duplicate") { return &retryableError{err: errors.New("agent: acknowledgement identity mismatch")} } }
+			return nil
+		case resp.StatusCode == http.StatusUnauthorized:
+			if attempt == 0 && reauth != nil { if err := reauth(); err == nil { continue } }
+			return errors.New("agent: credential rejected; queued evidence retained")
+		case resp.StatusCode == http.StatusTooManyRequests:
+			return &retryableError{err: errors.New("agent: rate or accepted-data budget exceeded"), retryAfter: retryAfterDelay(resp.Header.Get("Retry-After"), time.Now())}
+		case resp.StatusCode >= 500:
+			return &retryableError{err: fmt.Errorf("agent: hub returned HTTP %d", resp.StatusCode)}
+		default:
+			return fmt.Errorf("agent: hub rejected event with HTTP %d; operator review required", resp.StatusCode)
 		}
-		// Permanent: retrying a rejected credential without reauth cannot succeed.
-		return fmt.Errorf("agent: hub rejected API key — check that this client's key is registered on the hub")
-
-	case resp.StatusCode == http.StatusBadRequest:
-		// Permanent: the payload itself is wrong.
-		return fmt.Errorf("agent: hub rejected %s payload as malformed", payloadType)
-
-	case resp.StatusCode == http.StatusRequestEntityTooLarge:
-		return fmt.Errorf("agent: hub rejected %s payload as too large", payloadType)
-
-	case resp.StatusCode == http.StatusTooManyRequests:
-		wait := minBackoff
-		if v := resp.Header.Get("Retry-After"); v != "" {
-			if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-				wait = time.Duration(secs) * time.Second
-			}
-		}
-		return &retryableError{
-			err:        fmt.Errorf("agent: hub rate limited this client"),
-			retryAfter: wait,
-		}
-
-	case resp.StatusCode >= 500:
-		return &retryableError{err: fmt.Errorf("agent: hub returned HTTP %d for %s", resp.StatusCode, payloadType)}
-
-	default:
-		return fmt.Errorf("agent: hub returned HTTP %d for %s", resp.StatusCode, payloadType)
 	}
+	return errors.New("agent: authentication retry limit reached")
+}
+
+func retryAfterDelay(raw string, now time.Time) time.Duration {
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds > 0 && seconds <= int64((1<<63-1)/int64(time.Second)) { return time.Duration(seconds)*time.Second }
+	if deadline, err := http.ParseTime(raw); err == nil && deadline.After(now) { return deadline.Sub(now) }
+	return minBackoff
 }
