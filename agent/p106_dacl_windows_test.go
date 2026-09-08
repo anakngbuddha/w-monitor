@@ -10,12 +10,17 @@ import (
 
 	"Zeus/agent"
 	"Zeus/internal/testisolate"
+
 	"golang.org/x/sys/windows"
 )
 
 func TestCredentialFileDACLOmitsUsersAndEveryone(t *testing.T) {
 	credDir, _ := testisolate.Dirs(t)
-	if err := agent.SaveCredentials(agent.StoredCredentials{
+	store, err := agent.NewCredentialStore(credDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(agent.StoredCredentials{
 		Token:      "wma_dacl_probe",
 		TenantID:   "t_dacl",
 		ServerID:   "srv-dacl",
@@ -36,7 +41,7 @@ func TestCredentialFileDACLOmitsUsersAndEveryone(t *testing.T) {
 	if strings.Contains(sddl, ";;;WD)") || strings.Contains(sddl, ";;;BU)") {
 		t.Fatalf("DACL must not grant Everyone/Users, got %s", sddl)
 	}
-	if _, err := agent.LoadCredentials(); err != nil {
+	if _, err := store.Load(); err != nil {
 		t.Fatalf("current user must still load credentials: %v", err)
 	}
 }

@@ -12,8 +12,9 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// defaultTokenFilePath returns the OS-default token path without creating it.
-func defaultTokenFilePath() string {
+// tokenFilePath returns the OS-default token path used by the production
+// compatibility entry points (LoadCredentials/SaveCredentials/ClearCredentials).
+func tokenFilePath() string {
 	base := os.Getenv("PROGRAMDATA")
 	if base == "" {
 		base = `C:\ProgramData`
@@ -63,9 +64,13 @@ func unprotectBytes(cipher []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-// LoadCredentials decrypts and loads stored agent credentials from %PROGRAMDATA%\wmonitor\token.dat.
-func LoadCredentials() (*StoredCredentials, error) {
-	path := tokenFilePath()
+// Load decrypts the explicitly selected credential file, not a user-profile
+// dependent fallback.
+func (s *CredentialStore) Load() (*StoredCredentials, error) {
+	path, err := s.filePath()
+	if err != nil {
+		return nil, err
+	}
 	if err := rejectSymlink(path); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -76,12 +81,10 @@ func LoadCredentials() (*StoredCredentials, error) {
 		}
 		return nil, fmt.Errorf("read token file: %w", err)
 	}
-
 	plaintext, err := unprotectBytes(cipher)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt token: %w", err)
 	}
-
 	var creds StoredCredentials
 	if err := json.Unmarshal(plaintext, &creds); err != nil {
 		return nil, fmt.Errorf("unmarshal credentials: %w", err)
@@ -89,37 +92,34 @@ func LoadCredentials() (*StoredCredentials, error) {
 	return &creds, nil
 }
 
-// SaveCredentials encrypts and saves agent credentials to disk.
-func SaveCredentials(creds StoredCredentials) error {
+// Save encrypts to the explicitly selected directory using DPAPI, an atomic
+// write, and a protected DACL restricting access to SYSTEM/Administrators/
+// the current user.
+func (s *CredentialStore) Save(creds StoredCredentials) error {
+	path, err := s.filePath()
+	if err != nil {
+		return err
+	}
 	plaintext, err := json.Marshal(creds)
 	if err != nil {
 		return fmt.Errorf("marshal credentials: %w", err)
 	}
-
 	cipher, err := protectBytes(plaintext)
 	if err != nil {
 		return err
 	}
-
-	path := tokenFilePath()
-	if err := ensureCredentialDir(path); err != nil {
+	dir := filepath.Dir(path)
+	if err := rejectSymlink(dir); err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create credential directory: %w", err)
 	}
 	if err := atomicWriteFile(path, cipher, 0600); err != nil {
 		return fmt.Errorf("write token file: %w", err)
 	}
 	if err := applyTokenDACL(path); err != nil {
 		return fmt.Errorf("restrict token ACL: %w", err)
-	}
-	return nil
-}
-
-// ClearCredentials removes stored credentials from disk.
-func ClearCredentials() error {
-	path := tokenFilePath()
-	err := os.Remove(path)
-	if err != nil && !os.IsNotExist(err) {
-		return err
 	}
 	return nil
 }

@@ -6,19 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"time"
-
-	"Zeus/internal/fsroot"
 )
 
 // ErrNoCredentials is returned when no stored credentials exist on disk.
 var ErrNoCredentials = errors.New("agent: no stored credentials found")
-
-// EnvCredentialDir overrides the directory that holds the machine token file.
-// Tests and disposable runners should set this (or call SetCredentialDir) rather
-// than writing to OS-default credential paths.
-const EnvCredentialDir = "WMONITOR_CREDENTIAL_DIR"
 
 // StoredCredentials contains the machine's enrollment record.
 type StoredCredentials struct {
@@ -29,91 +21,64 @@ type StoredCredentials struct {
 	EnrolledAt time.Time `json:"enrolled_at"`
 }
 
-var (
-	credDirMu       sync.RWMutex
-	credDirOverride string
-)
-
-func init() {
-	fsroot.Register(DefaultCredentialDir())
+// CredentialStore owns one explicitly located credential file. Its path is
+// immutable; creating a store does not read, create, or change any files.
+// Callers must provide a trusted, absolute directory. Tests use t.TempDir().
+// The zero value is invalid and never falls back to production locations.
+type CredentialStore struct {
+	path string
 }
 
-// SetCredentialDir injects the credential directory. Empty restores OS default
-// resolution. Production paths are rejected so tests cannot target them.
-func SetCredentialDir(dir string) error {
-	if dir != "" {
-		if err := fsroot.RejectProductionPath(dir); err != nil {
-			return err
-		}
+// NewCredentialStore selects a directory without consulting HOME, PROGRAMDATA,
+// the current user, or the production credential path.
+func NewCredentialStore(dir string) (*CredentialStore, error) {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return nil, fmt.Errorf("agent: credential directory must be absolute")
 	}
-	credDirMu.Lock()
-	credDirOverride = dir
-	credDirMu.Unlock()
-	return nil
-}
-
-// CredentialDir returns the injected credential directory, or empty if unset.
-func CredentialDir() string {
-	credDirMu.RLock()
-	defer credDirMu.RUnlock()
-	return credDirOverride
-}
-
-// DefaultCredentialDir is the OS-default directory for the machine token.
-// It does not create the directory.
-func DefaultCredentialDir() string {
-	return filepath.Dir(defaultTokenFilePath())
-}
-
-func tokenFileName() string {
+	name := "token.json"
 	if runtime.GOOS == "windows" {
-		return "token.dat"
+		name = "token.dat"
 	}
-	return "token.json"
+	return &CredentialStore{path: filepath.Join(filepath.Clean(dir), name)}, nil
 }
 
-// tokenFilePath resolves the token file. Directory creation happens only on save.
-func tokenFilePath() string {
-	credDirMu.RLock()
-	override := credDirOverride
-	credDirMu.RUnlock()
-	if override != "" {
-		return filepath.Join(override, tokenFileName())
+func (s *CredentialStore) filePath() (string, error) {
+	if s == nil || s.path == "" || !filepath.IsAbs(s.path) {
+		return "", fmt.Errorf("agent: invalid credential store")
 	}
-	if dir := os.Getenv(EnvCredentialDir); dir != "" {
-		if fsroot.IsolationEnabled() {
-			if err := fsroot.RejectProductionPath(dir); err != nil {
-				panic("agent: " + err.Error())
-			}
-		}
-		return filepath.Join(dir, tokenFileName())
-	}
-	path := defaultTokenFilePath()
-	if fsroot.IsolationEnabled() {
-		panic(fmt.Sprintf("agent: production credential path %s used without test override", path))
-	}
-	return path
+	return s.path, nil
 }
 
-func ensureCredentialDir(path string) error {
-	dir := filepath.Dir(path)
-	if fsroot.IsolationEnabled() {
-		if err := fsroot.RejectProductionPath(dir); err != nil {
-			return err
-		}
-	}
-	if err := rejectSymlink(dir); err != nil && !os.IsNotExist(err) {
+// Clear removes only this store's credential file. It is safe to repeat.
+func (s *CredentialStore) Clear() error {
+	path, err := s.filePath()
+	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create token dir: %w", err)
-	}
-	if err := rejectSymlink(dir); err != nil {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
 }
 
+// LoadCredentials reads the production credential location. Tests must use an
+// explicit CredentialStore instead of this compatibility entry point.
+func LoadCredentials() (*StoredCredentials, error) {
+	return (&CredentialStore{path: tokenFilePath()}).Load()
+}
+
+// SaveCredentials writes the production credential location.
+func SaveCredentials(creds StoredCredentials) error {
+	return (&CredentialStore{path: tokenFilePath()}).Save(creds)
+}
+
+// ClearCredentials removes the production credential file.
+func ClearCredentials() error {
+	return (&CredentialStore{path: tokenFilePath()}).Clear()
+}
+
+// rejectSymlink refuses to operate through a symlinked path — defends against
+// a symlink planted at the credential path before the file/directory exists.
 func rejectSymlink(path string) error {
 	fi, err := os.Lstat(path)
 	if err != nil {
@@ -125,7 +90,8 @@ func rejectSymlink(path string) error {
 	return nil
 }
 
-// atomicWriteFile writes data to path via a same-directory temp file + rename.
+// atomicWriteFile writes data to path via a same-directory temp file + rename,
+// so a crash or concurrent read never observes a half-written credential file.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := rejectSymlink(path); err != nil && !os.IsNotExist(err) {
 		return err

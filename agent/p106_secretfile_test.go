@@ -3,6 +3,7 @@ package agent_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -16,11 +17,19 @@ func TestSaveCredentialsRejectsSymlink(t *testing.T) {
 	if err := os.WriteFile(target, []byte("decoy"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(credDir, tokenFileName())
+	name := "token.json"
+	if runtime.GOOS == "windows" {
+		name = "token.dat"
+	}
+	link := filepath.Join(credDir, name)
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlink not available: %v", err)
 	}
-	err := agent.SaveCredentials(agent.StoredCredentials{
+	store, err := agent.NewCredentialStore(credDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = store.Save(agent.StoredCredentials{
 		Token:      "wma_symlink_probe",
 		TenantID:   "t_sym",
 		ServerID:   "srv-sym",

@@ -1,4 +1,4 @@
-// Package testisolate injects credential/data/spool roots for tests (P1.01 / V22).
+// Package testisolate injects a data root for tests (P1.01 / V22).
 package testisolate
 
 import (
@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"Zeus/agent"
 	"Zeus/internal/fsroot"
 	"Zeus/storage"
 )
@@ -19,18 +18,9 @@ func Run(m *testing.M) int {
 		fmt.Fprintf(os.Stderr, "testisolate: %v\n", err)
 		return 1
 	}
-	cred := filepath.Join(suite.FixtureRoot, "credentials")
 	data := filepath.Join(suite.FixtureRoot, "data")
-	if err := os.MkdirAll(cred, 0o700); err != nil {
-		fmt.Fprintf(os.Stderr, "testisolate: cred dir: %v\n", err)
-		return 1
-	}
 	if err := os.MkdirAll(data, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "testisolate: data dir: %v\n", err)
-		return 1
-	}
-	if err := agent.SetCredentialDir(cred); err != nil {
-		fmt.Fprintf(os.Stderr, "testisolate: SetCredentialDir: %v\n", err)
 		return 1
 	}
 	if err := storage.SetDataDir(data); err != nil {
@@ -40,8 +30,11 @@ func Run(m *testing.M) int {
 	return suite.Finish(m.Run())
 }
 
-// Dirs returns unique credential and data directories under t.TempDir(),
-// installs them as process overrides, and restores the previous overrides.
+// Dirs returns unique credential and data directories under t.TempDir().
+// The credential directory is a plain path for the caller to pass to
+// agent.NewCredentialStore directly; it is not registered anywhere. The
+// data directory is installed as the process storage override and
+// restored on cleanup.
 func Dirs(t *testing.T) (credDir, dataDir string) {
 	t.Helper()
 	root := t.TempDir()
@@ -56,17 +49,11 @@ func Dirs(t *testing.T) (credDir, dataDir string) {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-
-	prevCred := agent.CredentialDir()
 	prevData := storage.DataDirOverride()
-	if err := agent.SetCredentialDir(credDir); err != nil {
-		t.Fatal(err)
-	}
 	if err := storage.SetDataDir(dataDir); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = agent.SetCredentialDir(prevCred)
 		_ = storage.SetDataDir(prevData)
 	})
 	return credDir, dataDir
