@@ -2,56 +2,59 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"Zeus/internal/fsroot"
 )
 
-// Spool bounds. A 100 MB cap holds roughly two weeks of one agent's samples,
-// which is far longer than any plausible hub outage, while still guaranteeing a
-// permanently unreachable hub cannot fill the client's disk.
 const (
-	maxSpoolBytes   = 100 << 20 // 100 MB
-	maxSegmentBytes = 8 << 20   // 8 MB per segment
+	maxSpoolBytes   = 100 << 20
+	maxSegmentBytes = 8 << 20
 	spoolDirName    = "spool"
 	spoolBindName   = "bind.json"
 )
 
-// spoolBinding ties a spool directory to one hub origin and agent identity.
-// A changed destination quarantines the old backlog so it is never sent.
+var ErrSpoolFull = errors.New("spool: disk budget exhausted; sample not queued")
+
 type spoolBinding struct {
 	Origin   string `json:"origin"`
 	TenantID string `json:"tenant_id,omitempty"`
 	ServerID string `json:"server_id,omitempty"`
 }
 
-// spoolEntry is one queued payload awaiting delivery.
 type spoolEntry struct {
 	PayloadType string          `json:"type"`
 	Body        json.RawMessage `json:"body"`
 	QueuedAt    int64           `json:"queued_at"`
 }
 
-// Spool is an append-only, size-bounded, on-disk queue.
-//
-// Rotating segments rather than using a single file means draining can delete
-// completed work by unlinking a whole file, instead of rewriting a large file to
-// remove its first line (which would be O(n) per delivered row).
+// drainMu serializes draining, rebinding and closing. mu only guards short
+// filesystem operations: append never shares a segment with network delivery.
+// The OS lock is released on process death, not by a guessed stale-lock timer.
+// Corrupt/old-origin data is retained in quarantine and counts toward the cap.
+// Checkpoints provide crash recovery; Hub event deduplication is still required
+// to resolve a successful commit whose acknowledgement was lost.
 type Spool struct {
 	mu      sync.Mutex
+	drainMu sync.Mutex
 	dir     string
 	current *os.File
 	curSize int64
+	lock    *os.File
+	closed  bool
 }
 
-// NewSpool opens (creating if needed) a spool directory.
 func NewSpool(dir string) (*Spool, error) {
 	if fsroot.IsolationEnabled() {
 		if err := fsroot.RejectProductionPath(dir); err != nil {
@@ -59,242 +62,321 @@ func NewSpool(dir string) (*Spool, error) {
 		}
 	}
 	path := filepath.Join(dir, spoolDirName)
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return nil, fmt.Errorf("spool: create %s: %w", path, err)
+	if err := rejectSymlink(path); err != nil && !os.IsNotExist(err) {
+		return nil, err
 	}
-	return &Spool{dir: path}, nil
+	if err := os.MkdirAll(path, 0700); err != nil {
+		return nil, err
+	}
+	if err := secureSpoolDirectory(path); err != nil {
+		return nil, err
+	}
+	lock, err := lockSpool(filepath.Join(path, "owner.lock"))
+	if err != nil {
+		return nil, fmt.Errorf("spool: another process owns the queue or ownership could not be established: %w", err)
+	}
+	return &Spool{dir: path, lock: lock}, nil
 }
 
-// BindDestination records the canonical hub origin and optional tenant/agent.
-// If an existing bind disagrees, prior segments are moved to quarantine/ and
-// are not drained.
+func (s *Spool) sealLocked() error {
+	if s.current == nil {
+		return nil
+	}
+	if err := s.current.Sync(); err != nil {
+		return err
+	}
+	err := s.current.Close()
+	s.current = nil
+	s.curSize = 0
+	return err
+}
+
 func (s *Spool) BindDestination(origin, tenantID, serverID string) error {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
+	if s.closed {
+		return os.ErrClosed
+	}
 	origin = CanonicalHubURL(origin)
+	if origin == "" {
+		return errors.New("spool: canonical destination is required")
+	}
 	existing, err := s.readBindLocked()
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-
-	mismatch := false
-	if existing != nil {
-		if existing.Origin != "" && origin != "" && !SameHubOrigin(existing.Origin, origin) {
-			mismatch = true
-		}
-		if existing.TenantID != "" && tenantID != "" && existing.TenantID != tenantID {
-			mismatch = true
-		}
-		if existing.ServerID != "" && serverID != "" && existing.ServerID != serverID {
-			mismatch = true
-		}
-	}
+	mismatch := existing != nil && ((existing.Origin != "" && !SameHubOrigin(existing.Origin, origin)) || (existing.TenantID != "" && tenantID != "" && existing.TenantID != tenantID) || (existing.ServerID != "" && serverID != "" && existing.ServerID != serverID))
 	if mismatch {
 		if err := s.quarantineLocked(); err != nil {
 			return err
 		}
-		log.Printf("[spool] destination changed; prior backlog was not sent")
 		existing = nil
 	}
-
-	bind := spoolBinding{Origin: origin, TenantID: tenantID, ServerID: serverID}
+	binding := spoolBinding{Origin: origin, TenantID: tenantID, ServerID: serverID}
 	if existing != nil {
-		if bind.Origin == "" {
-			bind.Origin = existing.Origin
+		if binding.TenantID == "" {
+			binding.TenantID = existing.TenantID
 		}
-		if bind.TenantID == "" {
-			bind.TenantID = existing.TenantID
-		}
-		if bind.ServerID == "" {
-			bind.ServerID = existing.ServerID
+		if binding.ServerID == "" {
+			binding.ServerID = existing.ServerID
 		}
 	}
-	return s.writeBindLocked(bind)
+	return s.writeBindLocked(binding)
 }
 
-func (s *Spool) bindPath() string {
-	return filepath.Join(s.dir, spoolBindName)
-}
+func (s *Spool) bindPath() string { return filepath.Join(s.dir, spoolBindName) }
 
 func (s *Spool) readBindLocked() (*spoolBinding, error) {
+	if err := rejectSymlink(s.bindPath()); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(s.bindPath())
 	if err != nil {
 		return nil, err
 	}
-	var b spoolBinding
-	if err := json.Unmarshal(data, &b); err != nil {
-		return nil, fmt.Errorf("spool: bind file: %w", err)
+	var binding spoolBinding
+	if err := json.Unmarshal(data, &binding); err != nil {
+		return nil, errors.New("spool: invalid destination binding; operator review required")
 	}
-	return &b, nil
+	return &binding, nil
 }
 
-func (s *Spool) writeBindLocked(b spoolBinding) error {
-	data, err := json.Marshal(b)
+func (s *Spool) writeBindLocked(binding spoolBinding) error {
+	data, err := json.Marshal(binding)
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(s.bindPath(), data, 0o600)
+	return spoolReplace(s.bindPath(), data)
 }
 
 func (s *Spool) quarantineLocked() error {
-	if s.current != nil {
-		s.current.Close()
-		s.current = nil
-		s.curSize = 0
-	}
-	qdir := filepath.Join(s.dir, "quarantine")
-	if err := os.MkdirAll(qdir, 0o700); err != nil {
-		return fmt.Errorf("spool: quarantine dir: %w", err)
+	if err := s.sealLocked(); err != nil {
+		return err
 	}
 	segments, _, err := s.segmentsLocked()
 	if err != nil {
 		return err
 	}
-	for _, src := range segments {
-		dst := filepath.Join(qdir, filepath.Base(src))
-		if err := os.Rename(src, dst); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("spool: quarantine %s: %w", filepath.Base(src), err)
+	for _, path := range segments {
+		if err := s.quarantinePathLocked(path); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// Append queues a payload for later delivery.
-func (s *Spool) Append(payloadType string, body []byte) error {
-	entry := spoolEntry{
-		PayloadType: payloadType,
-		Body:        json.RawMessage(body),
-		QueuedAt:    time.Now().Unix(),
+func (s *Spool) quarantinePathLocked(path string) error {
+	qdir := filepath.Join(s.dir, "quarantine")
+	if err := os.MkdirAll(qdir, 0700); err != nil {
+		return err
 	}
-	line, err := json.Marshal(entry)
-	if err != nil {
-		return fmt.Errorf("spool: marshal entry: %w", err)
+	if err := secureSpoolDirectory(qdir); err != nil {
+		return err
 	}
-	line = append(line, '\n')
+	if err := os.Rename(path, filepath.Join(qdir, filepath.Base(path))); err != nil {
+		return err
+	}
+	if err := os.Rename(path+".ack", filepath.Join(qdir, filepath.Base(path)+".ack")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := syncSpoolDir(qdir); err != nil {
+		return err
+	}
+	return syncSpoolDir(s.dir)
+}
 
+// RecordLoss stores only bounded reason codes and counts, never payloads or
+// credentials. Callers must propagate a recording failure, not claim durability.
+func (s *Spool) RecordLoss(reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.recordLossLocked(reason)
+}
 
+func (s *Spool) recordLossLocked(reason string) error {
+	switch reason {
+	case "overflow", "corrupt_segment", "permanent_rejection":
+	default:
+		return errors.New("spool: unsupported loss reason")
+	}
+	path := filepath.Join(s.dir, "loss.json")
+	counts := map[string]uint64{}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if err := json.Unmarshal(data, &counts); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if counts[reason] != ^uint64(0) {
+		counts[reason]++
+	}
+	data, err = json.Marshal(counts)
+	if err != nil {
+		return err
+	}
+	return spoolReplace(path, data)
+}
+
+func (s *Spool) Append(payloadType string, body []byte) error {
+	entry := spoolEntry{PayloadType: payloadType, Body: json.RawMessage(body), QueuedAt: time.Now().Unix()}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	line = append(line, '\n')
+	if len(line) > 1<<20 {
+		return errors.New("spool: entry exceeds 1 MiB")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return os.ErrClosed
+	}
 	if err := s.evictIfFullLocked(int64(len(line))); err != nil {
 		return err
 	}
 	if err := s.ensureSegmentLocked(int64(len(line))); err != nil {
 		return err
 	}
-
+	before := s.curSize
 	n, err := s.current.Write(line)
-	s.curSize += int64(n)
-	if err != nil {
-		return fmt.Errorf("spool: write: %w", err)
+	if err != nil || n != len(line) {
+		if rollbackErr := s.current.Truncate(before); rollbackErr != nil {
+			return fmt.Errorf("spool: partial write could not be rolled back: %w", rollbackErr)
+		}
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return err
 	}
+	s.curSize += int64(n)
 	return s.current.Sync()
 }
 
-// ensureSegmentLocked opens a new segment when there is none or the current one
-// is full.
 func (s *Spool) ensureSegmentLocked(incoming int64) error {
 	if s.current != nil && s.curSize+incoming <= maxSegmentBytes {
 		return nil
 	}
-	if s.current != nil {
-		s.current.Close()
-		s.current = nil
-		s.curSize = 0
+	if err := s.sealLocked(); err != nil {
+		return err
 	}
-
-	// Nanosecond-precision name keeps segments lexically sortable by age.
-	name := fmt.Sprintf("seg-%d.ndjson", time.Now().UnixNano())
-	f, err := os.OpenFile(filepath.Join(s.dir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return fmt.Errorf("spool: open segment: %w", err)
-	}
-	s.current = f
-	s.curSize = 0
-	return nil
-}
-
-// evictIfFullLocked drops the oldest segments until the incoming write fits.
-//
-// Dropping the oldest data is the right trade: recent metrics are what an
-// operator needs when they come back to a recovered agent, and unbounded growth
-// would eventually take the monitored machine down, which is the opposite of
-// what a monitoring agent should do.
-func (s *Spool) evictIfFullLocked(incoming int64) error {
-	segments, total, err := s.segmentsLocked()
+	f, err := os.CreateTemp(s.dir, fmt.Sprintf("seg-%020d-*.ndjson", time.Now().UnixNano()))
 	if err != nil {
 		return err
 	}
-	for total+incoming > maxSpoolBytes && len(segments) > 0 {
-		oldest := segments[0]
-		info, statErr := os.Stat(oldest)
-		if statErr == nil {
-			total -= info.Size()
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		return err
+	}
+	if err := syncSpoolDir(s.dir); err != nil {
+		f.Close()
+		return err
+	}
+	s.current, s.curSize = f, 0
+	return nil
+}
+
+// The former eviction entry point now applies explicit backpressure. It must
+// never delete a sealed segment concurrently being delivered.
+func (s *Spool) evictIfFullLocked(incoming int64) error {
+	var total int64
+	err := filepath.WalkDir(s.dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-		if s.current != nil && oldest == s.current.Name() {
-			s.current.Close()
-			s.current = nil
-			s.curSize = 0
+		if entry.Type()&os.ModeSymlink != 0 {
+			return errors.New("spool: symlink in queue")
 		}
-		if err := os.Remove(oldest); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("spool: evict %s: %w", oldest, err)
+		if !entry.IsDir() {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			total += info.Size()
 		}
-		log.Printf("[spool] evicted oldest segment %s to stay under the size cap", filepath.Base(oldest))
-		segments = segments[1:]
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if incoming > maxSpoolBytes || total > maxSpoolBytes-incoming {
+		if err := s.recordLossLocked("overflow"); err != nil {
+			return fmt.Errorf("%w; loss counter persistence failed", ErrSpoolFull)
+		}
+		return ErrSpoolFull
 	}
 	return nil
 }
 
-// segmentsLocked lists segment paths oldest first, with their total size.
 func (s *Spool) segmentsLocked() ([]string, int64, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
-		return nil, 0, fmt.Errorf("spool: read dir: %w", err)
+		return nil, 0, err
 	}
 	var paths []string
 	var total int64
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".ndjson" {
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "seg-") || filepath.Ext(entry.Name()) != ".ndjson" {
 			continue
 		}
-		paths = append(paths, filepath.Join(s.dir, e.Name()))
-		if info, err := e.Info(); err == nil {
-			total += info.Size()
+		if !entry.Type().IsRegular() {
+			return nil, 0, errors.New("spool: non-regular segment")
 		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, 0, err
+		}
+		paths = append(paths, filepath.Join(s.dir, entry.Name()))
+		total += info.Size()
 	}
-	sort.Strings(paths) // timestamped names sort oldest first
+	sort.Strings(paths)
 	return paths, total, nil
 }
 
-// Depth returns the number of queued entries. Reported on /api/health so a
-// backlog is visible rather than silent.
-func (s *Spool) Depth() (int, error) {
-	s.mu.Lock()
-	segments, _, err := s.segmentsLocked()
-	s.mu.Unlock()
+func checkpoint(path string, maximum int) (int, error) {
+	data, err := os.ReadFile(path + ".ack")
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}
+	n, err := strconv.Atoi(string(data))
+	if err != nil || n < 0 || n > maximum {
+		return 0, errors.New("spool: invalid checkpoint; operator review required")
+	}
+	return n, nil
+}
 
+func (s *Spool) Depth() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	paths, _, err := s.segmentsLocked()
+	if err != nil {
+		return 0, err
+	}
 	count := 0
-	for _, path := range segments {
-		f, err := os.Open(path)
-		if err != nil {
+	for _, path := range paths {
+		entries, err := readSegment(path)
+		if os.IsNotExist(err) {
 			continue
 		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
-		for scanner.Scan() {
-			if len(scanner.Bytes()) > 0 {
-				count++
-			}
+		if err != nil {
+			return count, err
 		}
-		f.Close()
+		n, err := checkpoint(path, len(entries))
+		if err != nil {
+			return count, err
+		}
+		count += len(entries) - n
 	}
 	return count, nil
 }
 
-// SizeBytes reports the spool's on-disk footprint.
 func (s *Spool) SizeBytes() (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -302,134 +384,133 @@ func (s *Spool) SizeBytes() (int64, error) {
 	return total, err
 }
 
-// Close releases any open file handles held by the spool.
 func (s *Spool) Close() error {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.current != nil {
-		err := s.current.Close()
-		s.current = nil
-		s.curSize = 0
-		return err
+	if s.closed {
+		return nil
 	}
-	return nil
+	s.closed = true
+	err := s.sealLocked()
+	if s.lock != nil {
+		if closeErr := s.lock.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
 
-// Drain delivers queued entries oldest first, stopping at the first failure.
-//
-// Stopping rather than skipping preserves ordering and prevents a persistent
-// failure from burning through the whole backlog against a hub that is still
-// down. A partially delivered segment is rewritten with only its undelivered
-// remainder.
-func (s *Spool) Drain(deliver func(payloadType string, body []byte) error) (delivered int, err error) {
+func (s *Spool) Drain(deliver func(string, []byte) error) (int, error) {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
 	s.mu.Lock()
-	segments, _, listErr := s.segmentsLocked()
-	currentName := ""
-	if s.current != nil {
-		currentName = s.current.Name()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, os.ErrClosed
 	}
+	if err := s.sealLocked(); err != nil {
+		s.mu.Unlock()
+		return 0, err
+	}
+	paths, _, err := s.segmentsLocked()
 	s.mu.Unlock()
-	if listErr != nil {
-		return 0, listErr
+	if err != nil {
+		return 0, err
 	}
-
-	for _, path := range segments {
-		// Don't drain the segment still being appended to unless it is the only
-		// one, to avoid competing with in-flight writes.
-		if path == currentName && len(segments) > 1 {
-			continue
+	delivered := 0
+	for _, path := range paths {
+		entries, err := readSegment(path)
+		if err != nil {
+			s.mu.Lock()
+			recordErr := s.recordLossLocked("corrupt_segment")
+			if recordErr == nil {
+				recordErr = s.quarantinePathLocked(path)
+			}
+			s.mu.Unlock()
+			if recordErr != nil {
+				return delivered, recordErr
+			}
+			return delivered, errors.New("spool: corrupt segment retained in quarantine; operator review required")
 		}
-
-		entries, readErr := readSegment(path)
-		if readErr != nil {
-			log.Printf("[spool] unreadable segment %s (%v); discarding it", filepath.Base(path), readErr)
-			os.Remove(path)
-			continue
+		n, err := checkpoint(path, len(entries))
+		if err != nil {
+			return delivered, err
 		}
-
-		for i, entry := range entries {
-			if deliverErr := deliver(entry.PayloadType, entry.Body); deliverErr != nil {
-				// Keep everything from this entry onward.
-				s.mu.Lock()
-				if s.current != nil && s.current.Name() == path {
-					s.current.Close()
-					s.current = nil
-					s.curSize = 0
-				}
-				s.mu.Unlock()
-				if rewriteErr := rewriteSegment(path, entries[i:]); rewriteErr != nil {
-					log.Printf("[spool] rewrite %s: %v", filepath.Base(path), rewriteErr)
-				}
-				return delivered, deliverErr
+		for i := n; i < len(entries); i++ {
+			if err := deliver(entries[i].PayloadType, entries[i].Body); err != nil {
+				return delivered, err
+			}
+			if err := spoolReplace(path+".ack", []byte(strconv.Itoa(i+1))); err != nil {
+				return delivered, err
 			}
 			delivered++
 		}
-
 		s.mu.Lock()
-		if s.current != nil && s.current.Name() == path {
-			s.current.Close()
-			s.current = nil
-			s.curSize = 0
+		err = os.Remove(path)
+		if err == nil {
+			err = syncSpoolDir(s.dir)
+		}
+		if err == nil {
+			if removeErr := os.Remove(path + ".ack"); removeErr != nil && !os.IsNotExist(removeErr) {
+				err = removeErr
+			}
 		}
 		s.mu.Unlock()
-		os.Remove(path)
+		if err != nil {
+			return delivered, err
+		}
 	}
 	return delivered, nil
 }
 
 func readSegment(path string) ([]spoolEntry, error) {
+	if err := rejectSymlink(path); err != nil {
+		return nil, err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxSegmentBytes+1<<20 {
+		return nil, errors.New("spool: oversized segment")
+	}
+	reader := bufio.NewReaderSize(f, 64<<10)
 	var entries []spoolEntry
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err == io.EOF && len(line) == 0 {
+			return entries, nil
+		}
+		if err != nil || len(line) > 1<<20 {
+			return nil, errors.New("spool: torn or oversized record")
+		}
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var entry spoolEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
-			// A torn final line from an unclean shutdown: skip it rather than
-			// discarding every valid entry in the segment.
-			continue
+		if err := json.Unmarshal(line, &entry); err != nil || entry.PayloadType == "" || !json.Valid(entry.Body) {
+			return nil, errors.New("spool: invalid record")
 		}
 		entries = append(entries, entry)
 	}
-	return entries, scanner.Err()
 }
 
-// rewriteSegment atomically replaces a segment with the given entries.
+// Kept for compatibility with focused fixtures; Drain uses checkpoints instead
+// of rewriting the immutable source segment after every partial delivery.
 func rewriteSegment(path string, entries []spoolEntry) error {
-	if len(entries) == 0 {
-		return os.Remove(path)
-	}
-
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	w := bufio.NewWriter(f)
+	var body bytes.Buffer
+	enc := json.NewEncoder(&body)
 	for _, entry := range entries {
-		line, err := json.Marshal(entry)
-		if err != nil {
-			continue
+		if err := enc.Encode(entry); err != nil {
+			return err
 		}
-		w.Write(line)
-		w.WriteByte('\n')
 	}
-	if err := w.Flush(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	f.Sync()
-	f.Close()
-	_ = os.Remove(path)
-	return os.Rename(tmp, path)
+	return spoolReplace(path, body.Bytes())
 }
