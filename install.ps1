@@ -1,191 +1,56 @@
-<#
-.SYNOPSIS
-Installs W-Monitor as a Windows Service (hub or agent mode).
-
-.DESCRIPTION
-This script must be run as Administrator. It will:
-1. Check for administrative privileges
-2. Stop the wmonitor service if it already exists
-3. Copy wmonitor.exe to %ProgramFiles%\W-Monitor
-4. Write agent/hub credentials to a locked config.env file
-5. Install and start the wmonitor service
-
-.PARAMETER Mode
-"agent" (default) - push metrics to a hub, no local DB.
-"hub"   - receive metrics from agents, serve dashboard.
-
-.PARAMETER HubUrl
-The URL of the Hub (required when -Mode agent).
-Example: https://hub.example.com:8080
-
-.PARAMETER ApiKey
-Optional. Legacy API key for backward-compatible agent binaries.
-Binaries built with build_release.ps1 -EnrollCode auto-enroll on first run
-and do NOT need this parameter.
-
-.PARAMETER Dsn
-Postgres DSN (required only when -Mode hub -Db postgres).
-Example: postgres://user:pass@host:5432/dbname?sslmode=require
-
-.PARAMETER Db
-"sqlite" (default) or "postgres" - only relevant for hub mode.
-
-.EXAMPLE
-# Install an enrollment-code agent (no API key needed — binary auto-enrolls):
-.\install.ps1 -Mode agent -HubUrl "https://hub.example.com:8080"
-
-# Install a legacy agent with a baked API key:
-.\install.ps1 -Mode agent -HubUrl "https://hub.example.com:8080" -ApiKey "abc123"
-
-# Install as hub with SQLite:
-.\install.ps1 -Mode hub
-
-# Install as hub with Postgres:
-.\install.ps1 -Mode hub -Db postgres -Dsn "postgres://user:pass@host:5432/wmonitor?sslmode=require"
-#>
-
 param(
-    [string]$Mode    = "agent",   # "agent" or "hub"
-    [string]$HubUrl  = "https://wmonitor-hub.onrender.com",
-    [string]$ApiKey  = "",        # optional; not needed for enrollment-code binaries
-    [string]$Dsn     = "",
-    [string]$Db      = "sqlite"   # "sqlite" or "postgres"
+    [Parameter(Mandatory=$true)][string]$ConfigPath,
+    [Parameter(Mandatory=$true)][string]$BinaryPath,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ExpectedSHA256
 )
-
-# 1. Ensure Admin privileges
+$ErrorActionPreference = 'Stop'
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Warning "This script requires Administrator privileges to install the service."
-    Write-Host "Attempting to restart script with elevated permissions..."
-    Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Mode `"$Mode`" -HubUrl `"$HubUrl`" -ApiKey `"$ApiKey`" -Dsn `"$Dsn`" -Db `"$Db`"" -Verb RunAs
-    exit
+if (-not $isAdmin) { throw 'Open an authorized Administrator shell. Automatic elevation with secret arguments is disabled.' }
+foreach ($path in @($ConfigPath, $BinaryPath)) {
+    $item = Get-Item -LiteralPath $path
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Regular, non-reparse source files are required.' }
 }
-
-# 2. Validate parameters
-if ($Mode -eq "agent" -and $HubUrl -eq "") {
-    Write-Error "Agent mode requires -HubUrl. Example: -HubUrl 'https://wmonitor-hub.onrender.com'"
-    exit 1
+if ((Get-FileHash -LiteralPath $BinaryPath -Algorithm SHA256).Hash -ne $ExpectedSHA256) { throw 'Binary checksum mismatch. Nothing installed.' }
+$programData = $env:PROGRAMDATA
+if (-not $programData) { $programData = 'C:\ProgramData' }
+$configDir = Join-Path $programData 'wmonitor'
+$configFile = Join-Path $configDir 'config.env'
+$installDir = Join-Path $env:ProgramFiles 'W-Monitor'
+$target = Join-Path $installDir 'wmonitor.exe'
+if ((Get-Service -Name wmonitor -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath $target) -or (Test-Path -LiteralPath $configFile)) {
+    throw 'Existing installation found. Use a reviewed maintenance-window upgrade. No existing service was stopped or replaced.'
 }
-if ($Mode -eq "hub" -and $Db -eq "postgres" -and $Dsn -eq "") {
-    Write-Error "Hub mode with -Db postgres requires -Dsn."
-    exit 1
-}
-
-$installDir = "$env:ProgramFiles\W-Monitor"
-$exeName    = "wmonitor.exe"
-$sourceExe  = Join-Path $PSScriptRoot $exeName
-$targetExe  = Join-Path $installDir $exeName
-
-# Config file under %ProgramData%\wmonitor so the SYSTEM service can read it
-# (the installing user's LOCALAPPDATA is not the service identity).
-$configDir  = Join-Path $env:PROGRAMDATA "wmonitor"
-if (-not $configDir) { $configDir = "C:\ProgramData\wmonitor" }
-$configFile = Join-Path $configDir "config.env"
-
-if (-not (Test-Path $sourceExe)) {
-    Write-Error "Cannot find $sourceExe. Please run build_release.ps1 first."
-    exit 1
-}
-
-# 3. Stop and uninstall existing wmonitor or legacy sysmon service
-Write-Host "Checking for existing services..."
-$legacySysmon = Get-Service -Name "sysmon" -ErrorAction SilentlyContinue
-if ($legacySysmon) {
-    Write-Host "Stopping legacy sysmon service..."
-    Stop-Service -Name "sysmon" -Force -ErrorAction SilentlyContinue
-}
-$existingService = Get-Service -Name "wmonitor" -ErrorAction SilentlyContinue
-if ($existingService) {
-    Write-Host "Stopping wmonitor service..."
-    Stop-Service -Name "wmonitor" -Force
-    Start-Sleep -Seconds 2
-    if (Test-Path $targetExe) {
-        Write-Host "Uninstalling old service registration..."
-        & $targetExe -uninstall
-        Start-Sleep -Seconds 2
+function Protect-Directory([string]$Path) {
+    if (Test-Path -LiteralPath $Path) {
+        if ((Get-Item -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse installation directory refused.' }
+    } else { New-Item -ItemType Directory -Path $Path | Out-Null }
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
     }
+    Set-Acl -LiteralPath $Path -AclObject $acl
 }
-
-# 4. Copy files
-Write-Host "Creating installation directory: $installDir"
-if (-not (Test-Path $installDir)) {
-    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+Protect-Directory $configDir
+Protect-Directory $installDir
+Protect-Directory (Join-Path $configDir 'data')
+# Create secrets only inside a directory already restricted to SYSTEM/Admins.
+[IO.File]::WriteAllBytes($configFile, [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $ConfigPath)))
+$fileAcl = New-Object System.Security.AccessControl.FileSecurity
+$fileAcl.SetAccessRuleProtection($true, $false)
+foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+    $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
+    $fileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'Allow')))
 }
-Write-Host "Copying $exeName to $installDir"
-Copy-Item -Path $sourceExe -Destination $targetExe -Force
-
-# 5. Add to PATH (Machine level)
-$envPath = [Environment]::GetEnvironmentVariable("PATH", [EnvironmentVariableTarget]::Machine)
-if ($envPath -notmatch [regex]::Escape($installDir)) {
-    Write-Host "Adding $installDir to System PATH..."
-    $newPath = $envPath + (if ($envPath.EndsWith(";")) { "" } else { ";" }) + $installDir
-    [Environment]::SetEnvironmentVariable("PATH", $newPath, [EnvironmentVariableTarget]::Machine)
-    $env:PATH = $newPath
-}
-
-# 6. Write config.env - credentials never go on the command line
-Write-Host "Writing config to: $configFile"
-if (-not (Test-Path $configDir)) {
-    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-}
-
-$configLines = @(
-    "# W-Monitor config - DO NOT COMMIT - generated by install.ps1",
-    "WMONITOR_MODE=$Mode",
-    "WMONITOR_API_KEY=$ApiKey"
-)
-if ($Mode -eq "agent") {
-    $configLines += "WMONITOR_AGENT_HUB=$HubUrl"
-}
-if ($Mode -eq "hub" -and $Db -eq "postgres") {
-    $configLines += "WMONITOR_DB_DSN=$Dsn"
-    $configLines += "WMONITOR_DB=postgres"
-}
-
-$configLines | Set-Content -Path $configFile -Encoding UTF8
-
-# Lock: SYSTEM + Administrators only (standard users cannot read secrets)
-Write-Host "Locking config file permissions..."
-icacls $configFile /inheritance:r /grant:r "SYSTEM:(R)" /grant:r "Administrators:(R)" | Out-Null
-
-# 7. Determine service arguments from mode — never put secrets on the command line
-$serviceArgs = @("-port", "8080")
-if ($Mode -eq "agent") {
-    $serviceArgs += @("-agent", $HubUrl)
-} else {
-    # hub mode
-    $serviceArgs += @("-hub")
-    if ($Db -eq "postgres") {
-        $serviceArgs += @("-db", "postgres")
-    }
-}
-
-# 8. Install and start the service
-Write-Host "Installing W-Monitor service ($Mode mode)..."
-& $targetExe -install @serviceArgs
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Failed to install service."
-    exit 1
-}
-
-Write-Host "Starting W-Monitor service..."
-& $targetExe -start
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Failed to start service."
-    exit 1
-}
-
-Write-Host ""
-if ($Mode -eq "agent") {
-    Write-Host "W-Monitor AGENT installed and started!" -ForegroundColor Green
-    Write-Host "  Pushing metrics to: $HubUrl"
-    Write-Host "  Config stored in:   $configFile"
-} else {
-    Write-Host "W-Monitor HUB installed and started!" -ForegroundColor Green
-    Write-Host "  Dashboard:  http://localhost:8080"
-    Write-Host "  DB backend: $Db"
-    Write-Host "  Config:     $configFile"
-}
-Write-Host ""
-Write-Host "Press any key to exit..."
-$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
+Set-Acl -LiteralPath $configFile -AclObject $fileAcl
+Copy-Item -LiteralPath $BinaryPath -Destination $target
+& $target -config $configFile -print-config
+if ($LASTEXITCODE -ne 0) { throw 'Configuration validation failed; service was not installed.' }
+& $target -config $configFile -install
+if ($LASTEXITCODE -ne 0) { throw 'Service installation failed.' }
+& $target -start
+if ($LASTEXITCODE -ne 0) { throw 'Service start failed.' }
+Write-Host 'Candidate service installed. Native reboot, standard-user ACL, stop and uninstall gates still require verification.'
+Write-Host 'No secret was embedded in the binary or placed in service arguments. A checksum is not a publisher signature.'
