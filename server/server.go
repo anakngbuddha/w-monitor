@@ -1,11 +1,17 @@
-// Package server provides the HTTP API and embedded dashboard for sysmon.
+// Package server provides the HTTP API and embedded dashboard.
 package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -17,118 +23,100 @@ import (
 	"Zeus/storage"
 )
 
-// BuildVersion is overridden from main via -ldflags at build time.
 var BuildVersion = "dev"
 
-// HTTP server timeouts.
-//
-// Previously this used a bare http.ListenAndServe, which applies no timeouts at
-// all. A handful of connections trickling headers one byte at a time (Slowloris)
-// could hold every goroutine open indefinitely.
 const (
 	readHeaderTimeout = 5 * time.Second
-	readTimeout       = 30 * time.Second
-	// Generous: CSV export of a wide time range legitimately streams for a while.
-	writeTimeout    = 120 * time.Second
-	idleTimeout     = 120 * time.Second
-	maxHeaderBytes  = 1 << 20 // 1 MB
-	shutdownGrace   = 10 * time.Second
-	maxIngestBody   = 1 << 18 // 256 KB
+	readTimeout = 30 * time.Second
+	writeTimeout = 120 * time.Second
+	idleTimeout = 120 * time.Second
+	maxHeaderBytes = 1 << 20
+	shutdownGrace = 10 * time.Second
+	maxIngestBody = storage.MaxBatchBytes
 	healthPingLimit = 2 * time.Second
 )
 
-// Server wraps the HTTP mux and storage store.
-type Server struct {
-	db         storage.Store
-	port       string
-	mux        *http.ServeMux
-	httpServer *http.Server
-	startedAt  time.Time
-
-	mu               sync.Mutex
-	dashboardViewers map[string]time.Time
-
-	// Hub mode — when true, /api/ingest is enabled and all endpoints require a
-	// registered API key that maps to a tenant.
-	hubMode   bool
-	keys      KeyStore
-	authCache *authCache
-	limiter   *rateLimiter
-
-	authEpoch       int64
-	epochRefreshed  time.Time
-	epochInterval   time.Duration
-	epochMu         sync.Mutex
-
-	sessions      *sessionStore
-	loginLimiter  *rateLimiter
-
-	// alerts is set by SetAlertSource when alerting is enabled.
-	alerts AlertSource
-
-	allowedOrigins []string
-
-	healthCheckedAt  time.Time
-	healthHealthy    bool
-	healthDBErr      error
-	healthLastAge    time.Duration
-	healthHaveMetric bool
-
-	retentionStatus func() map[string]interface{}
+type ingestBackend interface {
+	InitializeIngest(context.Context) error
+	AcceptIngest(context.Context, string, string, storage.IngestBatch, storage.IngestPolicy) ([]storage.IngestOutcome, error)
+	CleanupIngest(context.Context) error
 }
 
-// New creates a Server bound to the given port (e.g. "8080").
+type Server struct {
+	db storage.Store
+	port string
+	mux *http.ServeMux
+	httpServer *http.Server
+	startedAt time.Time
+	mu sync.Mutex
+	dashboardViewers map[string]time.Time
+	hubMode bool
+	keys KeyStore
+	authCache *authCache
+	limiter *rateLimiter
+	authEpoch int64
+	epochRefreshed time.Time
+	epochInterval time.Duration
+	epochMu sync.Mutex
+	sessions *sessionStore
+	loginLimiter *rateLimiter
+	alerts AlertSource
+	allowedOrigins []string
+	healthCheckedAt time.Time
+	healthHealthy bool
+	healthDBErr error
+	healthLastAge time.Duration
+	healthHaveMetric bool
+	retentionStatus func() map[string]interface{}
+	ingestion ingestBackend
+	ingestionErr error
+	ingestPolicy storage.IngestPolicy
+	stopping bool
+}
+
 func New(db storage.Store, port string) *Server {
-	s := &Server{
-		db:               db,
-		port:             port,
-		mux:              http.NewServeMux(),
-		startedAt:        time.Now(),
-		dashboardViewers: make(map[string]time.Time),
-		authCache:        newAuthCache(),
-		limiter:          newRateLimiter(defaultRatePerSecond, defaultBurst),
-		sessions:         newSessionStore(),
-		loginLimiter:     newRateLimiter(1, 5),
-		allowedOrigins:   parseAllowedOrigins(os.Getenv("WMONITOR_ALLOWED_ORIGINS")),
-		epochInterval:    AuthRevocationMaxDelay,
+	s := &Server{db: db, port: port, mux: http.NewServeMux(), startedAt: time.Now(), dashboardViewers: make(map[string]time.Time), authCache: newAuthCache(), limiter: newRateLimiter(defaultRatePerSecond, defaultBurst), sessions: newSessionStore(), loginLimiter: newRateLimiter(1, 5), allowedOrigins: parseAllowedOrigins(os.Getenv("WMONITOR_ALLOWED_ORIGINS")), epochInterval: AuthRevocationMaxDelay, ingestPolicy: storage.DefaultIngestPolicy()}
+	for _, setting := range []struct{ name string; target *int64 }{
+		{"WMONITOR_DAILY_ROW_QUOTA", &s.ingestPolicy.DailyRows},
+		{"WMONITOR_DAILY_BYTE_QUOTA", &s.ingestPolicy.DailyBytes},
+		{"WMONITOR_AGENT_DAILY_ROW_QUOTA", &s.ingestPolicy.AgentDailyRows},
+		{"WMONITOR_AGENT_DAILY_BYTE_QUOTA", &s.ingestPolicy.AgentDailyBytes},
+	} {
+		if raw := os.Getenv(setting.name); raw != "" {
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || value < 1 {
+				s.ingestionErr = errors.New("invalid ingest budget configuration")
+			} else {
+				*setting.target = value
+			}
+		}
 	}
+	if err := s.ingestPolicy.Validate(); err != nil { s.ingestionErr = err }
 	s.routes()
 	return s
 }
 
-// EnableHubMode enables the /api/ingest endpoint and turns on tenant isolation.
-//
-// The previous signature took the API key as a string and then ignored it, so
-// every endpoint accepted any non-empty X-API-Key value as a valid tenant. It
-// now takes the credential store that keys are actually verified against.
 func (s *Server) EnableHubMode(keys KeyStore) {
-	s.hubMode = true
-	s.keys = keys
+	s.hubMode, s.keys = true, keys
 	s.mux.HandleFunc("/api/ingest", s.handleIngest)
+	s.mux.HandleFunc("/api/v1/ingest/batches", s.handleBatch)
 	s.mux.HandleFunc("/api/enroll", s.handleEnroll)
 	s.mux.HandleFunc("/api/admin/enroll-codes", s.handleAdminEnrollCodes)
 	s.mux.HandleFunc("/api/admin/agents", s.handleAdminAgents)
 	s.mux.HandleFunc("/api/admin/clients", s.handleAdminClients)
 	s.mux.HandleFunc("/api/admin/agents/rotate", s.handleAdminAgentRotate)
 	s.syncAuthEpoch()
-	if keys == nil {
-		log.Println("[server] WARNING: hub mode enabled with no key store — all requests will be rejected")
-		return
-	}
-	log.Println("[server] hub mode enabled — POST /api/ingest requires ingest-scoped token; enrollment at /api/enroll")
+	if backend, ok := s.db.(ingestBackend); ok && s.ingestionErr == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := backend.InitializeIngest(ctx); err != nil { s.ingestionErr = errors.New("ingest initialization failed") } else { s.ingestion = backend }
+	} else if s.ingestionErr == nil { s.ingestionErr = errors.New("storage lacks atomic ingestion") }
+	if keys == nil { s.ingestionErr = errors.New("authentication unavailable") }
 }
 
-// SetRetentionStatusProvider exposes P1.02 containment state on /api/health.
-func (s *Server) SetRetentionStatusProvider(fn func() map[string]interface{}) {
-	s.retentionStatus = fn
-}
+func (s *Server) SetRetentionStatusProvider(fn func() map[string]interface{}) { s.retentionStatus = fn }
+func (s *Server) SetAllowedOrigins(origins []string) { s.allowedOrigins = origins }
 
-// SetAllowedOrigins overrides the CORS allowlist.
-func (s *Server) SetAllowedOrigins(origins []string) {
-	s.allowedOrigins = origins
-}
-
-// routes registers all HTTP handlers.
 func (s *Server) routes() {
 	s.mux.HandleFunc("/api/metrics", s.handleMetrics)
 	s.mux.HandleFunc("/api/processes", s.handleProcesses)
@@ -138,631 +126,338 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/export/csv", s.handleExportCSV)
 	s.mux.HandleFunc("/api/servers", s.handleServers)
 	s.mux.HandleFunc("/api/session", s.handleSession)
-	// Dashboard served at root — registered by dashboard package via RegisterStatic
 }
 
-// RegisterStatic registers a static file handler at / using the provided http.Handler.
-// Called by the dashboard package after setting up embed.FS.
-func (s *Server) RegisterStatic(h http.Handler) {
-	s.mux.Handle("/", h)
-}
+func (s *Server) RegisterStatic(h http.Handler) { s.mux.Handle("/", h) }
 
-// trackViewer records a request from a client IP.
 func (s *Server) trackViewer(r *http.Request) {
-	ip := clientIP(r)
 	s.mu.Lock()
-	s.dashboardViewers[ip] = time.Now()
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for ip, seen := range s.dashboardViewers { if now.Sub(seen) > time.Minute { delete(s.dashboardViewers, ip) } }
+	if len(s.dashboardViewers) < 4096 { s.dashboardViewers[clientIP(r)] = now }
 }
 
-// DashboardViewers returns the count of unique IPs that have hit this server in
-// the last 60 seconds.
-//
-// This used to be called GetConcurrentUsers, which made it satisfy the same
-// interface as the collector's TCP user tracker despite measuring something
-// completely different (people looking at the dashboard, not users of the
-// monitored application). Nothing ever wired it to the collector, but the name
-// made doing so by accident far too easy.
 func (s *Server) DashboardViewers() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	cutoff := time.Now().Add(-60 * time.Second)
-	for ip, lastSeen := range s.dashboardViewers {
-		if lastSeen.Before(cutoff) {
-			delete(s.dashboardViewers, ip)
-		}
-	}
+	for ip, seen := range s.dashboardViewers { if time.Since(seen) > time.Minute { delete(s.dashboardViewers, ip) } }
 	return len(s.dashboardViewers)
 }
 
-// Handler returns the underlying http.Handler with viewer tracking.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; connect-src 'self'")
-		s.trackViewer(r)
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; connect-src 'self'")
+		// Constant-time liveness neither scans customer data nor takes a lock
+		// held by the dependency readiness check.
+		if r.URL.Path == "/api/health" { s.handleHealth(w, r); return }
+		if s.limiter != nil && !s.limiter.allow("preauth:"+clientIP(r)) {
+			w.Header().Set("Retry-After", "1")
+			writeJSONError(w, http.StatusTooManyRequests, "request rate exceeded")
+			return
+		}
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" { s.trackViewer(r) }
 		s.mux.ServeHTTP(w, r)
 	})
 }
 
-// Start begins listening on the configured port.
 func (s *Server) Start() error {
-	s.httpServer = &http.Server{
-		Addr:              ":" + s.port,
-		Handler:           s.Handler(),
-		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
-		IdleTimeout:       idleTimeout,
-		MaxHeaderBytes:    maxHeaderBytes,
+	if s.hubMode && s.ingestionErr != nil { return s.ingestionErr }
+	host := "127.0.0.1"
+	if s.hubMode { host = "0.0.0.0" }
+	if configured := os.Getenv("WMONITOR_LISTEN_HOST"); configured != "" {
+		ip := net.ParseIP(configured)
+		if ip == nil || (!s.hubMode && !ip.IsLoopback()) { return errors.New("invalid or unauthenticated non-loopback listen host") }
+		host = configured
 	}
-	log.Printf("[server] listening on http://localhost:%s", s.port)
-	err := s.httpServer.ListenAndServe()
-	if err == http.ErrServerClosed {
-		// Expected during graceful shutdown.
-		return nil
+	port, err := strconv.Atoi(s.port)
+	if err != nil || port < 1 || port > 65535 { return errors.New("invalid HTTP port") }
+	s.mu.Lock()
+	if s.stopping { s.mu.Unlock(); return nil }
+	h := &http.Server{Addr: net.JoinHostPort(host, s.port), Handler: s.Handler(), ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: readTimeout, WriteTimeout: writeTimeout, IdleTimeout: idleTimeout, MaxHeaderBytes: maxHeaderBytes}
+	s.httpServer = h
+	s.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	var workers sync.WaitGroup
+	if s.ingestion != nil {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done(): return
+				case <-ticker.C:
+					cleanup, stop := context.WithTimeout(ctx, 5*time.Second)
+					if err := s.ingestion.CleanupIngest(cleanup); err != nil { log.Print("[server] ingest ledger cleanup incomplete") }
+					stop()
+				}
+			}
+		}()
 	}
+	err = h.ListenAndServe()
+	cancel()
+	workers.Wait()
+	if errors.Is(err, http.ErrServerClosed) { return nil }
 	return err
 }
 
-// Shutdown stops accepting connections and waits for in-flight requests.
-//
-// Without this, stopping the service cancelled the collector context and closed
-// the database while HTTP handlers were still running, so a CSV export in
-// progress died mid-stream and the client received a truncated file.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.httpServer == nil {
-		return nil
-	}
-	log.Println("[server] shutting down HTTP server")
-	return s.httpServer.Shutdown(ctx)
+	s.mu.Lock()
+	s.stopping = true
+	h := s.httpServer
+	s.mu.Unlock()
+	if h == nil { return nil }
+	return h.Shutdown(ctx)
 }
 
-// ShutdownGrace is the recommended grace period for Shutdown.
 func ShutdownGrace() time.Duration { return shutdownGrace }
 
-// ── CORS ──
-
 func parseAllowedOrigins(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
 	var out []string
-	for _, o := range strings.Split(raw, ",") {
-		if o = strings.TrimSpace(o); o != "" {
-			out = append(out, o)
-		}
-	}
+	for _, origin := range strings.Split(raw, ",") { if origin = strings.TrimSpace(origin); origin != "" && origin != "*" { out = append(out, origin) } }
 	return out
 }
 
-// writeCORS echoes the request origin only when it is explicitly allowed.
-//
-// These endpoints return tenant-scoped data behind an API key. "*" on an
-// authenticated API invites any page in any tab to read it.
 func (s *Server) writeCORS(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
-	if origin == "" || len(s.allowedOrigins) == 0 {
-		return
-	}
 	for _, allowed := range s.allowedOrigins {
-		if allowed == "*" || strings.EqualFold(allowed, origin) {
+		if origin != "" && allowed != "*" && strings.EqualFold(allowed, origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
+			w.Header().Add("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Headers", "X-API-Key, Content-Type")
 			return
 		}
 	}
 }
 
-// ── helpers ──
-
-func writeJSONError(w http.ResponseWriter, code int, msg string) {
+func writeJSONError(w http.ResponseWriter, code int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
-// enforceRate applies the per-tenant (or per-IP when unauthenticated) limit.
-func (s *Server) enforceRate(w http.ResponseWriter, r *http.Request, tenantID string) bool {
-	key := tenantID
-	if key == "" {
-		key = "ip:" + clientIP(r)
-	}
-	if s.limiter.allow(key) {
-		return true
-	}
-	retry := s.limiter.retryAfter()
-	w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())))
+func (s *Server) enforceRate(w http.ResponseWriter, r *http.Request, tenant string) bool {
+	if tenant == "" { tenant = "ip:"+clientIP(r) }
+	if s.limiter.allow("tenant:"+tenant) { return true }
+	w.Header().Set("Retry-After", "1")
 	writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
 	return false
 }
 
-// ── API handlers ──
-
-type metricsResponse struct {
-	Range string            `json:"range"`
-	Count int               `json:"count"`
-	Data  []metricDataPoint `json:"data"`
+func readOnly(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead { return true }
+	w.Header().Set("Allow", "GET, HEAD")
+	writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+	return false
 }
 
+type metricsResponse struct { Range string `json:"range"`; Count int `json:"count"`; Data []metricDataPoint `json:"data"` }
 type metricDataPoint struct {
-	Timestamp       int64   `json:"ts"`
-	ServerID        string  `json:"server_id"`
-	Hostname        string  `json:"hostname"`
-	CPUPct          float64 `json:"cpu_pct"`
-	MemPct          float64 `json:"mem_pct"`
-	DiskFreeGB      float64 `json:"disk_free_gb"`
-	NetSentBytes    uint64  `json:"net_sent_bytes"`
-	NetRecvBytes    uint64  `json:"net_recv_bytes"`
-	CPUCores        int     `json:"cpu_cores"`
-	MemTotalGB      float64 `json:"mem_total_gb"`
-	DiskTotalGB     float64 `json:"disk_total_gb"`
-	DiskReadOps     uint64  `json:"disk_read_ops"`
-	DiskWriteOps    uint64  `json:"disk_write_ops"`
-	DiskIOPS        float64 `json:"disk_iops"`
-	NetMBps         float64 `json:"net_mbps"`
-	ConcurrentUsers int     `json:"concurrent_users"`
-	NetSentExternal uint64  `json:"net_sent_external"`
-	NetRecvExternal uint64  `json:"net_recv_external"`
-	NetSentInternal uint64  `json:"net_sent_internal"`
-	NetRecvInternal uint64  `json:"net_recv_internal"`
+	Timestamp int64 `json:"ts"`
+	ServerID string `json:"server_id"`
+	Hostname string `json:"hostname"`
+	CPUPct float64 `json:"cpu_pct"`
+	MemPct float64 `json:"mem_pct"`
+	DiskFreeGB float64 `json:"disk_free_gb"`
+	NetSentBytes uint64 `json:"net_sent_bytes"`
+	NetRecvBytes uint64 `json:"net_recv_bytes"`
+	CPUCores int `json:"cpu_cores"`
+	MemTotalGB float64 `json:"mem_total_gb"`
+	DiskTotalGB float64 `json:"disk_total_gb"`
+	DiskReadOps uint64 `json:"disk_read_ops"`
+	DiskWriteOps uint64 `json:"disk_write_ops"`
+	DiskIOPS float64 `json:"disk_iops"`
+	NetMBps float64 `json:"net_mbps"`
+	ConcurrentUsers int `json:"concurrent_users"`
+	NetSentExternal uint64 `json:"net_sent_external"`
+	NetRecvExternal uint64 `json:"net_recv_external"`
+	NetSentInternal uint64 `json:"net_sent_internal"`
+	NetRecvInternal uint64 `json:"net_recv_internal"`
 }
 
-func parseRange(r string) time.Duration {
-	switch r {
-	case "7d":
-		return 7 * 24 * time.Hour
-	case "30d":
-		return 30 * 24 * time.Hour
-	default: // "24h" or anything else
-		return 24 * time.Hour
-	}
+func parseRange(value string) time.Duration {
+	switch value { case "7d": return 7*24*time.Hour; case "30d": return 30*24*time.Hour; default: return 24*time.Hour }
 }
 
-func queryMetricsScoped(ctx context.Context, db storage.Store, since time.Time, tenantID, serverID string) ([]storage.MetricRow, error) {
-	if err := storage.RequireTenant(tenantID); err != nil {
-		return nil, err
+func queryMetricsScoped(ctx context.Context, db storage.Store, since time.Time, tenant, server string) ([]storage.MetricRow, error) {
+	if err := storage.RequireTenant(tenant); err != nil { return nil, err }
+	if q, ok := db.(interface{ QueryMetricsQ(storage.MetricQuery) ([]storage.MetricRow, error) }); ok {
+		return q.QueryMetricsQ(storage.MetricQuery{Ctx: ctx, Since: since, Until: time.Now(), TenantID: tenant, ServerID: server, Limit: storage.DefaultQueryLimit})
 	}
-	type qer interface {
-		QueryMetricsQ(storage.MetricQuery) ([]storage.MetricRow, error)
-	}
-	if q, ok := db.(qer); ok {
-		return q.QueryMetricsQ(storage.MetricQuery{Ctx: ctx, Since: since, TenantID: tenantID, ServerID: serverID})
-	}
-	return db.QueryMetrics(since, tenantID)
+	return nil, errors.New("storage does not support bounded contextual metric reads")
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := s.authTenant(w, r)
-	if !ok {
-		return
-	}
-	if !s.enforceRate(w, r, tenantID) {
-		return
-	}
-
+	if !readOnly(w, r) { return }
+	tenant, ok := s.authTenant(w, r)
+	if !ok || !s.enforceRate(w, r, tenant) { return }
 	rangeParam := r.URL.Query().Get("range")
-	if rangeParam == "" {
-		rangeParam = "24h"
-	}
-	since := time.Now().Add(-parseRange(rangeParam))
-	if err := storage.RequireTenant(tenantID); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "tenant scope is required")
-		return
-	}
-
-	serverFilter := r.URL.Query().Get("server_id")
-	rows, err := queryMetricsScoped(r.Context(), s.db, since, tenantID, serverFilter)
-	if err != nil {
-		log.Printf("[server] QueryMetrics error: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "db error")
-		return
-	}
-
-	// Build response — empty slice (not nil) so JSON returns [] not null
+	if rangeParam == "" { rangeParam = "24h" }
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, err := queryMetricsScoped(ctx, s.db, time.Now().Add(-parseRange(rangeParam)), tenant, r.URL.Query().Get("server_id"))
+	if err != nil { writeJSONError(w, 503, "metric query unavailable"); return }
 	data := make([]metricDataPoint, 0, len(rows))
 	for _, row := range rows {
-		if serverFilter != "" && row.ServerID != serverFilter {
-			continue
-		}
-		data = append(data, metricDataPoint{
-			Timestamp:       row.Timestamp.Unix(),
-			ServerID:        row.ServerID,
-			Hostname:        row.Hostname,
-			CPUPct:          row.CPUPct,
-			MemPct:          row.MemPct,
-			DiskFreeGB:      row.DiskFreeGB,
-			NetSentBytes:    row.NetSentBytes,
-			NetRecvBytes:    row.NetRecvBytes,
-			CPUCores:        row.CPUCores,
-			MemTotalGB:      row.MemTotalGB,
-			DiskTotalGB:     row.DiskTotalGB,
-			DiskReadOps:     row.DiskReadOps,
-			DiskWriteOps:    row.DiskWriteOps,
-			DiskIOPS:        row.DiskIOPS,
-			NetMBps:         row.NetMBps,
-			ConcurrentUsers: row.ConcurrentUsers,
-			NetSentExternal: row.NetSentExternal,
-			NetRecvExternal: row.NetRecvExternal,
-			NetSentInternal: row.NetSentInternal,
-			NetRecvInternal: row.NetRecvInternal,
-		})
+		data = append(data, metricDataPoint{Timestamp: row.Timestamp.Unix(), ServerID: row.ServerID, Hostname: row.Hostname, CPUPct: row.CPUPct, MemPct: row.MemPct, DiskFreeGB: row.DiskFreeGB, NetSentBytes: row.NetSentBytes, NetRecvBytes: row.NetRecvBytes, CPUCores: row.CPUCores, MemTotalGB: row.MemTotalGB, DiskTotalGB: row.DiskTotalGB, DiskReadOps: row.DiskReadOps, DiskWriteOps: row.DiskWriteOps, DiskIOPS: row.DiskIOPS, NetMBps: row.NetMBps, ConcurrentUsers: row.ConcurrentUsers, NetSentExternal: row.NetSentExternal, NetRecvExternal: row.NetRecvExternal, NetSentInternal: row.NetSentInternal, NetRecvInternal: row.NetRecvInternal})
 	}
-
-	resp := metricsResponse{Range: rangeParam, Count: len(data), Data: data}
 	s.writeCORS(w, r)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	w.Header().Set("X-Result-Limit", strconv.Itoa(storage.DefaultQueryLimit))
+	json.NewEncoder(w).Encode(metricsResponse{Range: rangeParam, Count: len(data), Data: data})
 }
 
-type processResponse struct {
-	Range string             `json:"range"`
-	Count int                `json:"count"`
-	Data  []processDataPoint `json:"data"`
-}
-
-type processDataPoint struct {
-	Timestamp int64   `json:"ts"`
-	ServerID  string  `json:"server_id"`
-	PID       int32   `json:"pid"`
-	Name      string  `json:"name"`
-	CPUPct    float64 `json:"cpu_pct"`
-	MemMB     float64 `json:"mem_mb"`
-}
+type processResponse struct { Range string `json:"range"`; Count int `json:"count"`; Data []processDataPoint `json:"data"` }
+type processDataPoint struct { Timestamp int64 `json:"ts"`; ServerID string `json:"server_id"`; PID int32 `json:"pid"`; Name string `json:"name"`; CPUPct float64 `json:"cpu_pct"`; MemMB float64 `json:"mem_mb"` }
 
 func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := s.authTenant(w, r)
-	if !ok {
-		return
-	}
-	if !s.enforceRate(w, r, tenantID) {
-		return
-	}
-
+	if !readOnly(w, r) { return }
+	tenant, ok := s.authTenant(w, r)
+	if !ok || !s.enforceRate(w, r, tenant) { return }
 	rangeParam := r.URL.Query().Get("range")
-	if rangeParam == "" {
-		rangeParam = "24h"
-	}
-	since := time.Now().Add(-parseRange(rangeParam))
-	if err := storage.RequireTenant(tenantID); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "tenant scope is required")
-		return
-	}
-
-	rows, err := s.db.QueryProcesses(since, tenantID)
-	if err != nil {
-		log.Printf("[server] QueryProcesses error: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "db error")
-		return
-	}
-
-	serverFilter := r.URL.Query().Get("server_id")
-
+	if rangeParam == "" { rangeParam = "24h" }
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	q, ok := s.db.(interface{ QueryProcessesQ(storage.MetricQuery) ([]storage.ProcessRow, error) })
+	if !ok { writeJSONError(w, 503, "bounded process query unavailable"); return }
+	rows, err := q.QueryProcessesQ(storage.MetricQuery{Ctx: ctx, Since: time.Now().Add(-parseRange(rangeParam)), Until: time.Now(), TenantID: tenant, ServerID: r.URL.Query().Get("server_id"), Limit: storage.DefaultQueryLimit})
+	if err != nil { writeJSONError(w, 503, "process query unavailable"); return }
 	data := make([]processDataPoint, 0, len(rows))
-	for _, row := range rows {
-		if serverFilter != "" && row.ServerID != serverFilter {
-			continue
-		}
-		data = append(data, processDataPoint{
-			Timestamp: row.Timestamp.Unix(),
-			ServerID:  row.ServerID,
-			PID:       row.PID,
-			Name:      row.Name,
-			CPUPct:    row.CPUPct,
-			MemMB:     row.MemMB,
-		})
-	}
-
-	resp := processResponse{Range: rangeParam, Count: len(data), Data: data}
+	for _, row := range rows { data = append(data, processDataPoint{Timestamp: row.Timestamp.Unix(), ServerID: row.ServerID, PID: row.PID, Name: row.Name, CPUPct: row.CPUPct, MemMB: row.MemMB}) }
 	s.writeCORS(w, r)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(processResponse{Range: rangeParam, Count: len(data), Data: data})
 }
 
-// pinger is implemented by backends that can verify connectivity. Checked with a
-// type assertion so the storage.Store interface does not need to grow a method
-// that agent mode cannot meaningfully implement.
-type pinger interface {
-	Ping(ctx context.Context) error
-}
+type pinger interface { Ping(context.Context) error }
 
-// healthSnapshot gathers the facts the health endpoints report on (cached for 10s to prevent leakage and overhead).
-func (s *Server) healthSnapshot() (healthy bool, dbErr error, lastMetricAge time.Duration, haveMetric bool) {
+// Readiness is dependency-only. Never infer expected-agent health from an
+// arbitrary global metric, nor expose another tenant's alert or freshness data.
+func (s *Server) healthSnapshot() (bool, error, time.Duration, bool) {
 	s.mu.Lock()
-	if time.Since(s.healthCheckedAt) < 10*time.Second && s.healthCheckedAt.Unix() > 0 {
-		h, err, age, hm := s.healthHealthy, s.healthDBErr, s.healthLastAge, s.healthHaveMetric
-		s.mu.Unlock()
-		return h, err, age, hm
-	}
-	s.mu.Unlock()
-
-	healthy = true
-
-	if p, ok := s.db.(pinger); ok {
-		ctx, cancel := context.WithTimeout(context.Background(), healthPingLimit)
-		defer cancel()
-		if err := p.Ping(ctx); err != nil {
-			s.mu.Lock()
-			s.healthCheckedAt = time.Now()
-			s.healthHealthy = false
-			s.healthDBErr = err
-			s.mu.Unlock()
-			return false, err, 0, false
-		}
-	}
-
-	// Freshness matters more than row counts: a hub with 40 million rows and no
-	// new data for an hour is broken, and COUNT(*) would happily report "ok".
-	hctx, hcancel := context.WithTimeout(context.Background(), healthPingLimit)
-	defer hcancel()
-	var rows []storage.MetricRow
+	defer s.mu.Unlock()
+	if !s.healthCheckedAt.IsZero() && time.Since(s.healthCheckedAt) < 10*time.Second { return s.healthHealthy, s.healthDBErr, 0, false }
 	var err error
-	if q, ok := s.db.(storage.AllTenantsQuerier); ok {
-		rows, err = q.QueryMetricsAllTenants(hctx, time.Now().Add(-10*time.Minute), 64)
-	} else {
-		rows, err = s.db.QueryMetrics(time.Now().Add(-10*time.Minute), storage.LocalTenantID)
-	}
-	if err != nil {
-		s.mu.Lock()
-		s.healthCheckedAt = time.Now()
-		s.healthHealthy = false
-		s.healthDBErr = err
-		s.mu.Unlock()
-		return false, err, 0, false
-	}
-	if len(rows) > 0 {
-		newest := rows[len(rows)-1].Timestamp
-		lastMetricAge = time.Since(newest)
-		haveMetric = true
-	}
-
-	s.mu.Lock()
-	s.healthCheckedAt = time.Now()
-	s.healthHealthy = healthy
-	s.healthDBErr = nil
-	s.healthLastAge = lastMetricAge
-	s.healthHaveMetric = haveMetric
-	s.mu.Unlock()
-
-	return healthy, nil, lastMetricAge, haveMetric
+	if s.hubMode && s.ingestionErr != nil { err = s.ingestionErr } else if p, ok := s.db.(pinger); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), healthPingLimit)
+		err = p.Ping(ctx)
+		cancel()
+	} else { err = errors.New("storage readiness check unavailable") }
+	s.healthCheckedAt, s.healthHealthy, s.healthDBErr = time.Now(), err == nil, err
+	return err == nil, err, 0, false
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	healthy, dbErr, lastAge, haveMetric := s.healthSnapshot()
-
-	body := map[string]interface{}{
-		"status":         "ok",
-		"version":        BuildVersion,
-		"uptime_seconds": int64(time.Since(s.startedAt).Seconds()),
-		"hub_mode":       s.hubMode,
-		"timestamp":      time.Now().Unix(),
-	}
-	if haveMetric {
-		body["last_metric_age_seconds"] = int64(lastAge.Seconds())
-	} else {
-		body["last_metric_age_seconds"] = nil
-	}
-	if s.alerts != nil {
-		body["active_alerts"] = len(s.alerts.ActiveJSON())
-	}
-	if s.retentionStatus != nil {
-		body["retention"] = s.retentionStatus()
-	} else {
-		body["retention"] = map[string]interface{}{
-			"downsampling_enabled": false,
-			"purge_enabled":        false,
-			"reason":               "destructive downsampling and automatic purge are disabled until P2.03 (V07 containment); original tenant/server rows are preserved",
-		}
-	}
-
+	if !readOnly(w, r) { return }
 	w.Header().Set("Content-Type", "application/json")
-	if !healthy {
-		// The old handler discarded database errors entirely and always answered
-		// 200 "ok", so an unreachable database looked perfectly healthy to every
-		// uptime monitor pointed at it.
-		body["status"] = "degraded"
-		if dbErr != nil {
-			body["error"] = "database unreachable"
-			log.Printf("[server] health check failed: %v", dbErr)
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}
-	json.NewEncoder(w).Encode(body)
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "version": BuildVersion, "hub_mode": s.hubMode, "uptime_seconds": int64(time.Since(s.startedAt).Seconds()), "timestamp": time.Now().Unix(), "retention": map[string]interface{}{"downsampling_enabled": false, "purge_enabled": false, "reason": "V07 contained; destructive retention remains disabled until P2.03"}})
 }
 
-// handleReady is the orchestrator-facing check: no body, just a status code.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
-	healthy, _, _, _ := s.healthSnapshot()
-	if !healthy {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("not ready\n"))
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ready\n"))
+	if !readOnly(w, r) { return }
+	if healthy, _, _, _ := s.healthSnapshot(); !healthy { http.Error(w, "not ready", 503); return }
+	io.WriteString(w, "ready\n")
 }
 
-// handlePrometheus exposes basic internals in Prometheus text format so the
-// monitor can itself be monitored.
 func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
-	if s.hubMode {
-		ip := clientIP(r)
-		isLoopback := ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
-		if !isLoopback {
-			// Require admin scope if scraped over the public network
-			if _, ok := s.authTenantScope(w, r, storage.ScopeAdmin); !ok {
-				return
-			}
-		}
-	}
-
-	healthy, _, lastAge, haveMetric := s.healthSnapshot()
-
+	if !readOnly(w, r) { return }
+	// A loopback reverse proxy is not an administrative identity.
+	if s.hubMode { if _, ok := s.authTenantScope(w, r, storage.ScopeAdmin); !ok { return } }
+	healthy, _, _, _ := s.healthSnapshot()
 	up := 0
-	if healthy {
-		up = 1
-	}
-
+	if healthy { up = 1 }
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	fmt.Fprintf(w, "# HELP wmonitor_up Whether the storage backend is reachable.\n")
-	fmt.Fprintf(w, "# TYPE wmonitor_up gauge\nwmonitor_up %d\n", up)
-	fmt.Fprintf(w, "# HELP wmonitor_uptime_seconds Process uptime.\n")
-	fmt.Fprintf(w, "# TYPE wmonitor_uptime_seconds gauge\nwmonitor_uptime_seconds %d\n", int64(time.Since(s.startedAt).Seconds()))
-	if haveMetric {
-		fmt.Fprintf(w, "# HELP wmonitor_last_metric_age_seconds Age of the most recent stored sample.\n")
-		fmt.Fprintf(w, "# TYPE wmonitor_last_metric_age_seconds gauge\nwmonitor_last_metric_age_seconds %d\n", int64(lastAge.Seconds()))
-	}
-	fmt.Fprintf(w, "# HELP wmonitor_dashboard_viewers Unique IPs seen in the last 60s.\n")
-	fmt.Fprintf(w, "# TYPE wmonitor_dashboard_viewers gauge\nwmonitor_dashboard_viewers %d\n", s.DashboardViewers())
-	if s.alerts != nil {
-		fmt.Fprintf(w, "# HELP wmonitor_active_alerts Currently firing alerts.\n")
-		fmt.Fprintf(w, "# TYPE wmonitor_active_alerts gauge\nwmonitor_active_alerts %d\n", len(s.alerts.ActiveJSON()))
-	}
+	fmt.Fprintf(w, "# TYPE wmonitor_up gauge\nwmonitor_up %d\n# TYPE wmonitor_uptime_seconds gauge\nwmonitor_uptime_seconds %d\n", up, int64(time.Since(s.startedAt).Seconds()))
 }
 
 func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
-	s.writeCORS(w, r)
-	tenantID, ok := s.authTenant(w, r)
-	if !ok {
-		return
-	}
-	if !s.enforceRate(w, r, tenantID) {
-		return
-	}
-
-	rangeParam := r.URL.Query().Get("range")
-	if rangeParam == "" {
-		rangeParam = "24h"
-	}
-	since := time.Now().Add(-parseRange(rangeParam))
-	if err := storage.RequireTenant(tenantID); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "tenant scope is required")
-		return
-	}
-
+	if !readOnly(w, r) { return }
+	tenant, ok := s.authTenant(w, r)
+	if !ok || !s.enforceRate(w, r, tenant) { return }
+	if err := storage.RequireTenant(tenant); err != nil { writeJSONError(w, 400, "tenant required"); return }
+	// Existing CSV formatting remains spreadsheet-safe. The storage adapter
+	// supplies cancellation and server filtering to its bounded metric read.
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	view := exportView{Store: s.db, ctx: ctx, server: r.URL.Query().Get("server_id")}
 	w.Header().Set("Content-Type", "text/csv")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="wmonitor_export_%s.csv"`, time.Now().Format("20060102_150405")))
-	w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
-
-	if _, err := export.WriteCSV(w, s.db, since, tenantID); err != nil {
-		log.Printf("[server] CSV export error: %v", err)
-		http.Error(w, "export failed", http.StatusInternalServerError)
-		return
-	}
+	w.Header().Set("Content-Disposition", `attachment; filename="wmonitor_export.csv"`)
+	if _, err := export.WriteCSV(w, view, time.Now().Add(-parseRange(r.URL.Query().Get("range"))), tenant); err != nil { log.Print("[server] CSV export incomplete") }
 }
 
-// handleServers returns distinct server_id values seen in the DB (Phase 7).
+type exportView struct { storage.Store; ctx context.Context; server string }
+func (v exportView) QueryMetrics(since time.Time, tenant string) ([]storage.MetricRow, error) { return queryMetricsScoped(v.ctx, v.Store, since, tenant, v.server) }
+
 func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := s.authTenant(w, r)
-	if !ok {
-		return
-	}
-	if !s.enforceRate(w, r, tenantID) {
-		return
-	}
-	if err := storage.RequireTenant(tenantID); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "tenant scope is required")
-		return
-	}
-
-	servers, err := s.db.QueryServers(tenantID)
-	if err != nil {
-		log.Printf("[server] QueryServers error: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "db error")
-		return
-	}
-	if servers == nil {
-		servers = []string{}
-	}
-	s.writeCORS(w, r)
+	if !readOnly(w, r) { return }
+	tenant, ok := s.authTenant(w, r)
+	if !ok || !s.enforceRate(w, r, tenant) { return }
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	q, ok := s.db.(interface{ QueryServersContext(context.Context, string, int) ([]string, error) })
+	if !ok { writeJSONError(w, 503, "bounded server query unavailable"); return }
+	servers, err := q.QueryServersContext(ctx, tenant, 1000)
+	if err != nil { writeJSONError(w, 503, "server query unavailable"); return }
+	if servers == nil { servers = []string{} }
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"servers": servers})
+	json.NewEncoder(w).Encode(map[string]interface{}{"servers": servers, "limit": 1000})
 }
 
-// handleIngest accepts JSON metric/process payloads from agents (hub mode).
-//
-// The presented API key is verified against the registry and mapped to a tenant.
-// Previously any non-empty key was accepted and used verbatim as the tenant ID,
-// which meant unauthenticated writes into an attacker-chosen namespace.
-func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
+func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) { s.receiveBatch(w, r, false) }
+func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) { s.receiveBatch(w, r, true) }
 
+func (s *Server) receiveBatch(w http.ResponseWriter, r *http.Request, legacy bool) {
+	if r.Method != http.MethodPost { writeJSONError(w, 405, "method not allowed"); return }
 	principal, ok := s.authPrincipal(w, r, storage.ScopeIngest)
-	if !ok {
+	if !ok { return }
+	if principal.Kind != storage.KindAgent || principal.AgentID == "" { writeJSONError(w, 403, "a bound machine credential is required"); return }
+	if !s.limiter.allow("agent:"+principal.TenantID+":"+principal.AgentID) { w.Header().Set("Retry-After", "1"); writeJSONError(w, 429, "agent request rate exceeded"); return }
+	if s.ingestion == nil || s.ingestionErr != nil { writeJSONError(w, 503, "atomic ingestion unavailable"); return }
+	if s.retentionStatus != nil { if pressure, _ := s.retentionStatus()["disk_pressure"].(bool); pressure { w.Header().Set("Retry-After", "60"); writeJSONError(w, 503, "storage disk budget exhausted"); return } }
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxIngestBody))
+	if err != nil { writeJSONError(w, 413, "body exceeds limit"); return }
+	var batch storage.IngestBatch
+	if legacy {
+		batch.SchemaVersion = storage.IngestSchema
+		event := storage.IngestEvent{BootID: "legacy"}
+		var identity string
+		switch r.URL.Query().Get("type") {
+		case "metric":
+			event.Metric = &storage.MetricRow{}
+			err = storage.DecodeIngest(body, event.Metric)
+			identity = "metric:"+event.Metric.Timestamp.UTC().Format(time.RFC3339Nano)
+		case "process":
+			event.Process = &storage.ProcessRow{}
+			err = storage.DecodeIngest(body, event.Process)
+			identity = fmt.Sprintf("process:%s:%d", event.Process.Timestamp.UTC().Format(time.RFC3339Nano), event.Process.PID)
+		default: err = errors.New("unknown payload type")
+		}
+		if err != nil { writeJSONError(w, 400, "invalid legacy event"); return }
+		hash := sha256.Sum256([]byte(identity))
+		event.EventID = "legacy-"+hex.EncodeToString(hash[:])
+		event.Sequence = (binary.BigEndian.Uint64(hash[:8]) & ((1<<63)-1)) | 1
+		batch.Events = []storage.IngestEvent{event}
+	} else if err := storage.DecodeIngest(body, &batch); err != nil { writeJSONError(w, 400, "invalid batch JSON"); return }
+	if err := storage.NormalizeIngest(&batch, principal.TenantID, principal.AgentID, time.Now()); err != nil { writeJSONError(w, 400, "invalid event identity, timestamp or value"); return }
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	outcomes, err := s.ingestion.AcceptIngest(ctx, principal.TenantID, principal.AgentID, batch, s.ingestPolicy)
+	if errors.Is(err, storage.ErrEventConflict) { writeJSONError(w, 409, "event content conflicts with its accepted identity"); return }
+	if errors.Is(err, storage.ErrAcceptedBudget) {
+		now := time.Now().UTC()
+		next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+		w.Header().Set("Retry-After", strconv.Itoa(int(next.Sub(now).Seconds())+1))
+		writeJSONError(w, 429, "accepted-data budget exhausted")
 		return
 	}
-	if !s.enforceRate(w, r, principal.TenantID) {
-		return
-	}
-
-	// Cap the body. json.NewDecoder on an unbounded r.Body let a single request
-	// stream until the process ran out of memory.
-	r.Body = http.MaxBytesReader(w, r.Body, maxIngestBody)
-
-	bindServerID := func(payloadServerID string) (string, bool) {
-		if principal.Kind == storage.KindAgent {
-			if principal.AgentID == "" {
-				writeJSONError(w, http.StatusForbidden, "agent token is not bound to a server")
-				return "", false
-			}
-			if payloadServerID != "" && payloadServerID != principal.AgentID {
-				writeJSONError(w, http.StatusForbidden, "server identity mismatch")
-				return "", false
-			}
-			return principal.AgentID, true
-		}
-		return payloadServerID, true
-	}
-
-	switch r.URL.Query().Get("type") {
-	case "metric":
-		var m storage.MetricRow
-		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "bad request")
-			return
-		}
-		sid, ok := bindServerID(m.ServerID)
-		if !ok {
-			return
-		}
-		m.ServerID = sid
-		m.TenantID = principal.TenantID // server-assigned; never trust the client's value
-		if err := s.db.InsertMetric(m); err != nil {
-			log.Printf("[server] ingest metric error: %v", err)
-			writeJSONError(w, http.StatusInternalServerError, "db error")
-			return
-		}
-	case "process":
-		var p storage.ProcessRow
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "bad request")
-			return
-		}
-		sid, ok := bindServerID(p.ServerID)
-		if !ok {
-			return
-		}
-		p.ServerID = sid
-		p.TenantID = principal.TenantID
-		if err := s.db.InsertProcess(p); err != nil {
-			log.Printf("[server] ingest process error: %v", err)
-			writeJSONError(w, http.StatusInternalServerError, "db error")
-			return
-		}
-	default:
-		writeJSONError(w, http.StatusBadRequest, "type must be 'metric' or 'process'")
-		return
-	}
-
+	if err != nil { writeJSONError(w, 503, "ingest transaction did not complete"); return }
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(`{"status":"accepted"}`))
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "accepted", "outcomes": outcomes})
 }
