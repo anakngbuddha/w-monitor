@@ -13,299 +13,108 @@ import (
 	"Zeus/storage"
 )
 
-// hubFixture builds a hub-mode server with one registered client.
 func hubFixture(t *testing.T) (*server.Server, *storage.DB, string) {
 	t.Helper()
-
-	db, err := storage.Open(filepath.Join(t.TempDir(), "auth_test.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	db, err := storage.Open(filepath.Join(t.TempDir(), "auth.db"))
+	if err != nil { t.Fatal(err) }
 	t.Cleanup(func() { db.Close() })
-
-	const plaintext = "registered-client-key"
-	if err := db.UpsertAPIKey(storage.APIKeyRecord{
-		KeyHash:    storage.HashAPIKey(plaintext),
-		TenantID:   "t_registered",
-		ClientName: "RegisteredClient",
-		Kind:       storage.KindLegacy,
-		Scope:      storage.ScopeAll,
-	}); err != nil {
-		t.Fatalf("UpsertAPIKey: %v", err)
-	}
-
-	srv := server.New(db, "0")
-	srv.EnableHubMode(db)
-	return srv, db, plaintext
+	const key = "registered-client-key"
+	if err := db.UpsertAPIKey(storage.APIKeyRecord{KeyHash: storage.HashAPIKey(key), TenantID: "t_registered", ClientName: "RegisteredClient", Kind: storage.KindLegacy, Scope: storage.ScopeAll}); err != nil { t.Fatal(err) }
+	srv := server.New(db, "0"); srv.EnableHubMode(db)
+	return srv, db, key
 }
 
 func do(srv *server.Server, method, target, key string, body []byte) *httptest.ResponseRecorder {
-	var req *http.Request
-	if body != nil {
-		req = httptest.NewRequest(method, target, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-	} else {
-		req = httptest.NewRequest(method, target, nil)
-	}
-	if key != "" {
-		req.Header.Set("X-API-Key", key)
-	}
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, req)
-	return w
+	r := httptest.NewRequest(method, target, bytes.NewReader(body))
+	if body != nil { r.Header.Set("Content-Type", "application/json") }
+	if key != "" { r.Header.Set("X-API-Key", key) }
+	w := httptest.NewRecorder(); srv.Handler().ServeHTTP(w, r); return w
 }
 
-// The headline fix: a made-up key must not work anywhere.
+func registerPhase1Agent(t *testing.T, db *storage.DB, tenant, id, token string) {
+	t.Helper()
+	if err := db.UpsertAPIKey(storage.APIKeyRecord{KeyHash: storage.HashAPIKey(token), TenantID: tenant, ServerID: id, ClientName: "Agent-"+tenant, Kind: storage.KindAgent, Scope: storage.ScopeIngest}); err != nil { t.Fatal(err) }
+}
+
 func TestUnknownKeyRejectedOnEveryEndpoint(t *testing.T) {
 	srv, _, _ := hubFixture(t)
-
-	endpoints := []struct {
-		method, target string
-		body           []byte
-	}{
-		{"GET", "/api/metrics?range=24h", nil},
-		{"GET", "/api/processes?range=24h", nil},
-		{"GET", "/api/servers", nil},
-		{"GET", "/api/export/csv?range=24h", nil},
-		{"POST", "/api/ingest?type=metric", []byte(`{"CPUPct":50}`)},
-	}
-
-	for _, e := range endpoints {
-		w := do(srv, e.method, e.target, "a-key-i-invented", e.body)
-		if w.Code != http.StatusUnauthorized {
-			t.Errorf("%s %s with unknown key: got %d, want 401", e.method, e.target, w.Code)
-		}
+	for _, route := range []struct{ method, path string }{{"GET", "/api/metrics"}, {"GET", "/api/processes"}, {"GET", "/api/servers"}, {"GET", "/api/export/csv"}, {"GET", "/metrics"}, {"POST", "/api/ingest?type=metric"}, {"POST", "/api/v1/ingest/batches"}} {
+		if w := do(srv, route.method, route.path, "invented-key", nil); w.Code != 401 { t.Errorf("%s %s: %d", route.method, route.path, w.Code) }
 	}
 }
-
-func TestRegisteredKeyIsAccepted(t *testing.T) {
-	srv, _, key := hubFixture(t)
-
-	if w := do(srv, "GET", "/api/metrics?range=24h", key, nil); w.Code != http.StatusOK {
-		t.Errorf("registered key rejected: %d %s", w.Code, w.Body.String())
-	}
-}
-
+func TestRegisteredKeyIsAccepted(t *testing.T) { srv, _, key := hubFixture(t); if w := do(srv, "GET", "/api/metrics", key, nil); w.Code != 200 { t.Fatalf("read failed: %d", w.Code) } }
 func TestRevokedKeyIsRejected(t *testing.T) {
 	srv, db, key := hubFixture(t)
-
-	if w := do(srv, "GET", "/api/servers", key, nil); w.Code != http.StatusOK {
-		t.Fatalf("key should work before revocation: %d", w.Code)
-	}
-
-	if _, err := db.RevokeAPIKey("RegisteredClient"); err != nil {
-		t.Fatalf("RevokeAPIKey: %v", err)
-	}
-
-	// A fresh server avoids the positive auth cache, which is the documented
-	// 60s window for revocation to propagate.
-	srv2 := server.New(db, "0")
-	srv2.EnableHubMode(db)
-	if w := do(srv2, "GET", "/api/servers", key, nil); w.Code != http.StatusUnauthorized {
-		t.Errorf("revoked key still works: got %d, want 401", w.Code)
-	}
+	if w := do(srv, "GET", "/api/servers", key, nil); w.Code != 200 { t.Fatal("initial read failed") }
+	if _, err := db.RevokeAPIKey("RegisteredClient"); err != nil { t.Fatal(err) }
+	restarted := server.New(db, "0"); restarted.EnableHubMode(db)
+	if w := do(restarted, "GET", "/api/servers", key, nil); w.Code != 401 { t.Fatal("revoked key accepted after restart") }
 }
+func TestMissingKeyRejected(t *testing.T) { srv, _, _ := hubFixture(t); if w := do(srv, "GET", "/api/metrics", "", nil); w.Code != 401 { t.Fatal("missing key accepted") } }
+func TestKeyInQueryParamRejected(t *testing.T) { srv, _, key := hubFixture(t); if w := do(srv, "GET", "/api/metrics?api_key="+key, "", nil); w.Code != 401 { t.Fatal("query credential accepted") } }
 
-func TestMissingKeyRejected(t *testing.T) {
-	srv, _, _ := hubFixture(t)
-	if w := do(srv, "GET", "/api/metrics?range=24h", "", nil); w.Code != http.StatusUnauthorized {
-		t.Errorf("got %d, want 401", w.Code)
-	}
-}
-
-// Keys in URLs leak into access logs, proxy logs, and browser history.
-func TestKeyInQueryParamRejected(t *testing.T) {
-	srv, _, key := hubFixture(t)
-
-	w := do(srv, "GET", "/api/metrics?range=24h&api_key="+key, "", nil)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("api_key query param was accepted: got %d, want 401", w.Code)
-	}
-}
-
-// Ingest must tag rows with the tenant the key maps to, not with anything the
-// client sends in the payload.
-func TestIngestIgnoresClientSuppliedTenant(t *testing.T) {
-	srv, db, key := hubFixture(t)
-
-	payload, _ := json.Marshal(map[string]interface{}{
-		"Timestamp": time.Now(),
-		"TenantID":  "t_someone_elses_tenant",
-		"ServerID":  "agent-1",
-		"CPUPct":    42.0,
-		"MemPct":    10.0,
-	})
-
-	if w := do(srv, "POST", "/api/ingest?type=metric", key, payload); w.Code != http.StatusAccepted {
-		t.Fatalf("ingest failed: %d %s", w.Code, w.Body.String())
-	}
-
-	hijacked, err := db.QueryMetrics(time.Now().Add(-time.Hour), "t_someone_elses_tenant")
-	if err != nil {
-		t.Fatalf("QueryMetrics: %v", err)
-	}
-	if len(hijacked) != 0 {
-		t.Errorf("client-supplied tenant was honoured: %d rows landed in the wrong tenant", len(hijacked))
-	}
-
-	mine, err := db.QueryMetrics(time.Now().Add(-time.Hour), "t_registered")
-	if err != nil {
-		t.Fatalf("QueryMetrics: %v", err)
-	}
-	if len(mine) != 1 {
-		t.Errorf("got %d rows for the authenticated tenant, want 1", len(mine))
-	}
+func TestIngestRejectsClientSuppliedForeignTenant(t *testing.T) {
+	srv, db, _ := hubFixture(t)
+	const token = "fixture-bound-agent"
+	registerPhase1Agent(t, db, "t_registered", "agent-1", token)
+	payload, _ := json.Marshal(storage.MetricRow{Timestamp: time.Now(), TenantID: "t_someone_else", ServerID: "agent-1", CPUPct: 42, MemPct: 10})
+	if w := do(srv, "POST", "/api/ingest?type=metric", token, payload); w.Code != 400 { t.Fatalf("foreign identity not rejected: %d", w.Code) }
+	for _, tenant := range []string{"t_registered", "t_someone_else"} { rows, err := db.QueryMetrics(time.Now().Add(-time.Hour), tenant); if err != nil || len(rows) != 0 { t.Fatal("rejected identity caused a write") } }
+	payload, _ = json.Marshal(storage.MetricRow{Timestamp: time.Now(), ServerID: "agent-1", CPUPct: 42, MemPct: 10})
+	if w := do(srv, "POST", "/api/ingest?type=metric", token, payload); w.Code != 202 { t.Fatalf("bound ingest failed: %d %s", w.Code, w.Body.String()) }
+	rows, err := db.QueryMetrics(time.Now().Add(-time.Hour), "t_registered")
+	if err != nil || len(rows) != 1 { t.Fatal("authenticated tenant did not own the accepted event") }
 }
 
 func TestTenantIsolation(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "isolation_test.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	db, err := storage.Open(filepath.Join(t.TempDir(), "isolation.db"))
+	if err != nil { t.Fatal(err) }
 	defer db.Close()
-
-	const keyA = "key-alpha"
-	const keyB = "key-beta"
-	db.UpsertAPIKey(storage.APIKeyRecord{KeyHash: storage.HashAPIKey(keyA), TenantID: "t_alpha", ClientName: "Alpha", Kind: storage.KindLegacy, Scope: storage.ScopeAll})
-	db.UpsertAPIKey(storage.APIKeyRecord{KeyHash: storage.HashAPIKey(keyB), TenantID: "t_beta", ClientName: "Beta", Kind: storage.KindLegacy, Scope: storage.ScopeAll})
-
-	srv := server.New(db, "0")
-	srv.EnableHubMode(db)
-
-	mkBody := func(serverID string, cpu float64) []byte {
-		b, _ := json.Marshal(map[string]interface{}{
-			"Timestamp": time.Now(),
-			"ServerID":  serverID,
-			"CPUPct":    cpu,
-			"MemPct":    5.0,
-		})
-		return b
+	for _, tenant := range []string{"alpha", "beta"} {
+		if err := db.UpsertAPIKey(storage.APIKeyRecord{KeyHash: storage.HashAPIKey("read-"+tenant), TenantID: tenant, ClientName: tenant, Kind: storage.KindRead, Scope: storage.ScopeRead}); err != nil { t.Fatal(err) }
+		registerPhase1Agent(t, db, tenant, "same-server", "agent-"+tenant)
 	}
-
-	if w := do(srv, "POST", "/api/ingest?type=metric", keyA, mkBody("agent-alpha", 77.5)); w.Code != http.StatusAccepted {
-		t.Fatalf("alpha ingest: %d %s", w.Code, w.Body.String())
+	srv := server.New(db, "0"); srv.EnableHubMode(db)
+	for i, tenant := range []string{"alpha", "beta"} {
+		body, _ := json.Marshal(storage.MetricRow{Timestamp: time.Now(), ServerID: "same-server", CPUPct: float64(10+i*70), MemPct: 5})
+		if w := do(srv, "POST", "/api/ingest?type=metric", "agent-"+tenant, body); w.Code != 202 { t.Fatalf("ingest %s: %d %s", tenant, w.Code, w.Body.String()) }
 	}
-	if w := do(srv, "POST", "/api/ingest?type=metric", keyB, mkBody("agent-beta", 33.2)); w.Code != http.StatusAccepted {
-		t.Fatalf("beta ingest: %d %s", w.Code, w.Body.String())
-	}
-
-	for _, tc := range []struct{ key, wantServer string }{
-		{keyA, "agent-alpha"},
-		{keyB, "agent-beta"},
-	} {
-		w := do(srv, "GET", "/api/metrics?range=24h", tc.key, nil)
-		if w.Code != http.StatusOK {
-			t.Fatalf("query failed: %d %s", w.Code, w.Body.String())
-		}
-		var resp struct {
-			Count int `json:"count"`
-			Data  []struct {
-				ServerID string `json:"server_id"`
-			} `json:"data"`
-		}
-		json.NewDecoder(w.Body).Decode(&resp)
-		if resp.Count != 1 {
-			t.Errorf("tenant saw %d rows, want 1 (leakage across tenants)", resp.Count)
-			continue
-		}
-		if resp.Data[0].ServerID != tc.wantServer {
-			t.Errorf("tenant saw %q, want %q", resp.Data[0].ServerID, tc.wantServer)
-		}
+	for i, tenant := range []string{"alpha", "beta"} {
+		w := do(srv, "GET", "/api/metrics", "read-"+tenant, nil)
+		if w.Code != 200 { t.Fatal("scoped read failed") }
+		var response struct { Count int `json:"count"`; Data []struct { ServerID string `json:"server_id"`; CPU float64 `json:"cpu_pct"` } `json:"data"` }
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil { t.Fatal(err) }
+		if response.Count != 1 || len(response.Data) != 1 || response.Data[0].ServerID != "same-server" || response.Data[0].CPU != float64(10+i*70) { t.Fatal("same-ID cross-tenant leakage") }
 	}
 }
 
-// Hub mode with no key store must fail closed, not open.
 func TestHubModeWithoutKeyStoreRejectsEverything(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "nokeystore_test.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	srv := server.New(db, "0")
-	srv.EnableHubMode(nil)
-
-	if w := do(srv, "GET", "/api/metrics?range=24h", "anything", nil); w.Code == http.StatusOK {
-		t.Error("hub mode with no key store served data; must fail closed")
-	}
+	db, err := storage.Open(filepath.Join(t.TempDir(), "no-keys.db")); if err != nil { t.Fatal(err) }; defer db.Close()
+	srv := server.New(db, "0"); srv.EnableHubMode(nil)
+	if w := do(srv, "GET", "/api/metrics", "anything", nil); w.Code == 200 { t.Fatal("Hub without auth served data") }
 }
-
-// Local (non-hub) mode has a single dataset and must not demand a key.
 func TestLocalModeNeedsNoKey(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "local_test.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	srv := server.New(db, "0")
-	if w := do(srv, "GET", "/api/metrics?range=24h", "", nil); w.Code != http.StatusOK {
-		t.Errorf("local mode required a key: %d", w.Code)
-	}
+	db, err := storage.Open(filepath.Join(t.TempDir(), "local.db")); if err != nil { t.Fatal(err) }; defer db.Close()
+	if w := do(server.New(db, "0"), "GET", "/api/metrics", "", nil); w.Code != 200 { t.Fatal("local read required a key") }
 }
-
 func TestIngestRejectsOversizedBody(t *testing.T) {
-	srv, _, key := hubFixture(t)
-
-	huge := make([]byte, 1<<20) // 1 MB, over the 256 KB cap
-	for i := range huge {
-		huge[i] = 'a'
-	}
-	body := append([]byte(`{"ServerID":"`), huge...)
-	body = append(body, []byte(`"}`)...)
-
-	w := do(srv, "POST", "/api/ingest?type=metric", key, body)
-	if w.Code == http.StatusAccepted {
-		t.Error("oversized body was accepted")
-	}
+	srv, db, _ := hubFixture(t)
+	registerPhase1Agent(t, db, "t_registered", "agent-1", "size-fixture")
+	body := bytes.Repeat([]byte("a"), 1<<20)
+	if w := do(srv, "POST", "/api/ingest?type=metric", "size-fixture", body); w.Code != 413 { t.Fatalf("oversized body: %d", w.Code) }
 }
-
 func TestNoWildcardCORSByDefault(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "cors_test.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	srv := server.New(db, "0")
-	req := httptest.NewRequest("GET", "/api/metrics?range=24h", nil)
-	req.Header.Set("Origin", "https://evil.example.com")
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, req)
-
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got == "*" {
-		t.Error("wildcard CORS is still being sent on an authenticated API")
-	}
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
-		t.Errorf("unexpected CORS origin %q with no allowlist configured", got)
-	}
+	srv, _, key := hubFixture(t)
+	r := httptest.NewRequest("GET", "/api/metrics", nil); r.Header.Set("X-API-Key", key); r.Header.Set("Origin", "https://evil.example")
+	w := httptest.NewRecorder(); srv.Handler().ServeHTTP(w, r)
+	if w.Header().Get("Access-Control-Allow-Origin") != "" { t.Fatal("unconfigured CORS origin echoed") }
 }
-
 func TestCORSAllowlistEchoesPermittedOrigin(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "cors2_test.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	srv := server.New(db, "0")
-	srv.SetAllowedOrigins([]string{"https://dash.example.com"})
-
-	req := httptest.NewRequest("GET", "/api/metrics?range=24h", nil)
-	req.Header.Set("Origin", "https://dash.example.com")
-	w := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w, req)
-
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://dash.example.com" {
-		t.Errorf("Access-Control-Allow-Origin = %q, want the allowed origin", got)
-	}
-
-	req2 := httptest.NewRequest("GET", "/api/metrics?range=24h", nil)
-	req2.Header.Set("Origin", "https://evil.example.com")
-	w2 := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(w2, req2)
-
-	if got := w2.Header().Get("Access-Control-Allow-Origin"); got != "" {
-		t.Errorf("disallowed origin was echoed: %q", got)
+	srv, _, key := hubFixture(t); srv.SetAllowedOrigins([]string{"https://dash.example"})
+	for _, origin := range []string{"https://dash.example", "https://evil.example"} {
+		r := httptest.NewRequest("GET", "/api/metrics", nil); r.Header.Set("X-API-Key", key); r.Header.Set("Origin", origin)
+		w := httptest.NewRecorder(); srv.Handler().ServeHTTP(w, r)
+		want := ""; if origin == "https://dash.example" { want = origin }
+		if w.Header().Get("Access-Control-Allow-Origin") != want { t.Fatal("CORS boundary changed") }
 	}
 }
