@@ -1,0 +1,55 @@
+name: Phase 1 supplemental evidence
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  javascript-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax and isolated session-state regressions (not real browser proof)
+        run: |
+          node --check dashboard/static/session.js
+          node scripts/check-session.cjs
+
+  postgres-fixture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: phase1
+          POSTGRES_PASSWORD: fixture-only
+          POSTGRES_DB: phase1_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U phase1 -d phase1_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      WMONITOR_TEST_ISOLATION: '1'
+      WMONITOR_PHASE1_PG_FIXTURE: '1'
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Isolated-path preflight
+        run: go test ./agent -run '^TestNoProductionPathCallsInTests$' -count=1
+      - name: Real PostgreSQL duplicate/rollback fixture
+        run: go test -race ./storage -run '^TestPhase1PostgresFixture$' -count=1 -timeout=5m
