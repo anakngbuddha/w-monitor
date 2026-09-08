@@ -61,7 +61,7 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 func filterByTenant(alerts []map[string]interface{}, tenantID string) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(alerts))
 	if tenantID == "" {
-		return append(out, alerts...)
+		return out
 	}
 	for _, a := range alerts {
 		if v, ok := a["tenant_id"].(string); ok && v == tenantID {

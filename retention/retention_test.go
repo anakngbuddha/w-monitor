@@ -1,6 +1,8 @@
 package retention_test
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,7 +11,7 @@ import (
 	"Zeus/storage"
 )
 
-func TestRetentionPurgeAndDownsample(t *testing.T) {
+func TestRetentionPreservesTenantServerRows(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "test_retention.db")
 	db, err := storage.Open(tmp)
 	if err != nil {
@@ -18,94 +20,116 @@ func TestRetentionPurgeAndDownsample(t *testing.T) {
 	defer db.Close()
 
 	now := time.Now().UTC()
+	hourBucket := now.Add(-25 * time.Hour).Truncate(time.Hour)
 
-	// --- Insert synthetic data ---
-
-	// 5 rows that are 31 days old (should be DELETED)
-	old31d := now.Add(-31 * 24 * time.Hour)
+	if err := db.InsertMetric(storage.MetricRow{
+		Timestamp: hourBucket.Add(1 * time.Minute),
+		TenantID:  "tenant-a", ServerID: "srv-same", Hostname: "host-a",
+		CPUPct: 10, MemPct: 40, DiskFreeGB: 100, CPUCores: 4, MemTotalGB: 16, DiskTotalGB: 200,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertMetric(storage.MetricRow{
+		Timestamp: hourBucket.Add(2 * time.Minute),
+		TenantID:  "tenant-b", ServerID: "srv-same", Hostname: "host-b",
+		CPUPct: 90, MemPct: 80, DiskFreeGB: 10, CPUCores: 8, MemTotalGB: 32, DiskTotalGB: 400,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 5; i++ {
-		ts := old31d.Add(time.Duration(i) * 10 * time.Second)
-		db.InsertMetric(storage.MetricRow{
-			Timestamp: ts, CPUPct: 10, MemPct: 40, DiskFreeGB: 100,
-			NetSentBytes: 1000, NetRecvBytes: 2000,
-		})
+		if err := db.InsertMetric(storage.MetricRow{
+			Timestamp: now.Add(-31 * 24 * time.Hour).Add(time.Duration(i) * time.Second),
+			TenantID:  "tenant-a", ServerID: "srv-old", CPUPct: 1, MemPct: 1, DiskFreeGB: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// 12 rows that are 25 hours old, all within the same hour (should be DOWNSAMPLED to 1)
-	old25h := now.Add(-25 * time.Hour)
-	// Align to a clean hour boundary so they all fall in the same bucket
-	hourBucket := old25h.Truncate(time.Hour)
-	for i := 0; i < 12; i++ {
-		ts := hourBucket.Add(time.Duration(i) * 5 * time.Minute)
-		db.InsertMetric(storage.MetricRow{
-			Timestamp: ts, CPUPct: float64(20 + i), MemPct: 50, DiskFreeGB: 90,
-			NetSentBytes: 500, NetRecvBytes: 1500,
-			DiskIOPS: float64(100 + i*10), NetMBps: float64(1.0 + float64(i)*0.1), ConcurrentUsers: 2 + i%3,
-		})
+	before, err := db.CountMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != 7 {
+		t.Fatalf("before count = %d, want 7", before)
 	}
 
-	// 3 rows that are recent (< 24h) — should be UNTOUCHED
-	for i := 0; i < 3; i++ {
-		ts := now.Add(-time.Duration(i) * 10 * time.Minute)
-		db.InsertMetric(storage.MetricRow{
-			Timestamp: ts, CPUPct: 55, MemPct: 60, DiskFreeGB: 80,
-			NetSentBytes: 9000, NetRecvBytes: 8000,
-			DiskIOPS: 250, NetMBps: 3.5, ConcurrentUsers: 10,
-		})
-	}
-
-	beforeCount, _ := db.CountMetrics()
-	t.Logf("Before retention: %d metric rows", beforeCount)
-	if beforeCount != 20 {
-		t.Errorf("expected 20 rows before, got %d", beforeCount)
-	}
-
-	// --- Run retention ---
 	job := retention.New(db.Conn())
+	job.SetDataPath(tmp)
 	if err := job.Run(); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	afterCount, _ := db.CountMetrics()
-	t.Logf("After retention: %d metric rows", afterCount)
-
-	// Expected:
-	//   - 5 old-31d rows → deleted
-	//   - 12 old-25h rows in one hour bucket → collapsed to 1 average row
-	//   - 3 recent rows → untouched
-	// Total expected = 1 + 3 = 4
-	if afterCount != 4 {
-		t.Errorf("expected 4 rows after retention, got %d", afterCount)
-	}
-
-	// Verify the averaged row has a plausible CPU, DiskIOPS, NetMBps, and ConcurrentUsers value
-	rows, err := db.QueryMetrics(time.Unix(0, 0), "")
+	after, err := db.CountMetrics()
 	if err != nil {
-		t.Fatalf("QueryMetrics: %v", err)
+		t.Fatal(err)
 	}
-	var foundAvg bool
-	for _, r := range rows {
-		if r.Timestamp.Unix() == hourBucket.Unix() {
-			// This is our averaged row
-			foundAvg = true
-			if r.CPUPct < 20 || r.CPUPct > 32 {
-				t.Errorf("averaged CPUPct out of range: %v", r.CPUPct)
-			}
-			if r.DiskIOPS < 100 || r.DiskIOPS > 220 {
-				t.Errorf("averaged DiskIOPS out of range: %v", r.DiskIOPS)
-			}
-			if r.ConcurrentUsers < 1 || r.ConcurrentUsers > 5 {
-				t.Errorf("averaged ConcurrentUsers out of range: %v", r.ConcurrentUsers)
-			}
-			t.Logf("Averaged row: ts=%v cpu=%.2f iops=%.1f users=%d", r.Timestamp, r.CPUPct, r.DiskIOPS, r.ConcurrentUsers)
+	if after != before {
+		t.Fatalf("retention cycle changed row count %d -> %d; tenant/server rows must survive (V07 containment)", before, after)
+	}
+
+	rowsA, err := db.QueryMetrics(time.Unix(0, 0), "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowsB, err := db.QueryMetrics(time.Unix(0, 0), "tenant-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rowsA) != 6 || len(rowsB) != 1 {
+		t.Fatalf("tenant isolation lost: A=%d B=%d", len(rowsA), len(rowsB))
+	}
+	for _, r := range rowsA {
+		if r.TenantID != "tenant-a" || r.ServerID == "" {
+			t.Errorf("tenant-a row mutated: %+v", r)
 		}
 	}
-	if !foundAvg {
-		t.Errorf("expected to find an averaged row at hour bucket ts=%d; got rows: %v",
-			hourBucket.Unix(), func() []int64 {
-				var tss []int64
-				for _, r := range rows { tss = append(tss, r.Timestamp.Unix()) }
-				return tss
-			}())
+	if rowsB[0].CPUPct != 90 || rowsB[0].CPUCores != 8 {
+		t.Errorf("tenant-b row mutated: %+v", rowsB[0])
 	}
+
+	st := job.Status()
+	if st.DownsamplingEnabled || st.PurgeEnabled {
+		t.Errorf("containment flags: %+v", st)
+	}
+	if st.Reason == "" {
+		t.Error("missing retention-disabled reason")
+	}
+}
+
+func TestDiskBudgetExhaustionIsExplicit(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "budget.db")
+	db, err := storage.Open(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.InsertMetric(storage.MetricRow{
+		Timestamp: time.Now(), TenantID: "t", ServerID: "s", CPUPct: 1, MemPct: 1, DiskFreeGB: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	job := retention.New(db.Conn())
+	job.SetDataPath(tmp)
+	job.SetDiskBudget(1) // 1 byte; the SQLite file is larger
+	err = job.Run()
+	if !errors.Is(err, retention.ErrDiskPressure) {
+		t.Fatalf("Run error = %v, want ErrDiskPressure", err)
+	}
+	st := job.Status()
+	if !st.DiskPressure {
+		t.Fatal("Status.DiskPressure = false")
+	}
+	if st.DiskUsedBytes <= 1 {
+		t.Fatalf("DiskUsedBytes = %d, want file size > 1", st.DiskUsedBytes)
+	}
+
+	n, err := db.CountMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("disk pressure deleted rows: count=%d", n)
+	}
+	_ = os.Remove(tmp)
 }

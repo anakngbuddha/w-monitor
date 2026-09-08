@@ -130,7 +130,12 @@ W-Monitor enforces a strict credential hierarchy to prevent secrets from leaking
 | `WMONITOR_DB_DSN` | PostgreSQL connection string | `postgres://user:pass@host:5432/db?sslmode=require` |
 | `WMONITOR_MODE` | Server operating mode | `hub` |
 | `WMONITOR_PORT` | HTTP dashboard port | `8080` or `10000` |
-| `WMONITOR_API_KEY` | Hub default API key (optional) | `secure-random-32-char-key` |
+| `WMONITOR_API_KEY` | Hub default API key (optional) | Prefer `config.env` / env; never put this on the Windows service command line |
+| `WMONITOR_TRUSTED_PROXIES` | Reverse-proxy IPs or CIDRs allowed to set `X-Forwarded-Proto` | `10.0.0.0/8` (empty = never trust the header) |
+
+Remote PostgreSQL DSNs must include `sslmode=require`, `verify-ca`, or `verify-full`. Loopback hosts may use `sslmode=disable`. `-dsn` remains visible in the process list; use `WMONITOR_DB_DSN` or `-dsn-file` in production.
+
+Windows installer writes `%ProgramData%\wmonitor\config.env` with a SYSTEM + Administrators ACL. Linux installer writes `/etc/wmonitor/config.env` mode `600`. Both are loaded at process start; service arguments do not include `-api-key`, `-dsn`, or `-enroll-code`.
 
 #### Setting Environment Variables on Windows:
 ```powershell
@@ -183,19 +188,23 @@ The repository includes a [render.yaml](file:///c:/Users/markv/Desktop/w-monitor
 
 ## 4. Client Onboarding & API Key Management
 
-### The Organization API Key Model
+### Typed credentials (P1.03)
 
-Instead of generating individual keys per server machine, you create **one Organization API Key per client**. All servers within that client company share this single key.
+Do not treat client display names as identity. Each credential has a kind (`enroll`, `agent`, `read`, `admin`, `legacy`) and a scope (`enroll`, `ingest`, `read`, `admin`, `all`). Platform administration requires `kind=admin` **and** `scope=admin`. A legacy key with `scope=all` can still read/ingest **that tenant**; it cannot call `/api/admin/clients` or mint enrollment codes.
 
-- The plaintext key is shown **only once** upon generation.
-- Only the **SHA-256 hash** is saved in the database (`api_keys` table).
-- The Hub automatically allocates a unique `tenant_id` for that organization.
+- Dashboard login uses a `wmr_` **read** token (`-add-client`).
+- Agents receive a `wma_` **ingest** token bound to one `server_id` at enrollment. That token cannot write another server's rows.
+- First enrollment of a `server_id` needs only the handshake code. Replacement needs the current `wma_` token in `POST /api/enroll` (`current_token`) **or** platform-admin `POST /api/admin/agents/rotate`. A concurrent enroll for the same identity cannot create a second active token.
+- A lost enroll HTTP reply is recovered for 5 minutes (same code + `server_id` returns the same token, no extra use). After first ingest or TTL, recovery ends.
+- `WM-XXXX-XXXX-XXXX` enrollment codes are consumed only at `POST /api/enroll`. Presenting them as `X-API-Key` is rejected.
+- Only the SHA-256 hash is stored. Tokens are hashed as exact trimmed bytes; enrollment codes are normalized then hashed.
+- Duplicate `client_name` values never pick a tenant. Pass `tenant_id` when creating an enrollment code, or use unique names.
 
----
+Hub start does **not** auto-import `clients_registry.csv`. Use `-import-clients` explicitly; existing or revoked hashes are left unchanged. `WMONITOR_API_KEY` / `WMONITOR_ADMIN_TOKEN` are registered on first boot only when the hash is absent.
 
 ### Adding a New Client Organization
 
-Run the `-add-client` command pointing to your PostgreSQL database:
+Run the `-add-client` command pointing at the Hub database:
 
 ```powershell
 .\wmonitor.exe -db postgres -add-client "AcmeCorp"
@@ -203,14 +212,36 @@ Run the `-add-client` command pointing to your PostgreSQL database:
 
 **Output:**
 ```text
-Client:    AcmeCorp
-Tenant ID: t_a8f3b219c0de447192bc55ef812034aa
-API Key:   J8q7xKv9mP2LzY10aB+cdE4fGhIjKlMnOpQrStUvWxY=
+Client:     AcmeCorp
+Tenant ID:  t_a8f3b219c0de447192bc55ef812034aa
+Read Token (Dashboard): wmr_...
 
-Store this key now. Only its hash is saved, so it cannot be recovered later.
+Store this token now. Use it to log in to the central dashboard.
 ```
 
-Copy the generated **API Key** (`J8q7x...`). This key will be used for all AcmeCorp servers.
+Then issue an enrollment code for agents:
+
+```powershell
+.\wmonitor.exe -new-enroll-code "AcmeCorp" -ttl 72h -max-uses 25
+```
+
+### Opaque tenant migration (SQLite)
+
+If historical rows still use a raw API key as `tenant_id`:
+
+1. Stop the Hub.
+2. Copy/verify a restorable backup (the command also writes one).
+3. Run:
+
+```powershell
+.\wmonitor.exe -migrate-opaque-tenants -opaque-tenant-backup-dir C:\backup\wmonitor-opaque
+```
+
+```bash
+./wmonitor -migrate-opaque-tenants -opaque-tenant-backup-dir /var/backups/wmonitor-opaque
+```
+
+Rollback: keep the Hub stopped and replace the live SQLite file with the backup. Do not downgrade into a build that stores raw keys as tenant IDs or that auto-imports CSV. PostgreSQL remap is not included in P1.03 — snapshot PG yourself.
 
 ---
 
@@ -238,7 +269,28 @@ If an assessment is concluded or credentials need immediate invalidation:
 ```powershell
 .\wmonitor.exe -db postgres -revoke-client "AcmeCorp"
 ```
-*Hub instances update their authorization cache and reject all requests from revoked clients within 60 seconds.*
+*Hub instances reject revoked credentials immediately on the instance that performed the revoke. Other replicas refresh `auth_epoch` at least every 5 seconds (`AuthRevocationMaxDelay`); a warmed positive cache cannot outlive credential expiry.*
+
+Hub CLI exports (`-export-csv`, `-export-txt`, `-assessment-report`) require `-tenant t_<hex>` for hub data. Omitting `-tenant` reads only the standalone tenant `t_local`, never every customer.
+
+### Rotating a single agent token (operator approval)
+
+When the machine cannot prove the current token (lost credential file after the 5-minute handshake window):
+
+```powershell
+# Platform admin token in X-API-Key
+Invoke-RestMethod -Method POST -Uri "https://your-hub/api/admin/agents/rotate" `
+  -Headers @{ "X-API-Key" = $adminToken; "Content-Type" = "application/json" } `
+  -Body '{"server_id":"srv-app-01","tenant_id":"t_a8f3b219c0de447192bc55ef812034aa"}'
+```
+
+```bash
+curl -sS -X POST "https://your-hub/api/admin/agents/rotate" \
+  -H "X-API-Key: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"server_id":"srv-app-01","tenant_id":"t_a8f3b219c0de447192bc55ef812034aa"}'
+```
+
+The JSON response contains a new `wma_` token. Place it in the agent credential store. The previous token is revoked; replicas reject it within 5 seconds.
 
 ---
 
@@ -369,6 +421,42 @@ For Excel financial modeling, TCO calculators, and custom pivot tables:
 #### 4. Checking recent agent logs:
 - **Windows:** View Windows Event Viewer &rarr; *Application Logs* (Source: `wmonitor`) or run interactively `wmonitor -agent <hub-url> -api-key <key>`.
 - **Linux:** `journalctl -u wmonitor -f`
+
+---
+
+### Test isolation (do not run the suite on enrolled hosts)
+
+`go test` used to write and delete the live machine token (`%PROGRAMDATA%\wmonitor\token.dat` on Windows, `/etc/wmonitor/token.json` or `~/.local/share/sysmon/token.json` on Linux). That is V22.
+
+**Windows (PowerShell) and Linux:** always set isolation, or rely on CI which already does:
+
+```powershell
+$env:WMONITOR_TEST_ISOLATION = "1"
+go test ./agent ./storage ./internal/fsroot
+```
+
+```bash
+export WMONITOR_TEST_ISOLATION=1
+go test ./agent ./storage ./internal/fsroot
+```
+
+CI (`.github/workflows/ci.yml`) sets `WMONITOR_TEST_ISOLATION=1`, records `go version` / `go list -m all` / `go mod verify`, uses Go **1.26.6**, and pins `staticcheck@v0.6.1` and `govulncheck@v1.1.4` (not `@latest`). Module language version in `go.mod` remains `go 1.26.5`.
+
+### Retention containment (V07) — backup before any future enablement
+
+Hourly **downsampling and automatic 30-day purge are disabled** until P2.03. `/api/health` includes a `retention` object (`downsampling_enabled: false`). Disk growth is bounded by `WMONITOR_DISK_BUDGET_BYTES` (default 10 GiB); exhaustion is reported as an error, not silent deletion.
+
+**Before any future rollout that re-enables retention:**
+1. Verify a restorable backup of SQLite/PostgreSQL.
+2. If a live secret was ever exposed (CSV auto-import, logs, process list), rotate it with an authorized operator procedure. **W-Monitor does not rotate credentials automatically.** CSV is no longer auto-imported at Hub start (P1.03).
+3. Do not downgrade to a build that still calls `downsampleMetrics`.
+
+### Identity rollback (P1.03)
+
+Schema/identity changes are not a blind downgrade. After `-migrate-opaque-tenants`, restore the backup SQLite file written under `-opaque-tenant-backup-dir` rather than reintroducing plaintext tenant IDs. A revoked credential must stay revoked across restart and CSV drop.
+
+
+
 
 
 

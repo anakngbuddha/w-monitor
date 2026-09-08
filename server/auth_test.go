@@ -28,6 +28,8 @@ func hubFixture(t *testing.T) (*server.Server, *storage.DB, string) {
 		KeyHash:    storage.HashAPIKey(plaintext),
 		TenantID:   "t_registered",
 		ClientName: "RegisteredClient",
+		Kind:       storage.KindLegacy,
+		Scope:      storage.ScopeAll,
 	}); err != nil {
 		t.Fatalf("UpsertAPIKey: %v", err)
 	}
@@ -164,8 +166,8 @@ func TestTenantIsolation(t *testing.T) {
 
 	const keyA = "key-alpha"
 	const keyB = "key-beta"
-	db.UpsertAPIKey(storage.APIKeyRecord{KeyHash: storage.HashAPIKey(keyA), TenantID: "t_alpha", ClientName: "Alpha"})
-	db.UpsertAPIKey(storage.APIKeyRecord{KeyHash: storage.HashAPIKey(keyB), TenantID: "t_beta", ClientName: "Beta"})
+	db.UpsertAPIKey(storage.APIKeyRecord{KeyHash: storage.HashAPIKey(keyA), TenantID: "t_alpha", ClientName: "Alpha", Kind: storage.KindLegacy, Scope: storage.ScopeAll})
+	db.UpsertAPIKey(storage.APIKeyRecord{KeyHash: storage.HashAPIKey(keyB), TenantID: "t_beta", ClientName: "Beta", Kind: storage.KindLegacy, Scope: storage.ScopeAll})
 
 	srv := server.New(db, "0")
 	srv.EnableHubMode(db)

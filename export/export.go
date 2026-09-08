@@ -22,14 +22,14 @@ type Summary struct {
 	RowCount         int
 	FleetServerCount int // number of distinct servers contributing data (≥1)
 
-	AvgCPU        float64
-	PeakCPU       float64
-	AvgMem        float64
-	PeakMem       float64
-	MinDiskFreeGB float64
-	CPUCores      int
-	MemTotalGB    float64
-	DiskTotalGB   float64
+	AvgCPU            float64
+	PeakCPU           float64
+	AvgMem            float64
+	PeakMem           float64
+	MinDiskFreeGB     float64
+	CPUCores          int
+	MemTotalGB        float64
+	DiskTotalGB       float64
 	TotalNetSentBytes uint64
 	TotalNetRecvBytes uint64
 
@@ -285,16 +285,16 @@ func AggregateFleetSummary(servers []ServerSummary, period string) Summary {
 
 	for _, sv := range servers {
 		s := sv.Summary
-		fleet.RowCount    += s.RowCount
-		fleet.CPUCores    += s.CPUCores
-		fleet.MemTotalGB  += s.MemTotalGB
+		fleet.RowCount += s.RowCount
+		fleet.CPUCores += s.CPUCores
+		fleet.MemTotalGB += s.MemTotalGB
 		fleet.DiskTotalGB += s.DiskTotalGB
 
 		// Absolute peak & average resource usage per server
-		fleetPeakCPUCores   += (s.PeakCPU / 100.0) * float64(s.CPUCores)
-		fleetAvgCPUCores    += (s.AvgCPU / 100.0) * float64(s.CPUCores)
-		fleetPeakUsedRAMGB  += (s.PeakMem / 100.0) * s.MemTotalGB
-		fleetAvgUsedRAMGB   += (s.AvgMem / 100.0) * s.MemTotalGB
+		fleetPeakCPUCores += (s.PeakCPU / 100.0) * float64(s.CPUCores)
+		fleetAvgCPUCores += (s.AvgCPU / 100.0) * float64(s.CPUCores)
+		fleetPeakUsedRAMGB += (s.PeakMem / 100.0) * s.MemTotalGB
+		fleetAvgUsedRAMGB += (s.AvgMem / 100.0) * s.MemTotalGB
 		peakUsed := s.DiskTotalGB - s.MinDiskFreeGB
 		if peakUsed < 0 {
 			peakUsed = 0
@@ -305,12 +305,12 @@ func AggregateFleetSummary(servers []ServerSummary, period string) Summary {
 		fleet.MinDiskFreeGB += s.MinDiskFreeGB
 
 		// IOPS and Net BW: servers run concurrently, so sum
-		fleet.MinDiskIOPS  += s.MinDiskIOPS
-		fleet.AvgDiskIOPS  += s.AvgDiskIOPS
+		fleet.MinDiskIOPS += s.MinDiskIOPS
+		fleet.AvgDiskIOPS += s.AvgDiskIOPS
 		fleet.PeakDiskIOPS += s.PeakDiskIOPS
 
-		fleet.MinNetMBps  += s.MinNetMBps
-		fleet.AvgNetMBps  += s.AvgNetMBps
+		fleet.MinNetMBps += s.MinNetMBps
+		fleet.AvgNetMBps += s.AvgNetMBps
 		fleet.PeakNetMBps += s.PeakNetMBps
 
 		// Net traffic totals: additive
@@ -326,11 +326,11 @@ func AggregateFleetSummary(servers []ServerSummary, period string) Summary {
 	// Re-express CPU/Mem as % of total fleet capacity for display purposes
 	if fleet.CPUCores > 0 {
 		fleet.PeakCPU = fleetPeakCPUCores / float64(fleet.CPUCores) * 100.0
-		fleet.AvgCPU  = fleetAvgCPUCores / float64(fleet.CPUCores) * 100.0
+		fleet.AvgCPU = fleetAvgCPUCores / float64(fleet.CPUCores) * 100.0
 	}
 	if fleet.MemTotalGB > 0 {
 		fleet.PeakMem = fleetPeakUsedRAMGB / fleet.MemTotalGB * 100.0
-		fleet.AvgMem  = fleetAvgUsedRAMGB / fleet.MemTotalGB * 100.0
+		fleet.AvgMem = fleetAvgUsedRAMGB / fleet.MemTotalGB * 100.0
 	}
 
 	// Spec suggestions use the summed absolute peaks — correct for fleet sizing
@@ -350,16 +350,49 @@ func ComputeSummary(rows []storage.MetricRow, period string) Summary {
 	return AggregateFleetSummary(perServer, period)
 }
 
-// WriteCSV writes a CSV summary of metrics with a header block to the provided writer.
-// Pass tenantID="" to include all tenants (admin/CLI use); non-empty filters to one tenant.
+// SpreadsheetSafeCell prefixes formula-like values so Excel/Sheets will not
+// execute them. Lossless machine export must not use this function.
+func SpreadsheetSafeCell(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r', '\n':
+		return "'" + s
+	}
+	return s
+}
+
+// WriteCSV writes a spreadsheet-safe CSV summary (human/Excel deliverable).
+// Server ID and hostname cells that look like formulas are prefixed with `'`.
+// Pass tenantID explicitly; empty is never a global customer export.
 func WriteCSV(w io.Writer, db storage.Store, since time.Time, tenantID string) (int, error) {
+	return writeCSV(w, db, since, tenantID, true)
+}
+
+// WriteCSVLossless writes untransformed field values for machine consumers.
+// Formula-like names are NOT neutralized; do not open this file in a spreadsheet.
+func WriteCSVLossless(w io.Writer, db storage.Store, since time.Time, tenantID string) (int, error) {
+	return writeCSV(w, db, since, tenantID, false)
+}
+
+func writeCSV(w io.Writer, db storage.Store, since time.Time, tenantID string, spreadsheetSafe bool) (int, error) {
+	if err := storage.RequireTenant(tenantID); err != nil {
+		return 0, err
+	}
 	rows, err := db.QueryMetrics(since, tenantID)
 	if err != nil {
 		return 0, fmt.Errorf("query metrics: %w", err)
 	}
 
 	cw := csv.NewWriter(w)
-	defer cw.Flush()
+
+	cell := func(s string) string {
+		if spreadsheetSafe {
+			return SpreadsheetSafeCell(s)
+		}
+		return s
+	}
 
 	period := fmt.Sprintf("%s to %s", since.UTC().Format("2006-01-02 15:04"), time.Now().UTC().Format("2006-01-02 15:04"))
 	s := ComputeSummary(rows, period)
@@ -369,7 +402,6 @@ func WriteCSV(w io.Writer, db storage.Store, since time.Time, tenantID string) (
 		fleetLabel = fmt.Sprintf("Fleet (%d servers)", s.FleetServerCount)
 	}
 
-	// Summary Block
 	if err := cw.WriteAll([][]string{
 		{"App", "W-Monitor System Report"},
 		{"Period", s.Period},
@@ -394,19 +426,17 @@ func WriteCSV(w io.Writer, db storage.Store, since time.Time, tenantID string) (
 		return 0, err
 	}
 
-	// Header
 	if err := cw.Write([]string{
 		"Date/Time (UTC)", "Server ID", "Hostname", "CPU %", "Memory %", "Disk Free GB", "Net Sent MB", "Net Recv MB", "vCPUs", "Total RAM GB", "Total Disk GB", "Disk IOPS", "Net MB/s", "Concurrent Users",
 	}); err != nil {
 		return 0, err
 	}
 
-	// Data rows
 	for _, r := range rows {
 		if err := cw.Write([]string{
 			r.Timestamp.UTC().Format("2006-01-02 15:04:05"),
-			r.ServerID,
-			r.Hostname,
+			cell(r.ServerID),
+			cell(r.Hostname),
 			fmt.Sprintf("%.2f", r.CPUPct),
 			fmt.Sprintf("%.2f", r.MemPct),
 			fmt.Sprintf("%.2f", r.DiskFreeGB),
@@ -423,11 +453,15 @@ func WriteCSV(w io.Writer, db storage.Store, since time.Time, tenantID string) (
 		}
 	}
 
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		return 0, fmt.Errorf("csv flush: %w", err)
+	}
 	return len(rows), nil
 }
 
 // CSVReport writes a CSV summary of metrics within the given time range to outPath.
-func CSVReport(db storage.Store, since time.Time, outPath string) (int, error) {
+func CSVReport(db storage.Store, since time.Time, outPath, tenantID string) (int, error) {
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 		return 0, fmt.Errorf("mkdir: %w", err)
 	}
@@ -438,12 +472,15 @@ func CSVReport(db storage.Store, since time.Time, outPath string) (int, error) {
 	}
 	defer f.Close()
 
-	return WriteCSV(f, db, since, "")
+	return WriteCSV(f, db, since, tenantID)
 }
 
 // TextReport writes a human-readable plain-text summary report.
-func TextReport(db storage.Store, since time.Time, outPath string) (Summary, error) {
-	rows, err := db.QueryMetrics(since, "")
+func TextReport(db storage.Store, since time.Time, outPath, tenantID string) (Summary, error) {
+	if err := storage.RequireTenant(tenantID); err != nil {
+		return Summary{}, err
+	}
+	rows, err := db.QueryMetrics(since, tenantID)
 	if err != nil {
 		return Summary{}, fmt.Errorf("query metrics: %w", err)
 	}

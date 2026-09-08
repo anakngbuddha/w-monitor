@@ -76,8 +76,10 @@ $exeName    = "wmonitor.exe"
 $sourceExe  = Join-Path $PSScriptRoot $exeName
 $targetExe  = Join-Path $installDir $exeName
 
-# Config file under %LOCALAPPDATA%\Sysmon (same as DataDir())
-$configDir  = Join-Path $env:LOCALAPPDATA "Sysmon"
+# Config file under %ProgramData%\wmonitor so the SYSTEM service can read it
+# (the installing user's LOCALAPPDATA is not the service identity).
+$configDir  = Join-Path $env:PROGRAMDATA "wmonitor"
+if (-not $configDir) { $configDir = "C:\ProgramData\wmonitor" }
 $configFile = Join-Path $configDir "config.env"
 
 if (-not (Test-Path $sourceExe)) {
@@ -142,18 +144,14 @@ if ($Mode -eq "hub" -and $Db -eq "postgres") {
 
 $configLines | Set-Content -Path $configFile -Encoding UTF8
 
-# Lock: only SYSTEM and current user can read (no other users)
+# Lock: SYSTEM + Administrators only (standard users cannot read secrets)
 Write-Host "Locking config file permissions..."
-icacls $configFile /inheritance:r /grant:r "SYSTEM:(R)" /grant:r "${env:USERNAME}:(R)" | Out-Null
+icacls $configFile /inheritance:r /grant:r "SYSTEM:(R)" /grant:r "Administrators:(R)" | Out-Null
 
-# 7. Determine service arguments from mode
+# 7. Determine service arguments from mode — never put secrets on the command line
 $serviceArgs = @("-port", "8080")
 if ($Mode -eq "agent") {
     $serviceArgs += @("-agent", $HubUrl)
-    # Legacy: only pass -api-key when explicitly provided (enrollment-code binaries don't need it)
-    if ($ApiKey -ne "") {
-        $serviceArgs += @("-api-key", $ApiKey)
-    }
 } else {
     # hub mode
     $serviceArgs += @("-hub")

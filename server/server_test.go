@@ -130,6 +130,13 @@ func TestHealthReportsStatusAndFreshness(t *testing.T) {
 	if body["status"] != "ok" {
 		t.Errorf("status = %v, want ok", body["status"])
 	}
+	ret, ok := body["retention"].(map[string]interface{})
+	if !ok {
+		t.Fatal("health response missing retention object")
+	}
+	if ret["downsampling_enabled"] != false {
+		t.Errorf("downsampling_enabled = %v, want false", ret["downsampling_enabled"])
+	}
 	if _, ok := body["last_metric_age_seconds"]; !ok {
 		t.Error("health response is missing last_metric_age_seconds")
 	}

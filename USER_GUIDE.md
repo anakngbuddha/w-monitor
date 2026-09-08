@@ -123,6 +123,7 @@ On your Hub machine, run these commands (the hub doesn't need to be running for 
 .\wmonitor.exe -new-enroll-code "AcmeCorp" -ttl 72h -max-uses 25
 # Output: WM-XXXX-XXXX-XXXX  -- use this in Step 2B below
 ```
+The enrollment code is a handshake secret only. It cannot be sent as `X-API-Key` to `/api/ingest` or dashboard routes. Duplicate client display names are rejected; pass a unique name or create the code with an explicit tenant after listing clients.
 
 **D. Build a client binary with the enrollment code baked in:**
 ```powershell
@@ -157,6 +158,8 @@ Run in **PowerShell as Administrator**:
 3. On first start, the agent calls `POST /api/enroll` with the baked enrollment code.
 4. The Hub returns a scoped `wma_` ingest token, saved to `%ProgramData%\wmonitor\token.dat` (DPAPI-encrypted, SYSTEM + Administrators only).
 5. Subsequent runs load the token from the credential store — no re-enrollment needed.
+6. Replacing a machine token requires proving the current token (`current_token` in the enroll JSON) or an operator `POST /api/admin/agents/rotate`. A lost first reply is recovered automatically for five minutes.
+7. Production agents require an `https://` hub URL (loopback HTTP is allowed only for local tests). Changing the hub URL does **not** send the old token or the old spool backlog; re-enroll at the new hub.
 
 #### B. Interactive Foreground Run (Testing Only)
 If you want to test without installing a service:
@@ -188,6 +191,7 @@ sudo ./install.sh --mode agent --hub-url https://wmonitor-hub.onrender.com
 3. On first start, the agent calls `POST /api/enroll` with the baked enrollment code.
 4. The Hub returns a scoped `wma_` ingest token, saved to `/etc/wmonitor/token.json` (`0600`, root-only).
 5. Subsequent runs load the token from the credential file -- no re-enrollment needed.
+6. Replacing a machine token requires `current_token` or operator `POST /api/admin/agents/rotate`. A lost first reply is recovered for five minutes.
 
 #### B. Interactive Foreground Run (Testing Only)
 ```bash
@@ -258,7 +262,7 @@ Generates an interactive HTML report complete with resource percentiles, IOPS di
 ```
 
 ### 2. Granular CSV Metrics Export
-Generates a raw data dump for custom financial modeling, TCO calculators, and Excel pivot tables:
+Generates a CSV dump for TCO calculators and Excel pivot tables. **`-export-csv` is spreadsheet-safe:** Server ID and hostname values that begin with `=`, `+`, `-`, `@`, tab, or CR/LF are prefixed with `'` so spreadsheet apps treat them as text. Lossless (unprefixed) export is `export.WriteCSVLossless` for machine consumers only — do not open that file in Excel.
 
 ```powershell
 .\wmonitor.exe -db postgres -dsn "YOUR_POSTGRES_DSN" -export-csv AcmeCorp_Metrics_Dump.csv -since 720h
@@ -353,13 +357,25 @@ W-Monitor enforces a strict configuration precedence:
 | `-app-port <p>` | `WMONITOR_APP_PORT` | `""` | Ports to monitor for concurrent active users (e.g. `80,443,3000`) |
 | `-external-iface`| `WMONITOR_EXTERNAL_IFACE`| `""` | Override network interface for cloud egress tracking |
 | `-assessment-report`| — | `""` | Generate HTML cloud assessment report and exit |
-| `-export-csv` | — | `""` | Export raw metric rows to CSV and exit |
+| `-export-csv` | — | `""` | Export spreadsheet-safe CSV (formula-prefixed names) and exit |
+| `-tenant <id>` | — | `t_local` | Tenant scope for `-export-csv`, `-export-txt`, and `-assessment-report`. Empty is never a global read. Hub operators must pass the client `t_<hex>` id. |
 | `-since <dur>` | — | `720h` (30d) | Time window for assessment & export reports |
-| `-add-client <name>`| — | `""` | Generate Organization API Key for a new client (Hub only) |
+| `-add-client <name>`| — | `""` | Generate a dashboard **read** token and opaque `t_<hex>` tenant for a new unique client name (Hub only). Duplicate names are refused. |
 | `-list-clients` | — | `false` | Audit all registered clients and activity timestamps |
 | `-revoke-client` | — | `""` | Revoke all API keys for a client organization |
-| `-print-config` | — | `false` | Print resolved runtime config (secrets masked) and exit |
-| `-show-key` | — | `false` | Display configured API key and exit |
+| `-import-clients <csv>` | — | `""` | Explicit CSV import of client keys. Skips hashes that already exist (including revoked). Does **not** run at Hub start. |
+| `-new-enroll-code <name>` | — | `""` | Issue a handshake-only enrollment code. Ambiguous display names fail. First `POST /api/enroll` for a new `server_id` consumes one use. Replacement needs `current_token` or operator rotate. |
+| `-new-admin-token` | — | `false` | Issue a platform admin token (`wmk_`, `kind=admin`, `scope=admin`). |
+| `-migrate-opaque-tenants` | — | `false` | SQLite-only: remap plaintext `tenant_id` values to `t_<hex>` after writing a backup. |
+| `-opaque-tenant-backup-dir` | — | `""` | Required backup directory for `-migrate-opaque-tenants`. |
+| `-print-config` | — | `false` | Print resolved runtime config. Secrets are shown as `(set)` / `(not set)`, never as a prefix of the value. |
+| `-show-key` | — | `false` | Display configured API key and exit (operator console only; not written to the service log). |
+| — | `WMONITOR_CREDENTIAL_DIR` | OS default (`%PROGRAMDATA%\wmonitor` on Windows; `/etc/wmonitor` as root or `~/.local/share/sysmon` otherwise) | Directory that stores the machine enrollment token. Used by tests and disposable runners so production token files are never overwritten. |
+| — | `WMONITOR_DATA_DIR` | OS default (`%LOCALAPPDATA%\sysmon` / `~/.local/share/sysmon`) | Data directory for spool, `agent_id`, and local SQLite. |
+| — | `WMONITOR_DISK_BUDGET_BYTES` | `10737418240` (10 GiB) | Maximum size of the SQLite data file. When exceeded, retention reports disk pressure and does not delete or downsample rows. `0` disables the check. |
+| — | `WMONITOR_TRUSTED_PROXIES` | `""` | Comma-separated proxy IPs or CIDRs. Only these peers may set `X-Forwarded-Proto` for HTTPS detection. Empty means the header is never trusted. |
+
+Precedence for credential/data directories: in-process test override (`SetCredentialDir` / `SetDataDir`) > environment variable > OS default. There is no CLI flag for these paths.
 
 ---
 

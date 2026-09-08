@@ -125,8 +125,9 @@ CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
 	return nil
 }
 
-// InsertMetric writes one metrics row.
+// InsertMetric writes one metrics row. Empty TenantID becomes LocalTenantID.
 func (pg *PostgresDB) InsertMetric(m MetricRow) error {
+	m.TenantID = normalizeInsertTenant(m.TenantID)
 	_, err := pg.pool.Exec(context.Background(),
 		`INSERT INTO metrics(timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
@@ -141,8 +142,9 @@ func (pg *PostgresDB) InsertMetric(m MetricRow) error {
 	return err
 }
 
-// InsertProcess writes one process row.
+// InsertProcess writes one process row. Empty TenantID becomes LocalTenantID.
 func (pg *PostgresDB) InsertProcess(p ProcessRow) error {
+	p.TenantID = normalizeInsertTenant(p.TenantID)
 	_, err := pg.pool.Exec(context.Background(),
 		`INSERT INTO processes(timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
@@ -151,21 +153,45 @@ func (pg *PostgresDB) InsertProcess(p ProcessRow) error {
 	return err
 }
 
-// QueryMetrics returns rows within the given time window, oldest first.
-// If tenantID is non-empty, only rows with that tenant_id are returned.
 func (pg *PostgresDB) QueryMetrics(since time.Time, tenantID string) ([]MetricRow, error) {
-	var query string
-	var args []interface{}
-	if tenantID != "" {
-		query = `SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
-		 FROM metrics WHERE timestamp >= $1 AND tenant_id = $2 ORDER BY timestamp ASC`
-		args = []interface{}{since.Unix(), tenantID}
-	} else {
-		query = `SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
-		 FROM metrics WHERE timestamp >= $1 ORDER BY timestamp ASC`
-		args = []interface{}{since.Unix()}
+	return pg.QueryMetricsQ(MetricQuery{Since: since, TenantID: tenantID})
+}
+
+func (pg *PostgresDB) QueryMetricsAllTenants(ctx context.Context, since time.Time, limit int) ([]MetricRow, error) {
+	return pg.queryMetrics(queryContext(ctx), since, time.Time{}, "", "", queryLimit(limit), true)
+}
+
+func (pg *PostgresDB) QueryMetricsQ(q MetricQuery) ([]MetricRow, error) {
+	if err := RequireTenant(q.TenantID); err != nil {
+		return nil, err
 	}
-	rows, err := pg.pool.Query(context.Background(), query, args...)
+	return pg.queryMetrics(queryContext(q.Ctx), q.Since, q.Until, q.TenantID, q.ServerID, queryLimit(q.Limit), false)
+}
+
+func (pg *PostgresDB) queryMetrics(ctx context.Context, since, until time.Time, tenantID, serverID string, limit int, allTenants bool) ([]MetricRow, error) {
+	query := `SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
+		 FROM metrics WHERE timestamp >= $1`
+	args := []interface{}{since.Unix()}
+	n := 2
+	if !until.IsZero() {
+		query += fmt.Sprintf(` AND timestamp <= $%d`, n)
+		args = append(args, until.Unix())
+		n++
+	}
+	if !allTenants {
+		query += fmt.Sprintf(` AND tenant_id = $%d`, n)
+		args = append(args, tenantID)
+		n++
+	}
+	if serverID != "" {
+		query += fmt.Sprintf(` AND server_id = $%d`, n)
+		args = append(args, serverID)
+		n++
+	}
+	query += fmt.Sprintf(` ORDER BY timestamp ASC LIMIT $%d`, n)
+	args = append(args, limit)
+
+	rows, err := pg.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -202,21 +228,15 @@ func (pg *PostgresDB) QueryMetrics(since time.Time, tenantID string) ([]MetricRo
 	return result, rows.Err()
 }
 
-// QueryProcesses returns process rows within the given time window.
-// If tenantID is non-empty, only rows with that tenant_id are returned.
 func (pg *PostgresDB) QueryProcesses(since time.Time, tenantID string) ([]ProcessRow, error) {
-	var query string
-	var args []interface{}
-	if tenantID != "" {
-		query = `SELECT id, timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb
-		 FROM processes WHERE timestamp >= $1 AND tenant_id = $2 ORDER BY timestamp ASC`
-		args = []interface{}{since.Unix(), tenantID}
-	} else {
-		query = `SELECT id, timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb
-		 FROM processes WHERE timestamp >= $1 ORDER BY timestamp ASC`
-		args = []interface{}{since.Unix()}
+	if err := RequireTenant(tenantID); err != nil {
+		return nil, err
 	}
-	rows, err := pg.pool.Query(context.Background(), query, args...)
+	rows, err := pg.pool.Query(context.Background(),
+		`SELECT id, timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb
+		 FROM processes WHERE timestamp >= $1 AND tenant_id = $2 ORDER BY timestamp ASC LIMIT $3`,
+		since.Unix(), tenantID, DefaultQueryLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -252,15 +272,13 @@ func (pg *PostgresDB) CountProcesses() (int, error) {
 // QueryServers returns distinct server_id values seen in the metrics table.
 // If tenantID is non-empty, only servers for that tenant are returned.
 func (pg *PostgresDB) QueryServers(tenantID string) ([]string, error) {
-	var query string
-	var args []interface{}
-	if tenantID != "" {
-		query = "SELECT DISTINCT server_id FROM metrics WHERE server_id != '' AND tenant_id = $1 ORDER BY server_id"
-		args = []interface{}{tenantID}
-	} else {
-		query = "SELECT DISTINCT server_id FROM metrics WHERE server_id != '' ORDER BY server_id"
+	if err := RequireTenant(tenantID); err != nil {
+		return nil, err
 	}
-	rows, err := pg.pool.Query(context.Background(), query, args...)
+	rows, err := pg.pool.Query(context.Background(),
+		"SELECT DISTINCT server_id FROM metrics WHERE server_id != '' AND tenant_id = $1 ORDER BY server_id",
+		tenantID,
+	)
 	if err != nil {
 		return nil, err
 	}

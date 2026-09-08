@@ -154,10 +154,10 @@ func TestEnrollIdempotentRotation(t *testing.T) {
 	db.UpsertAPIKey(storage.APIKeyRecord{
 		TenantID:   "t_rotate_test",
 		ClientName: "RotateClient",
-		KeyHash:    storage.HashAPIKey(code),
+		KeyHash:    storage.HashEnrollCode(code),
 		KeyPrefix:  "wme_",
 		Kind:       storage.KindEnroll,
-		Scope:      storage.ScopeIngest,
+		Scope:      storage.ScopeEnroll,
 		MaxUses:    5,
 		ExpiresAt:  time.Now().Add(24 * time.Hour),
 	})
@@ -168,34 +168,55 @@ func TestEnrollIdempotentRotation(t *testing.T) {
 		"hostname":    "host1",
 	})
 
-	// Run 1: first token issued
 	rec1 := do(srv, "POST", "/api/enroll", "", enrollPayload)
 	if rec1.Code != http.StatusCreated {
-		t.Fatalf("enroll 1 failed: %d", rec1.Code)
+		t.Fatalf("enroll 1 failed: %d %s", rec1.Code, rec1.Body.String())
 	}
 	var resp1 struct{ Token string }
 	json.Unmarshal(rec1.Body.Bytes(), &resp1)
 
-	// Run 2: re-enroll with same server_id rotates old token
-	rec2 := do(srv, "POST", "/api/enroll", "", enrollPayload)
+	// Lost reply: same code+server recovers the same token and does not rotate.
+	recLost := do(srv, "POST", "/api/enroll", "", enrollPayload)
+	if recLost.Code != http.StatusCreated {
+		t.Fatalf("lost-reply enroll failed: %d %s", recLost.Code, recLost.Body.String())
+	}
+	var respLost struct{ Token string }
+	json.Unmarshal(recLost.Body.Bytes(), &respLost)
+	if respLost.Token != resp1.Token {
+		t.Errorf("lost reply issued a new token")
+	}
+
+	if err := db.ExpireEnrollmentHandshakes(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without proof, replacement is refused.
+	recDenied := do(srv, "POST", "/api/enroll", "", enrollPayload)
+	if recDenied.Code != http.StatusConflict {
+		t.Fatalf("unenforced rotation: got %d, want 409", recDenied.Code)
+	}
+
+	rotatePayload, _ := json.Marshal(map[string]string{
+		"enroll_code":   code,
+		"server_id":     "srv-unique-01",
+		"hostname":      "host1",
+		"current_token": resp1.Token,
+	})
+	rec2 := do(srv, "POST", "/api/enroll", "", rotatePayload)
 	if rec2.Code != http.StatusCreated {
-		t.Fatalf("enroll 2 failed: %d", rec2.Code)
+		t.Fatalf("enroll with proof failed: %d %s", rec2.Code, rec2.Body.String())
 	}
 	var resp2 struct{ Token string }
 	json.Unmarshal(rec2.Body.Bytes(), &resp2)
-
 	if resp1.Token == resp2.Token {
-		t.Errorf("re-enrollment returned identical token, expected new rotated token")
+		t.Errorf("rotation returned identical token")
 	}
 
-	// Old token should be revoked (returns 401)
 	metricBody, _ := json.Marshal(storage.MetricRow{ServerID: "srv-unique-01", Timestamp: time.Now()})
 	checkOld := do(srv, "POST", "/api/ingest?type=metric", resp1.Token, metricBody)
 	if checkOld.Code != http.StatusUnauthorized {
 		t.Errorf("old token still accepted after rotation: got %d, want 401", checkOld.Code)
 	}
-
-	// New token works
 	checkNew := do(srv, "POST", "/api/ingest?type=metric", resp2.Token, metricBody)
 	if checkNew.Code != http.StatusAccepted {
 		t.Errorf("new token rejected: got %d, want 202", checkNew.Code)
@@ -219,6 +240,7 @@ func TestSessionLoginAndCookieAuth(t *testing.T) {
 	loginBody, _ := json.Marshal(map[string]string{"read_token": readToken})
 	loginReq := httptest.NewRequest("POST", "/api/session", bytes.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
+	loginReq.Header.Set("Origin", "http://example.com")
 	loginW := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(loginW, loginReq)
 
@@ -240,6 +262,15 @@ func TestSessionLoginAndCookieAuth(t *testing.T) {
 	if !sessionCookie.HttpOnly {
 		t.Errorf("cookie is not HttpOnly")
 	}
+	if sessionCookie.Value == readToken {
+		t.Fatal("session cookie must be opaque, not the raw token")
+	}
+	if !strings.HasPrefix(sessionCookie.Value, "wms_") {
+		t.Fatalf("session id prefix: %s", sessionCookie.Value)
+	}
+	if sessionCookie.SameSite != http.SameSiteStrictMode {
+		t.Errorf("SameSite = %v, want Strict", sessionCookie.SameSite)
+	}
 
 	// Authenticate request using session cookie
 	req := httptest.NewRequest("GET", "/api/metrics", nil)
@@ -251,8 +282,11 @@ func TestSessionLoginAndCookieAuth(t *testing.T) {
 		t.Errorf("session cookie GET /api/metrics failed: code %d, body %s", w.Code, w.Body.String())
 	}
 
-	// Logout
+	// Logout without the cookie must still clear the browser cookie, but
+	// logout with the cookie must revoke the server session.
 	logoutReq := httptest.NewRequest("DELETE", "/api/session", nil)
+	logoutReq.Header.Set("Origin", "http://example.com")
+	logoutReq.AddCookie(sessionCookie)
 	logoutW := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(logoutW, logoutReq)
 
@@ -262,5 +296,13 @@ func TestSessionLoginAndCookieAuth(t *testing.T) {
 	logoutCookies := logoutW.Result().Cookies()
 	if len(logoutCookies) == 0 || logoutCookies[0].MaxAge != -1 {
 		t.Errorf("logout did not clear cookie")
+	}
+
+	again := httptest.NewRequest("GET", "/api/metrics", nil)
+	again.AddCookie(sessionCookie)
+	againW := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(againW, again)
+	if againW.Code != http.StatusUnauthorized {
+		t.Errorf("revoked session still authorized: %d", againW.Code)
 	}
 }

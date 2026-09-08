@@ -258,6 +258,7 @@ func (c *Collector) collect() error {
 	// Write metric row
 	metric := storage.MetricRow{
 		Timestamp:       now,
+		TenantID:        storage.LocalTenantID,
 		ServerID:        c.serverID,
 		Hostname:        c.hostname,
 		CPUPct:          cpuPct,

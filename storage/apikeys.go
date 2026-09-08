@@ -17,6 +17,15 @@ import (
 // ErrAPIKeyNotFound is returned when a presented key is unknown, expired, or revoked.
 var ErrAPIKeyNotFound = errors.New("storage: api key not found")
 
+// ErrAPIKeyRevoked is returned by LookupAPIKey when the row exists but is revoked.
+var ErrAPIKeyRevoked = errors.New("storage: api key revoked")
+
+// ErrMissingCredentialFields is returned when UpsertAPIKey is given an empty kind or scope.
+var ErrMissingCredentialFields = errors.New("storage: api key record needs Kind and Scope")
+
+// ErrAmbiguousClientName is returned when a display name maps to more than one tenant.
+var ErrAmbiguousClientName = errors.New("storage: client display name is ambiguous")
+
 const (
 	KindEnroll = "enroll"
 	KindAgent  = "agent"
@@ -28,6 +37,7 @@ const (
 	ScopeRead   = "read"
 	ScopeAdmin  = "admin"
 	ScopeAll    = "all"
+	ScopeEnroll = "enroll" // handshake-only; never a general-route permission
 
 	PrefixAgent  = "wma_"
 	PrefixRead   = "wmr_"
@@ -61,17 +71,18 @@ type APIKeyRecord struct {
 // crockfordAlphabet avoids visually ambiguous characters: I, L, O, U.
 const crockfordAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
-// HashAPIKey returns the hex-encoded SHA-256 of a plaintext API key.
+// HashAPIKey returns the hex-encoded SHA-256 of a presented opaque token.
 //
-// Lookups are performed on this hash, so comparison is a fixed-length equality
-// test on a digest rather than on secret material.
+// Tokens are hashed as trimmed exact bytes. Enrollment-code formatting must
+// go through HashEnrollCode; this function must not uppercase or strip wma_/wmr_/wmk_ tokens.
 func HashAPIKey(key string) string {
-	normalized := strings.TrimSpace(key)
-	if strings.HasPrefix(strings.ToUpper(normalized), "WM-") || (strings.HasPrefix(strings.ToUpper(normalized), "WM") && len(normalized) >= 12) {
-		normalized = NormalizeEnrollCode(normalized)
-	}
-	sum := sha256.Sum256([]byte(normalized))
+	sum := sha256.Sum256([]byte(strings.TrimSpace(key)))
 	return hex.EncodeToString(sum[:])
+}
+
+// HashEnrollCode hashes a human enrollment code after hyphen/case normalization.
+func HashEnrollCode(code string) string {
+	return HashAPIKey(NormalizeEnrollCode(code))
 }
 
 // GenerateToken creates a high-entropy URL-safe token with a recognizable prefix.
@@ -257,7 +268,7 @@ func migrateSQLiteAPIKeys(conn *sql.DB) error {
 	}
 	_, _ = conn.Exec("CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id)")
 	_, _ = conn.Exec("CREATE INDEX IF NOT EXISTS idx_api_keys_server ON api_keys(tenant_id, server_id)")
-	return nil
+	return ensureEnrollmentAuxSQLite(conn)
 }
 
 // ── SQLite implementation ──
@@ -294,18 +305,56 @@ func (db *DB) ResolveAPIKey(keyHash string) (APIKeyRecord, error) {
 	if err != nil {
 		return APIKeyRecord{}, err
 	}
-	if revokedAt != 0 {
+	rec.ExpiresAt = time.Unix(expiresAt, 0)
+	rec.CreatedAt = time.Unix(createdAt, 0)
+	rec.LastSeenAt = time.Unix(lastSeen, 0)
+	rec.Revoked = revokedAt != 0
+	if rec.Kind == KindEnroll {
 		return APIKeyRecord{}, ErrAPIKeyNotFound
 	}
-	if expiresAt > 0 && time.Now().Unix() > expiresAt {
+	if rec.Revoked {
+		return APIKeyRecord{}, ErrAPIKeyNotFound
+	}
+	if expiresAt > 0 && time.Now().Unix() >= expiresAt {
 		return APIKeyRecord{}, ErrAPIKeyNotFound
 	}
 	if rec.MaxUses > 0 && rec.Uses >= rec.MaxUses {
 		return APIKeyRecord{}, ErrAPIKeyNotFound
 	}
+	return rec, nil
+}
+
+// LookupAPIKey returns the credential row including revoked records.
+// Enrollment codes are still hidden from general lookup.
+func (db *DB) LookupAPIKey(keyHash string) (APIKeyRecord, error) {
+	if err := db.ensureAPIKeys(); err != nil {
+		return APIKeyRecord{}, err
+	}
+	var rec APIKeyRecord
+	var expiresAt, createdAt, lastSeen, revokedAt int64
+	err := db.conn.QueryRow(
+		`SELECT id, key_hash, tenant_id, client_name, kind, scope, key_prefix,
+		        expires_at, max_uses, uses, server_id, issued_by,
+		        created_at, last_seen_at, revoked_at
+		 FROM api_keys WHERE key_hash = ?`, keyHash,
+	).Scan(
+		&rec.ID, &rec.KeyHash, &rec.TenantID, &rec.ClientName, &rec.Kind, &rec.Scope, &rec.KeyPrefix,
+		&expiresAt, &rec.MaxUses, &rec.Uses, &rec.ServerID, &rec.IssuedBy,
+		&createdAt, &lastSeen, &revokedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return APIKeyRecord{}, ErrAPIKeyNotFound
+	}
+	if err != nil {
+		return APIKeyRecord{}, err
+	}
 	rec.ExpiresAt = time.Unix(expiresAt, 0)
 	rec.CreatedAt = time.Unix(createdAt, 0)
 	rec.LastSeenAt = time.Unix(lastSeen, 0)
+	rec.Revoked = revokedAt != 0
+	if rec.Revoked {
+		return rec, ErrAPIKeyRevoked
+	}
 	return rec, nil
 }
 
@@ -346,12 +395,17 @@ func (db *DB) ConsumeEnrollCode(codeHash string) (APIKeyRecord, error) {
 	return rec, nil
 }
 
-// TouchAPIKey records that a key was just used.
+// TouchAPIKey records that a key was just used and drops any enrollment
+// handshake plaintext for that credential (lost-reply recovery ends after first use).
 func (db *DB) TouchAPIKey(keyHash string) error {
 	if err := db.ensureAPIKeys(); err != nil {
 		return err
 	}
-	_, err := db.conn.Exec("UPDATE api_keys SET last_seen_at = ? WHERE key_hash = ?", time.Now().Unix(), keyHash)
+	now := time.Now().Unix()
+	if _, err := db.conn.Exec("UPDATE api_keys SET last_seen_at = ? WHERE key_hash = ?", now, keyHash); err != nil {
+		return err
+	}
+	_, err := db.conn.Exec("DELETE FROM enrollment_handshakes WHERE key_hash = ?", keyHash)
 	return err
 }
 
@@ -363,17 +417,12 @@ func (db *DB) UpsertAPIKey(rec APIKeyRecord) error {
 	if rec.KeyHash == "" || rec.TenantID == "" {
 		return errors.New("storage: api key record needs KeyHash and TenantID")
 	}
+	if rec.Kind == "" || rec.Scope == "" {
+		return ErrMissingCredentialFields
+	}
 	created := rec.CreatedAt
 	if created.IsZero() {
 		created = time.Now()
-	}
-	kind := rec.Kind
-	if kind == "" {
-		kind = KindLegacy
-	}
-	scope := rec.Scope
-	if scope == "" {
-		scope = ScopeAll
 	}
 	var expiresAt int64
 	if !rec.ExpiresAt.IsZero() {
@@ -394,9 +443,8 @@ func (db *DB) UpsertAPIKey(rec APIKeyRecord) error {
 			expires_at = excluded.expires_at,
 			max_uses = excluded.max_uses,
 			server_id = excluded.server_id,
-			issued_by = excluded.issued_by,
-			revoked_at = 0`,
-		rec.KeyHash, rec.TenantID, rec.ClientName, kind, scope, rec.KeyPrefix,
+			issued_by = excluded.issued_by`,
+		rec.KeyHash, rec.TenantID, rec.ClientName, rec.Kind, rec.Scope, rec.KeyPrefix,
 		expiresAt, rec.MaxUses, rec.Uses, rec.ServerID, rec.IssuedBy,
 		created.Unix(),
 	)
@@ -408,11 +456,21 @@ func (db *DB) RevokeAPIKey(clientName string) (int64, error) {
 	if err := db.ensureAPIKeys(); err != nil {
 		return 0, err
 	}
-	res, err := db.conn.Exec("UPDATE api_keys SET revoked_at = ? WHERE client_name = ? AND revoked_at = 0", time.Now().Unix(), clientName)
+	now := time.Now().Unix()
+	res, err := db.conn.Exec("UPDATE api_keys SET revoked_at = ? WHERE client_name = ? AND revoked_at = 0", now, clientName)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return n, err
+	}
+	if n > 0 {
+		if err := bumpAuthEpochSQLite(db.conn, now); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // RevokeAgent marks a machine agent token as revoked.
@@ -420,14 +478,24 @@ func (db *DB) RevokeAgent(tenantID, serverID string) (int64, error) {
 	if err := db.ensureAPIKeys(); err != nil {
 		return 0, err
 	}
+	now := time.Now().Unix()
 	res, err := db.conn.Exec(
 		"UPDATE api_keys SET revoked_at = ? WHERE tenant_id = ? AND server_id = ? AND kind = 'agent' AND revoked_at = 0",
-		time.Now().Unix(), tenantID, serverID,
+		now, tenantID, serverID,
 	)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return n, err
+	}
+	if n > 0 {
+		if err := bumpAuthEpochSQLite(db.conn, now); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // ListAgents returns all registered machine agent tokens.
@@ -539,7 +607,7 @@ func (pg *PostgresDB) ensureAPIKeys() error {
 				return fmt.Errorf("migrate postgres api_keys: %w", err)
 			}
 		}
-		return nil
+		return ensureEnrollmentAuxPostgres(ctx, pg)
 	})
 }
 
@@ -566,18 +634,55 @@ func (pg *PostgresDB) ResolveAPIKey(keyHash string) (APIKeyRecord, error) {
 		}
 		return APIKeyRecord{}, err
 	}
-	if revokedAt != 0 {
+	rec.ExpiresAt = time.Unix(expiresAt, 0)
+	rec.CreatedAt = time.Unix(createdAt, 0)
+	rec.LastSeenAt = time.Unix(lastSeen, 0)
+	rec.Revoked = revokedAt != 0
+	if rec.Kind == KindEnroll {
 		return APIKeyRecord{}, ErrAPIKeyNotFound
 	}
-	if expiresAt > 0 && time.Now().Unix() > expiresAt {
+	if rec.Revoked {
+		return APIKeyRecord{}, ErrAPIKeyNotFound
+	}
+	if expiresAt > 0 && time.Now().Unix() >= expiresAt {
 		return APIKeyRecord{}, ErrAPIKeyNotFound
 	}
 	if rec.MaxUses > 0 && rec.Uses >= rec.MaxUses {
 		return APIKeyRecord{}, ErrAPIKeyNotFound
 	}
+	return rec, nil
+}
+
+// LookupAPIKey returns the credential row including revoked records.
+func (pg *PostgresDB) LookupAPIKey(keyHash string) (APIKeyRecord, error) {
+	if err := pg.ensureAPIKeys(); err != nil {
+		return APIKeyRecord{}, err
+	}
+	var rec APIKeyRecord
+	var expiresAt, createdAt, lastSeen, revokedAt int64
+	err := pg.pool.QueryRow(context.Background(),
+		`SELECT id, key_hash, tenant_id, client_name, kind, scope, key_prefix,
+		        expires_at, max_uses, uses, server_id, issued_by,
+		        created_at, last_seen_at, revoked_at
+		 FROM api_keys WHERE key_hash = $1`, keyHash,
+	).Scan(
+		&rec.ID, &rec.KeyHash, &rec.TenantID, &rec.ClientName, &rec.Kind, &rec.Scope, &rec.KeyPrefix,
+		&expiresAt, &rec.MaxUses, &rec.Uses, &rec.ServerID, &rec.IssuedBy,
+		&createdAt, &lastSeen, &revokedAt,
+	)
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return APIKeyRecord{}, ErrAPIKeyNotFound
+		}
+		return APIKeyRecord{}, err
+	}
 	rec.ExpiresAt = time.Unix(expiresAt, 0)
 	rec.CreatedAt = time.Unix(createdAt, 0)
 	rec.LastSeenAt = time.Unix(lastSeen, 0)
+	rec.Revoked = revokedAt != 0
+	if rec.Revoked {
+		return rec, ErrAPIKeyRevoked
+	}
 	return rec, nil
 }
 
@@ -618,13 +723,18 @@ func (pg *PostgresDB) ConsumeEnrollCode(codeHash string) (APIKeyRecord, error) {
 	return rec, nil
 }
 
-// TouchAPIKey records that a key was just used.
+// TouchAPIKey records that a key was just used and drops handshake plaintext.
 func (pg *PostgresDB) TouchAPIKey(keyHash string) error {
 	if err := pg.ensureAPIKeys(); err != nil {
 		return err
 	}
-	_, err := pg.pool.Exec(context.Background(),
-		"UPDATE api_keys SET last_seen_at = $1 WHERE key_hash = $2", time.Now().Unix(), keyHash)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	if _, err := pg.pool.Exec(ctx,
+		"UPDATE api_keys SET last_seen_at = $1 WHERE key_hash = $2", now, keyHash); err != nil {
+		return err
+	}
+	_, err := pg.pool.Exec(ctx, "DELETE FROM enrollment_handshakes WHERE key_hash = $1", keyHash)
 	return err
 }
 
@@ -636,17 +746,12 @@ func (pg *PostgresDB) UpsertAPIKey(rec APIKeyRecord) error {
 	if rec.KeyHash == "" || rec.TenantID == "" {
 		return errors.New("storage: api key record needs KeyHash and TenantID")
 	}
+	if rec.Kind == "" || rec.Scope == "" {
+		return ErrMissingCredentialFields
+	}
 	created := rec.CreatedAt
 	if created.IsZero() {
 		created = time.Now()
-	}
-	kind := rec.Kind
-	if kind == "" {
-		kind = KindLegacy
-	}
-	scope := rec.Scope
-	if scope == "" {
-		scope = ScopeAll
 	}
 	var expiresAt int64
 	if !rec.ExpiresAt.IsZero() {
@@ -667,9 +772,8 @@ func (pg *PostgresDB) UpsertAPIKey(rec APIKeyRecord) error {
 			expires_at = EXCLUDED.expires_at,
 			max_uses = EXCLUDED.max_uses,
 			server_id = EXCLUDED.server_id,
-			issued_by = EXCLUDED.issued_by,
-			revoked_at = 0`,
-		rec.KeyHash, rec.TenantID, rec.ClientName, kind, scope, rec.KeyPrefix,
+			issued_by = EXCLUDED.issued_by`,
+		rec.KeyHash, rec.TenantID, rec.ClientName, rec.Kind, rec.Scope, rec.KeyPrefix,
 		expiresAt, rec.MaxUses, rec.Uses, rec.ServerID, rec.IssuedBy,
 		created.Unix(),
 	)
@@ -681,12 +785,20 @@ func (pg *PostgresDB) RevokeAPIKey(clientName string) (int64, error) {
 	if err := pg.ensureAPIKeys(); err != nil {
 		return 0, err
 	}
-	tag, err := pg.pool.Exec(context.Background(),
-		"UPDATE api_keys SET revoked_at = $1 WHERE client_name = $2 AND revoked_at = 0", time.Now().Unix(), clientName)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	tag, err := pg.pool.Exec(ctx,
+		"UPDATE api_keys SET revoked_at = $1 WHERE client_name = $2 AND revoked_at = 0", now, clientName)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	n := tag.RowsAffected()
+	if n > 0 {
+		if err := bumpAuthEpochPostgres(ctx, pg, now); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // RevokeAgent marks a machine agent token as revoked.
@@ -694,14 +806,22 @@ func (pg *PostgresDB) RevokeAgent(tenantID, serverID string) (int64, error) {
 	if err := pg.ensureAPIKeys(); err != nil {
 		return 0, err
 	}
-	tag, err := pg.pool.Exec(context.Background(),
+	ctx := context.Background()
+	now := time.Now().Unix()
+	tag, err := pg.pool.Exec(ctx,
 		"UPDATE api_keys SET revoked_at = $1 WHERE tenant_id = $2 AND server_id = $3 AND kind = 'agent' AND revoked_at = 0",
-		time.Now().Unix(), tenantID, serverID,
+		now, tenantID, serverID,
 	)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	n := tag.RowsAffected()
+	if n > 0 {
+		if err := bumpAuthEpochPostgres(ctx, pg, now); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // ListAgents returns all registered machine agent tokens.
@@ -786,4 +906,51 @@ func (pg *PostgresDB) ListAPIKeys() ([]APIKeyRecord, error) {
 // Ping verifies the pool is reachable.
 func (pg *PostgresDB) Ping(ctx context.Context) error {
 	return pg.pool.Ping(ctx)
+}
+
+// UniqueTenantForClientName returns the single tenant bound to a display name.
+// Zero matches returns ("", nil). Two or more distinct tenant IDs is an error:
+// display names never resolve identity when they are ambiguous.
+func UniqueTenantForClientName(keys []APIKeyRecord, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("storage: client name is required")
+	}
+	seen := make(map[string]struct{})
+	for _, k := range keys {
+		if !strings.EqualFold(k.ClientName, name) || k.TenantID == "" {
+			continue
+		}
+		seen[k.TenantID] = struct{}{}
+	}
+	switch len(seen) {
+	case 0:
+		return "", nil
+	case 1:
+		for id := range seen {
+			return id, nil
+		}
+	}
+	return "", ErrAmbiguousClientName
+}
+
+// IsOpaqueTenantID reports whether tenantID already uses the t_<hex> form
+// (or the reserved platform-admin tenant).
+func IsOpaqueTenantID(tenantID string) bool {
+	if tenantID == "" || tenantID == "admin" {
+		return true
+	}
+	if !strings.HasPrefix(tenantID, "t_") {
+		return false
+	}
+	hexPart := tenantID[2:]
+	if len(hexPart) < 16 {
+		return false
+	}
+	for _, c := range hexPart {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
 }

@@ -62,6 +62,8 @@ func TestResolveAPIKeyRoundTrip(t *testing.T) {
 		KeyHash:    HashAPIKey(plaintext),
 		TenantID:   "t_abc123",
 		ClientName: "WSI",
+		Kind:       KindRead,
+		Scope:      ScopeRead,
 	}); err != nil {
 		t.Fatalf("UpsertAPIKey: %v", err)
 	}
@@ -96,6 +98,8 @@ func TestRevokedKeyIsRejected(t *testing.T) {
 		KeyHash:    HashAPIKey(plaintext),
 		TenantID:   "t_revoke",
 		ClientName: "DemoClient",
+		Kind:       KindRead,
+		Scope:      ScopeRead,
 	}); err != nil {
 		t.Fatalf("UpsertAPIKey: %v", err)
 	}
@@ -125,6 +129,8 @@ func TestListAPIKeysNeverExposesPlaintext(t *testing.T) {
 		KeyHash:    HashAPIKey(plaintext),
 		TenantID:   "t_1",
 		ClientName: "ClientOne",
+		Kind:       KindRead,
+		Scope:      ScopeRead,
 	})
 
 	keys, err := db.ListAPIKeys()
@@ -148,6 +154,8 @@ func TestUpsertIsIdempotent(t *testing.T) {
 		KeyHash:    HashAPIKey("same-key"),
 		TenantID:   "t_same",
 		ClientName: "Repeat",
+		Kind:       KindRead,
+		Scope:      ScopeRead,
 	}
 	for i := 0; i < 3; i++ {
 		if err := db.UpsertAPIKey(rec); err != nil {
@@ -168,12 +176,15 @@ func TestUpsertRejectsIncompleteRecords(t *testing.T) {
 	if err := db.UpsertAPIKey(APIKeyRecord{KeyHash: "abc"}); err == nil {
 		t.Error("expected error for missing TenantID")
 	}
+	if err := db.UpsertAPIKey(APIKeyRecord{KeyHash: "abc", TenantID: "t_1"}); err == nil {
+		t.Error("expected error for missing Kind and Scope")
+	}
 }
 
 func TestTouchAPIKeyUpdatesLastSeen(t *testing.T) {
 	db := testDB(t)
 	hash := HashAPIKey("touch-me")
-	db.UpsertAPIKey(APIKeyRecord{KeyHash: hash, TenantID: "t_touch", ClientName: "Toucher"})
+	db.UpsertAPIKey(APIKeyRecord{KeyHash: hash, TenantID: "t_touch", ClientName: "Toucher", Kind: KindRead, Scope: ScopeRead})
 
 	before, _ := db.ResolveAPIKey(hash)
 	if err := db.TouchAPIKey(hash); err != nil {

@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"Zeus/internal/fsroot"
 	"Zeus/storage"
 )
 
@@ -87,29 +88,61 @@ func (a *Agent) SetAPIKey(apiKey string) {
 // drainer can be started with StartDrainer. If it is not, the agent still runs
 // but drops rows on failure, exactly as it did before, and says so.
 func New(hubURL, apiKey string) *Agent {
-	a := &Agent{
-		hubURL: hubURL,
-		apiKey: apiKey,
-		httpClient: &http.Client{
-			Timeout: postTimeout,
-		},
-		drainWake: make(chan struct{}, 1),
-	}
-
-	if dir, err := storage.DataDir(); err == nil {
-		if sp, err := NewSpool(dir); err == nil {
-			a.spool = sp
-			if depth, err := sp.Depth(); err == nil && depth > 0 {
-				log.Printf("[agent] %d spooled samples pending from a previous run", depth)
-			}
-		} else {
-			log.Printf("[agent] WARNING: could not open spool (%v) — samples will be dropped if the hub is unreachable", err)
-		}
+	dir := ""
+	if d, err := storage.DataDir(); err == nil {
+		dir = d
 	} else {
 		log.Printf("[agent] WARNING: no data directory (%v) — samples will be dropped if the hub is unreachable", err)
 	}
+	return newAgent(hubURL, apiKey, dir)
+}
 
+// NewWithSpoolRoot is New with an explicit data/spool root. Tests must pass a
+// temporary directory; production paths are refused.
+func NewWithSpoolRoot(hubURL, apiKey, spoolRoot string) *Agent {
+	if spoolRoot != "" {
+		if err := fsroot.RejectProductionPath(spoolRoot); err != nil {
+			log.Printf("[agent] WARNING: refusing production spool root (%v) — samples will be dropped if the hub is unreachable", err)
+			return newAgent(hubURL, apiKey, "")
+		}
+	}
+	return newAgent(hubURL, apiKey, spoolRoot)
+}
+
+func newAgent(hubURL, apiKey, dataDir string) *Agent {
+	a := &Agent{
+		hubURL: hubURL,
+		apiKey: apiKey,
+		httpClient: newHubHTTPClient(postTimeout),
+		drainWake: make(chan struct{}, 1),
+	}
+
+	if dataDir == "" {
+		return a
+	}
+	if sp, err := NewSpool(dataDir); err == nil {
+		a.spool = sp
+		if err := sp.BindDestination(hubURL, "", ""); err != nil {
+			log.Printf("[agent] WARNING: spool destination bind failed (%v)", err)
+		}
+		if depth, err := sp.Depth(); err == nil && depth > 0 {
+			log.Printf("[agent] %d spooled samples pending from a previous run", depth)
+		}
+	} else {
+		log.Printf("[agent] WARNING: could not open spool (%v) — samples will be dropped if the hub is unreachable", err)
+	}
 	return a
+}
+
+// BindIdentity ties the spool to tenant and server. A mismatch quarantines
+// backlog instead of sending it to a different identity.
+func (a *Agent) BindIdentity(tenantID, serverID string) {
+	if a.spool == nil {
+		return
+	}
+	if err := a.spool.BindDestination(a.hubURL, tenantID, serverID); err != nil {
+		log.Printf("[agent] spool identity bind failed: %v", err)
+	}
 }
 
 // StartDrainer launches the background retry loop. Safe to call more than once.

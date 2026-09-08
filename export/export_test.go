@@ -41,7 +41,7 @@ func TestExportCSVAndText(t *testing.T) {
 	txtPath := filepath.Join(tmp, "report.txt")
 
 	// Test CSV export
-	n, err := export.CSVReport(db, now.Add(-48*time.Hour), csvPath)
+	n, err := export.CSVReport(db, now.Add(-48*time.Hour), csvPath, storage.LocalTenantID)
 	if err != nil {
 		t.Fatalf("CSVReport: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestExportCSVAndText(t *testing.T) {
 	t.Logf("CSV path: %s, total CSV rows (including summary): %d", csvPath, len(records))
 
 	// Test text report
-	s, err := export.TextReport(db, now.Add(-48*time.Hour), txtPath)
+	s, err := export.TextReport(db, now.Add(-48*time.Hour), txtPath, storage.LocalTenantID)
 	if err != nil {
 		t.Fatalf("TextReport: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestAssessmentHTMLReport(t *testing.T) {
 	start := now.Add(-24 * time.Hour)
 	end := now
 
-	if err := export.GenerateAssessmentReport(db, start, end, outPath); err != nil {
+	if err := export.GenerateAssessmentReport(db, start, end, outPath, storage.LocalTenantID); err != nil {
 		t.Fatalf("GenerateAssessmentReport: %v", err)
 	}
 
@@ -208,7 +208,7 @@ func TestMultiServerExportAndAssessment(t *testing.T) {
 	}
 
 	// 1. Test ComputePerServerSummaries directly
-	rows, err := db.QueryMetrics(now.Add(-24*time.Hour), "")
+	rows, err := db.QueryMetrics(now.Add(-24*time.Hour), storage.LocalTenantID)
 	if err != nil {
 		t.Fatalf("QueryMetrics: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestMultiServerExportAndAssessment(t *testing.T) {
 
 	// 3. Test GenerateAssessmentReport with multi-server data
 	htmlPath := filepath.Join(tmp, "multiserver_assessment.html")
-	if err := export.GenerateAssessmentReport(db, now.Add(-24*time.Hour), now, htmlPath); err != nil {
+	if err := export.GenerateAssessmentReport(db, now.Add(-24*time.Hour), now, htmlPath, storage.LocalTenantID); err != nil {
 		t.Fatalf("GenerateAssessmentReport: %v", err)
 	}
 
@@ -283,7 +283,7 @@ func TestMultiServerExportAndAssessment(t *testing.T) {
 
 	// 4. Test TextReport with multi-server data
 	txtPath := filepath.Join(tmp, "multiserver_report.txt")
-	s, err := export.TextReport(db, now.Add(-24*time.Hour), txtPath)
+	s, err := export.TextReport(db, now.Add(-24*time.Hour), txtPath, storage.LocalTenantID)
 	if err != nil {
 		t.Fatalf("TextReport: %v", err)
 	}
@@ -300,3 +300,107 @@ func TestMultiServerExportAndAssessment(t *testing.T) {
 	}
 }
 
+func TestHTMLEscapesHostileHostnames(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmp, "xss.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	payload := `<img src=x onerror=alert(1)>`
+	sid := `"><script>alert(1)</script>`
+	for _, row := range []storage.MetricRow{
+		{Timestamp: now.Add(-time.Hour), ServerID: sid, Hostname: payload, CPUPct: 10, MemPct: 10, DiskFreeGB: 1, CPUCores: 2, MemTotalGB: 4, DiskTotalGB: 20},
+		{Timestamp: now.Add(-time.Hour), ServerID: "web-02", Hostname: "plain.example", CPUPct: 20, MemPct: 20, DiskFreeGB: 2, CPUCores: 2, MemTotalGB: 4, DiskTotalGB: 20},
+	} {
+		if err := db.InsertMetric(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(tmp, "xss.html")
+	if err := export.GenerateAssessmentReport(db, now.Add(-2*time.Hour), now, out, storage.LocalTenantID); err != nil {
+		t.Fatal(err)
+	}
+	html, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(html)
+	if strings.Contains(s, payload) {
+		t.Fatal("raw XSS hostname written into HTML")
+	}
+	if strings.Contains(s, "<script>alert(1)</script>") {
+		t.Fatal("raw script tag written into HTML")
+	}
+	if strings.Contains(s, "<img src=x") {
+		t.Fatal("raw img tag written into HTML")
+	}
+	if !strings.Contains(s, "&lt;img") && !strings.Contains(s, "&lt;script") {
+		t.Fatalf("expected escaped metacharacters, html snippet: %s", s[0:min(1200, len(s))])
+	}
+}
+
+func TestSpreadsheetSafeCSVPrefixesFormulas(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmp, "formula.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	if err := db.InsertMetric(storage.MetricRow{
+		Timestamp: now, ServerID: "=cmd|'/c calc'!A0", Hostname: "+1+1", CPUPct: 1, MemPct: 1, DiskFreeGB: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var safe, raw strings.Builder
+	if _, err := export.WriteCSV(&safe, db, now.Add(-time.Hour), storage.LocalTenantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := export.WriteCSVLossless(&raw, db, now.Add(-time.Hour), storage.LocalTenantID); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(safe.String(), "'=cmd|'/c calc'!A0") {
+		t.Fatalf("spreadsheet CSV missing quoted formula, got %q", safe.String())
+	}
+	if !strings.Contains(safe.String(), "'+1+1") {
+		t.Fatalf("spreadsheet CSV missing quoted hostname formula, got %q", safe.String())
+	}
+	if !strings.Contains(raw.String(), "=cmd|'/c calc'!A0") {
+		t.Fatal("lossless CSV should keep the raw formula")
+	}
+	if strings.Contains(raw.String(), "'=cmd") {
+		t.Fatal("lossless CSV must not prefix formulas")
+	}
+}
+
+type failWriter struct {
+	n, failAt int
+}
+
+func (f *failWriter) Write(p []byte) (int, error) {
+	if f.n+len(p) >= f.failAt {
+		return 0, os.ErrClosed
+	}
+	f.n += len(p)
+	return len(p), nil
+}
+
+func TestCSVFlushErrorIsReturned(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmp, "flush.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	if err := db.InsertMetric(storage.MetricRow{Timestamp: now, ServerID: "s", Hostname: "h", CPUPct: 1, MemPct: 1, DiskFreeGB: 1}); err != nil {
+		t.Fatal(err)
+	}
+	w := &failWriter{failAt: 8}
+	if _, err := export.WriteCSV(w, db, now.Add(-time.Hour), storage.LocalTenantID); err == nil {
+		t.Fatal("expected csv write/flush error")
+	}
+}

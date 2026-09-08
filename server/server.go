@@ -55,6 +55,14 @@ type Server struct {
 	authCache *authCache
 	limiter   *rateLimiter
 
+	authEpoch       int64
+	epochRefreshed  time.Time
+	epochInterval   time.Duration
+	epochMu         sync.Mutex
+
+	sessions      *sessionStore
+	loginLimiter  *rateLimiter
+
 	// alerts is set by SetAlertSource when alerting is enabled.
 	alerts AlertSource
 
@@ -65,6 +73,8 @@ type Server struct {
 	healthDBErr      error
 	healthLastAge    time.Duration
 	healthHaveMetric bool
+
+	retentionStatus func() map[string]interface{}
 }
 
 // New creates a Server bound to the given port (e.g. "8080").
@@ -77,7 +87,10 @@ func New(db storage.Store, port string) *Server {
 		dashboardViewers: make(map[string]time.Time),
 		authCache:        newAuthCache(),
 		limiter:          newRateLimiter(defaultRatePerSecond, defaultBurst),
+		sessions:         newSessionStore(),
+		loginLimiter:     newRateLimiter(1, 5),
 		allowedOrigins:   parseAllowedOrigins(os.Getenv("WMONITOR_ALLOWED_ORIGINS")),
+		epochInterval:    AuthRevocationMaxDelay,
 	}
 	s.routes()
 	return s
@@ -96,11 +109,18 @@ func (s *Server) EnableHubMode(keys KeyStore) {
 	s.mux.HandleFunc("/api/admin/enroll-codes", s.handleAdminEnrollCodes)
 	s.mux.HandleFunc("/api/admin/agents", s.handleAdminAgents)
 	s.mux.HandleFunc("/api/admin/clients", s.handleAdminClients)
+	s.mux.HandleFunc("/api/admin/agents/rotate", s.handleAdminAgentRotate)
+	s.syncAuthEpoch()
 	if keys == nil {
 		log.Println("[server] WARNING: hub mode enabled with no key store — all requests will be rejected")
 		return
 	}
 	log.Println("[server] hub mode enabled — POST /api/ingest requires ingest-scoped token; enrollment at /api/enroll")
+}
+
+// SetRetentionStatusProvider exposes P1.02 containment state on /api/health.
+func (s *Server) SetRetentionStatusProvider(fn func() map[string]interface{}) {
+	s.retentionStatus = fn
 }
 
 // SetAllowedOrigins overrides the CORS allowlist.
@@ -159,6 +179,11 @@ func (s *Server) DashboardViewers() int {
 // Handler returns the underlying http.Handler with viewer tracking.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; connect-src 'self'")
 		s.trackViewer(r)
 		s.mux.ServeHTTP(w, r)
 	})
@@ -299,6 +324,19 @@ func parseRange(r string) time.Duration {
 	}
 }
 
+func queryMetricsScoped(ctx context.Context, db storage.Store, since time.Time, tenantID, serverID string) ([]storage.MetricRow, error) {
+	if err := storage.RequireTenant(tenantID); err != nil {
+		return nil, err
+	}
+	type qer interface {
+		QueryMetricsQ(storage.MetricQuery) ([]storage.MetricRow, error)
+	}
+	if q, ok := db.(qer); ok {
+		return q.QueryMetricsQ(storage.MetricQuery{Ctx: ctx, Since: since, TenantID: tenantID, ServerID: serverID})
+	}
+	return db.QueryMetrics(since, tenantID)
+}
+
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := s.authTenant(w, r)
 	if !ok {
@@ -313,15 +351,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		rangeParam = "24h"
 	}
 	since := time.Now().Add(-parseRange(rangeParam))
+	if err := storage.RequireTenant(tenantID); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "tenant scope is required")
+		return
+	}
 
-	rows, err := s.db.QueryMetrics(since, tenantID)
+	serverFilter := r.URL.Query().Get("server_id")
+	rows, err := queryMetricsScoped(r.Context(), s.db, since, tenantID, serverFilter)
 	if err != nil {
 		log.Printf("[server] QueryMetrics error: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "db error")
 		return
 	}
-
-	serverFilter := r.URL.Query().Get("server_id")
 
 	// Build response — empty slice (not nil) so JSON returns [] not null
 	data := make([]metricDataPoint, 0, len(rows))
@@ -388,6 +429,10 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 		rangeParam = "24h"
 	}
 	since := time.Now().Add(-parseRange(rangeParam))
+	if err := storage.RequireTenant(tenantID); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "tenant scope is required")
+		return
+	}
 
 	rows, err := s.db.QueryProcesses(since, tenantID)
 	if err != nil {
@@ -453,7 +498,15 @@ func (s *Server) healthSnapshot() (healthy bool, dbErr error, lastMetricAge time
 
 	// Freshness matters more than row counts: a hub with 40 million rows and no
 	// new data for an hour is broken, and COUNT(*) would happily report "ok".
-	rows, err := s.db.QueryMetrics(time.Now().Add(-10*time.Minute), "")
+	hctx, hcancel := context.WithTimeout(context.Background(), healthPingLimit)
+	defer hcancel()
+	var rows []storage.MetricRow
+	var err error
+	if q, ok := s.db.(storage.AllTenantsQuerier); ok {
+		rows, err = q.QueryMetricsAllTenants(hctx, time.Now().Add(-10*time.Minute), 64)
+	} else {
+		rows, err = s.db.QueryMetrics(time.Now().Add(-10*time.Minute), storage.LocalTenantID)
+	}
 	if err != nil {
 		s.mu.Lock()
 		s.healthCheckedAt = time.Now()
@@ -496,6 +549,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.alerts != nil {
 		body["active_alerts"] = len(s.alerts.ActiveJSON())
+	}
+	if s.retentionStatus != nil {
+		body["retention"] = s.retentionStatus()
+	} else {
+		body["retention"] = map[string]interface{}{
+			"downsampling_enabled": false,
+			"purge_enabled":        false,
+			"reason":               "destructive downsampling and automatic purge are disabled until P2.03 (V07 containment); original tenant/server rows are preserved",
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -578,6 +640,10 @@ func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 		rangeParam = "24h"
 	}
 	since := time.Now().Add(-parseRange(rangeParam))
+	if err := storage.RequireTenant(tenantID); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "tenant scope is required")
+		return
+	}
 
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="wmonitor_export_%s.csv"`, time.Now().Format("20060102_150405")))
@@ -585,6 +651,8 @@ func (s *Server) handleExportCSV(w http.ResponseWriter, r *http.Request) {
 
 	if _, err := export.WriteCSV(w, s.db, since, tenantID); err != nil {
 		log.Printf("[server] CSV export error: %v", err)
+		http.Error(w, "export failed", http.StatusInternalServerError)
+		return
 	}
 }
 
@@ -595,6 +663,10 @@ func (s *Server) handleServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.enforceRate(w, r, tenantID) {
+		return
+	}
+	if err := storage.RequireTenant(tenantID); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "tenant scope is required")
 		return
 	}
 
@@ -623,17 +695,32 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenantID, ok := s.authTenantScope(w, r, storage.ScopeIngest)
+	principal, ok := s.authPrincipal(w, r, storage.ScopeIngest)
 	if !ok {
 		return
 	}
-	if !s.enforceRate(w, r, tenantID) {
+	if !s.enforceRate(w, r, principal.TenantID) {
 		return
 	}
 
 	// Cap the body. json.NewDecoder on an unbounded r.Body let a single request
 	// stream until the process ran out of memory.
 	r.Body = http.MaxBytesReader(w, r.Body, maxIngestBody)
+
+	bindServerID := func(payloadServerID string) (string, bool) {
+		if principal.Kind == storage.KindAgent {
+			if principal.AgentID == "" {
+				writeJSONError(w, http.StatusForbidden, "agent token is not bound to a server")
+				return "", false
+			}
+			if payloadServerID != "" && payloadServerID != principal.AgentID {
+				writeJSONError(w, http.StatusForbidden, "server identity mismatch")
+				return "", false
+			}
+			return principal.AgentID, true
+		}
+		return payloadServerID, true
+	}
 
 	switch r.URL.Query().Get("type") {
 	case "metric":
@@ -642,7 +729,12 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "bad request")
 			return
 		}
-		m.TenantID = tenantID // server-assigned; never trust the client's value
+		sid, ok := bindServerID(m.ServerID)
+		if !ok {
+			return
+		}
+		m.ServerID = sid
+		m.TenantID = principal.TenantID // server-assigned; never trust the client's value
 		if err := s.db.InsertMetric(m); err != nil {
 			log.Printf("[server] ingest metric error: %v", err)
 			writeJSONError(w, http.StatusInternalServerError, "db error")
@@ -654,7 +746,12 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "bad request")
 			return
 		}
-		p.TenantID = tenantID
+		sid, ok := bindServerID(p.ServerID)
+		if !ok {
+			return
+		}
+		p.ServerID = sid
+		p.TenantID = principal.TenantID
 		if err := s.db.InsertProcess(p); err != nil {
 			log.Printf("[server] ingest process error: %v", err)
 			writeJSONError(w, http.StatusInternalServerError, "db error")

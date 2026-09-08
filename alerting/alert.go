@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"Zeus/storage"
 )
 
 // Severity ranks an alert.
@@ -61,6 +63,9 @@ func (a Alert) Title() string {
 }
 
 // key identifies a rule/server pair for state tracking.
-func alertKey(rule, serverID string) string {
-	return rule + "\x00" + serverID
+func alertKey(rule, tenantID, serverID string) string {
+	if tenantID == "" {
+		tenantID = storage.LocalTenantID
+	}
+	return tenantID + "\x00" + rule + "\x00" + serverID
 }

@@ -1,12 +1,16 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
+
+	"Zeus/internal/fsroot"
 
 	_ "modernc.org/sqlite"
 )
@@ -19,24 +23,24 @@ type DB struct {
 
 // MetricRow holds a single metrics snapshot.
 type MetricRow struct {
-	ID               int64
-	Timestamp        time.Time
-	TenantID         string // API key used as tenant identifier (hub mode)
-	ServerID         string
-	Hostname         string
-	CPUPct           float64
-	MemPct           float64
-	DiskFreeGB       float64
-	NetSentBytes     uint64
-	NetRecvBytes     uint64
-	CPUCores         int
-	MemTotalGB       float64
-	DiskTotalGB      float64
-	DiskReadOps      uint64
-	DiskWriteOps     uint64
-	DiskIOPS         float64
-	NetMBps          float64
-	ConcurrentUsers  int
+	ID              int64
+	Timestamp       time.Time
+	TenantID        string // API key used as tenant identifier (hub mode)
+	ServerID        string
+	Hostname        string
+	CPUPct          float64
+	MemPct          float64
+	DiskFreeGB      float64
+	NetSentBytes    uint64
+	NetRecvBytes    uint64
+	CPUCores        int
+	MemTotalGB      float64
+	DiskTotalGB     float64
+	DiskReadOps     uint64
+	DiskWriteOps    uint64
+	DiskIOPS        float64
+	NetMBps         float64
+	ConcurrentUsers int
 	// Per-interface network split (Phase 10)
 	NetSentExternal uint64
 	NetRecvExternal uint64
@@ -57,8 +61,40 @@ type ProcessRow struct {
 	MemMB     float64
 }
 
-// DataDir returns the OS-appropriate data directory for sysmon.
-func DataDir() (string, error) {
+// EnvDataDir overrides the process data directory (spool, sqlite, agent_id).
+const EnvDataDir = "WMONITOR_DATA_DIR"
+
+var (
+	dataDirMu       sync.RWMutex
+	dataDirOverride string
+)
+
+func init() {
+	fsroot.Register(DefaultDataDirPath())
+}
+
+// SetDataDir injects the data directory for tests. Production paths are rejected.
+func SetDataDir(dir string) error {
+	if dir != "" {
+		if err := fsroot.RejectProductionPath(dir); err != nil {
+			return err
+		}
+	}
+	dataDirMu.Lock()
+	dataDirOverride = dir
+	dataDirMu.Unlock()
+	return nil
+}
+
+// DataDirOverride returns the injected data directory, or empty if unset.
+func DataDirOverride() string {
+	dataDirMu.RLock()
+	defer dataDirMu.RUnlock()
+	return dataDirOverride
+}
+
+// DefaultDataDirPath is the OS-default data directory. It does not create it.
+func DefaultDataDirPath() string {
 	var base string
 	switch runtime.GOOS {
 	case "windows":
@@ -79,11 +115,39 @@ func DataDir() (string, error) {
 	default: // linux and others
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return "", fmt.Errorf("cannot determine home dir: %w", err)
+			return filepath.Join("/tmp", "sysmon")
 		}
 		base = filepath.Join(home, ".local", "share")
 	}
-	dir := filepath.Join(base, "sysmon")
+	return filepath.Join(base, "sysmon")
+}
+
+// DataDir returns the OS-appropriate data directory for wmonitor.
+func DataDir() (string, error) {
+	dataDirMu.RLock()
+	override := dataDirOverride
+	dataDirMu.RUnlock()
+	if override != "" {
+		if err := os.MkdirAll(override, 0755); err != nil {
+			return "", fmt.Errorf("cannot create data dir %s: %w", override, err)
+		}
+		return override, nil
+	}
+	if dir := os.Getenv(EnvDataDir); dir != "" {
+		if fsroot.IsolationEnabled() {
+			if err := fsroot.RejectProductionPath(dir); err != nil {
+				return "", err
+			}
+		}
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return "", fmt.Errorf("cannot create data dir %s: %w", dir, err)
+		}
+		return dir, nil
+	}
+	if fsroot.IsolationEnabled() {
+		return "", fmt.Errorf("storage: DataDir called without test override while %s=1", fsroot.EnvTestIsolation)
+	}
+	dir := DefaultDataDirPath()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", fmt.Errorf("cannot create data dir %s: %w", dir, err)
 	}
@@ -194,8 +258,9 @@ CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
 	return nil
 }
 
-// InsertMetric writes one metrics row.
+// InsertMetric writes one metrics row. An empty TenantID is stored as LocalTenantID.
 func (db *DB) InsertMetric(m MetricRow) error {
+	m.TenantID = normalizeInsertTenant(m.TenantID)
 	_, err := db.conn.Exec(
 		`INSERT INTO metrics(timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -204,8 +269,9 @@ func (db *DB) InsertMetric(m MetricRow) error {
 	return err
 }
 
-// InsertProcess writes one process row.
+// InsertProcess writes one process row. An empty TenantID is stored as LocalTenantID.
 func (db *DB) InsertProcess(p ProcessRow) error {
+	p.TenantID = normalizeInsertTenant(p.TenantID)
 	_, err := db.conn.Exec(
 		`INSERT INTO processes(timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -214,24 +280,45 @@ func (db *DB) InsertProcess(p ProcessRow) error {
 	return err
 }
 
-// QueryMetrics returns rows within the given time window, oldest first.
-// If tenantID is non-empty, only rows with that tenant_id are returned.
+// QueryMetrics returns rows within the given time window for one tenant.
+// tenantID must be non-empty; empty is never a global read.
 func (db *DB) QueryMetrics(since time.Time, tenantID string) ([]MetricRow, error) {
-	var rows *sql.Rows
-	var err error
-	if tenantID != "" {
-		rows, err = db.conn.Query(
-			`SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
-			 FROM metrics WHERE timestamp >= ? AND tenant_id = ? ORDER BY timestamp ASC`,
-			since.Unix(), tenantID,
-		)
-	} else {
-		rows, err = db.conn.Query(
-			`SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
-			 FROM metrics WHERE timestamp >= ? ORDER BY timestamp ASC`,
-			since.Unix(),
-		)
+	return db.QueryMetricsQ(MetricQuery{Since: since, TenantID: tenantID})
+}
+
+// QueryMetricsAllTenants is a privileged health/alerting read. Not a customer export.
+func (db *DB) QueryMetricsAllTenants(ctx context.Context, since time.Time, limit int) ([]MetricRow, error) {
+	return db.queryMetrics(queryContext(ctx), since, time.Time{}, "", "", queryLimit(limit), true)
+}
+
+// QueryMetricsQ applies SQL-side tenant/server/time bounds, a limit, and ctx cancellation.
+func (db *DB) QueryMetricsQ(q MetricQuery) ([]MetricRow, error) {
+	if err := RequireTenant(q.TenantID); err != nil {
+		return nil, err
 	}
+	return db.queryMetrics(queryContext(q.Ctx), q.Since, q.Until, q.TenantID, q.ServerID, queryLimit(q.Limit), false)
+}
+
+func (db *DB) queryMetrics(ctx context.Context, since, until time.Time, tenantID, serverID string, limit int, allTenants bool) ([]MetricRow, error) {
+	q := `SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
+		 FROM metrics WHERE timestamp >= ?`
+	args := []any{since.Unix()}
+	if !until.IsZero() {
+		q += ` AND timestamp <= ?`
+		args = append(args, until.Unix())
+	}
+	if !allTenants {
+		q += ` AND tenant_id = ?`
+		args = append(args, tenantID)
+	}
+	if serverID != "" {
+		q += ` AND server_id = ?`
+		args = append(args, serverID)
+	}
+	q += ` ORDER BY timestamp ASC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := db.conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -250,24 +337,25 @@ func (db *DB) QueryMetrics(since time.Time, tenantID string) ([]MetricRow, error
 	return result, rows.Err()
 }
 
-// QueryProcesses returns process rows within the given time window.
-// If tenantID is non-empty, only rows with that tenant_id are returned.
+// QueryProcesses returns process rows within the given time window for one tenant.
 func (db *DB) QueryProcesses(since time.Time, tenantID string) ([]ProcessRow, error) {
-	var rows *sql.Rows
-	var err error
-	if tenantID != "" {
-		rows, err = db.conn.Query(
-			`SELECT id, timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb
-			 FROM processes WHERE timestamp >= ? AND tenant_id = ? ORDER BY timestamp ASC`,
-			since.Unix(), tenantID,
-		)
-	} else {
-		rows, err = db.conn.Query(
-			`SELECT id, timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb
-			 FROM processes WHERE timestamp >= ? ORDER BY timestamp ASC`,
-			since.Unix(),
-		)
+	if err := RequireTenant(tenantID); err != nil {
+		return nil, err
 	}
+	return db.queryProcesses(context.Background(), since, tenantID, queryLimit(0), false)
+}
+
+func (db *DB) queryProcesses(ctx context.Context, since time.Time, tenantID string, limit int, allTenants bool) ([]ProcessRow, error) {
+	q := `SELECT id, timestamp, tenant_id, server_id, hostname, pid, name, cpu_pct, mem_mb
+		 FROM processes WHERE timestamp >= ?`
+	args := []any{since.Unix()}
+	if !allTenants {
+		q += ` AND tenant_id = ?`
+		args = append(args, tenantID)
+	}
+	q += ` ORDER BY timestamp ASC LIMIT ?`
+	args = append(args, limit)
+	rows, err := db.conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -302,17 +390,15 @@ func (db *DB) CountProcesses() (int, error) {
 
 // QueryServers returns distinct server_id values seen in the metrics table.
 // If tenantID is non-empty, only servers for that tenant are returned.
+// QueryServers returns distinct server_id values for one tenant.
 func (db *DB) QueryServers(tenantID string) ([]string, error) {
-	var rows *sql.Rows
-	var err error
-	if tenantID != "" {
-		rows, err = db.conn.Query(
-			"SELECT DISTINCT server_id FROM metrics WHERE server_id != '' AND tenant_id = ? ORDER BY server_id",
-			tenantID,
-		)
-	} else {
-		rows, err = db.conn.Query("SELECT DISTINCT server_id FROM metrics WHERE server_id != '' ORDER BY server_id")
+	if err := RequireTenant(tenantID); err != nil {
+		return nil, err
 	}
+	rows, err := db.conn.Query(
+		"SELECT DISTINCT server_id FROM metrics WHERE server_id != '' AND tenant_id = ? ORDER BY server_id",
+		tenantID,
+	)
 	if err != nil {
 		return nil, err
 	}

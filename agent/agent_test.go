@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"Zeus/agent"
+	"Zeus/internal/testisolate"
 	"Zeus/storage"
 )
 
@@ -31,7 +32,9 @@ func TestAgentIngestMetric(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	ag := agent.New(ts.URL, testKey)
+	_, dataDir := testisolate.Dirs(t)
+	ag := agent.NewWithSpoolRoot(ts.URL, testKey, dataDir)
+	defer ag.Close()
 
 	m := storage.MetricRow{
 		Timestamp:       time.Now(),
@@ -77,7 +80,9 @@ func TestAgentIngestProcess(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	ag := agent.New(ts.URL, testKey)
+	_, dataDir := testisolate.Dirs(t)
+	ag := agent.NewWithSpoolRoot(ts.URL, testKey, dataDir)
+	defer ag.Close()
 
 	p := storage.ProcessRow{
 		Timestamp: time.Now(),
@@ -103,7 +108,9 @@ func TestAgentUnauthorized(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	ag := agent.New(ts.URL, "wrong-key")
+	_, dataDir := testisolate.Dirs(t)
+	ag := agent.NewWithSpoolRoot(ts.URL, "wrong-key", dataDir)
+	defer ag.Close()
 	err := ag.InsertMetric(storage.MetricRow{Timestamp: time.Now()})
 	if err == nil {
 		t.Fatal("expected error on 401, got nil")

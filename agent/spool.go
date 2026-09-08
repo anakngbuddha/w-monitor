@@ -10,6 +10,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"Zeus/internal/fsroot"
 )
 
 // Spool bounds. A 100 MB cap holds roughly two weeks of one agent's samples,
@@ -19,7 +21,16 @@ const (
 	maxSpoolBytes   = 100 << 20 // 100 MB
 	maxSegmentBytes = 8 << 20   // 8 MB per segment
 	spoolDirName    = "spool"
+	spoolBindName   = "bind.json"
 )
+
+// spoolBinding ties a spool directory to one hub origin and agent identity.
+// A changed destination quarantines the old backlog so it is never sent.
+type spoolBinding struct {
+	Origin   string `json:"origin"`
+	TenantID string `json:"tenant_id,omitempty"`
+	ServerID string `json:"server_id,omitempty"`
+}
 
 // spoolEntry is one queued payload awaiting delivery.
 type spoolEntry struct {
@@ -42,11 +53,111 @@ type Spool struct {
 
 // NewSpool opens (creating if needed) a spool directory.
 func NewSpool(dir string) (*Spool, error) {
+	if fsroot.IsolationEnabled() {
+		if err := fsroot.RejectProductionPath(dir); err != nil {
+			return nil, fmt.Errorf("spool: %w", err)
+		}
+	}
 	path := filepath.Join(dir, spoolDirName)
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, fmt.Errorf("spool: create %s: %w", path, err)
 	}
 	return &Spool{dir: path}, nil
+}
+
+// BindDestination records the canonical hub origin and optional tenant/agent.
+// If an existing bind disagrees, prior segments are moved to quarantine/ and
+// are not drained.
+func (s *Spool) BindDestination(origin, tenantID, serverID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	origin = CanonicalHubURL(origin)
+	existing, err := s.readBindLocked()
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	mismatch := false
+	if existing != nil {
+		if existing.Origin != "" && origin != "" && !SameHubOrigin(existing.Origin, origin) {
+			mismatch = true
+		}
+		if existing.TenantID != "" && tenantID != "" && existing.TenantID != tenantID {
+			mismatch = true
+		}
+		if existing.ServerID != "" && serverID != "" && existing.ServerID != serverID {
+			mismatch = true
+		}
+	}
+	if mismatch {
+		if err := s.quarantineLocked(); err != nil {
+			return err
+		}
+		log.Printf("[spool] destination changed; prior backlog was not sent")
+		existing = nil
+	}
+
+	bind := spoolBinding{Origin: origin, TenantID: tenantID, ServerID: serverID}
+	if existing != nil {
+		if bind.Origin == "" {
+			bind.Origin = existing.Origin
+		}
+		if bind.TenantID == "" {
+			bind.TenantID = existing.TenantID
+		}
+		if bind.ServerID == "" {
+			bind.ServerID = existing.ServerID
+		}
+	}
+	return s.writeBindLocked(bind)
+}
+
+func (s *Spool) bindPath() string {
+	return filepath.Join(s.dir, spoolBindName)
+}
+
+func (s *Spool) readBindLocked() (*spoolBinding, error) {
+	data, err := os.ReadFile(s.bindPath())
+	if err != nil {
+		return nil, err
+	}
+	var b spoolBinding
+	if err := json.Unmarshal(data, &b); err != nil {
+		return nil, fmt.Errorf("spool: bind file: %w", err)
+	}
+	return &b, nil
+}
+
+func (s *Spool) writeBindLocked(b spoolBinding) error {
+	data, err := json.Marshal(b)
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(s.bindPath(), data, 0o600)
+}
+
+func (s *Spool) quarantineLocked() error {
+	if s.current != nil {
+		s.current.Close()
+		s.current = nil
+		s.curSize = 0
+	}
+	qdir := filepath.Join(s.dir, "quarantine")
+	if err := os.MkdirAll(qdir, 0o700); err != nil {
+		return fmt.Errorf("spool: quarantine dir: %w", err)
+	}
+	segments, _, err := s.segmentsLocked()
+	if err != nil {
+		return err
+	}
+	for _, src := range segments {
+		dst := filepath.Join(qdir, filepath.Base(src))
+		if err := os.Rename(src, dst); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("spool: quarantine %s: %w", filepath.Base(src), err)
+		}
+	}
+	return nil
 }
 
 // Append queues a payload for later delivery.

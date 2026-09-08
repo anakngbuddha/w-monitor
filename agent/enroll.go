@@ -11,11 +11,12 @@ import (
 )
 
 type enrollReq struct {
-	EnrollCode string `json:"enroll_code"`
-	ServerID   string `json:"server_id"`
-	Hostname   string `json:"hostname"`
-	OS         string `json:"os"`
-	Version    string `json:"version"`
+	EnrollCode   string `json:"enroll_code"`
+	ServerID     string `json:"server_id"`
+	Hostname     string `json:"hostname"`
+	OS           string `json:"os"`
+	Version      string `json:"version"`
+	CurrentToken string `json:"current_token,omitempty"`
 }
 
 type enrollResp struct {
@@ -26,30 +27,44 @@ type enrollResp struct {
 }
 
 // Enroll performs the first-run handshake with the hub and persists the returned agent token.
-func Enroll(ctx context.Context, hubURL, enrollCode, serverID, hostname, version string) (*StoredCredentials, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
+// currentToken, when set, proves ownership for replacement of an existing machine identity.
+func Enroll(ctx context.Context, hubURL, enrollCode, serverID, hostname, version, currentToken string) (*StoredCredentials, error) {
+	if err := RequireHTTPSHub(hubURL); err != nil {
+		return nil, err
+	}
+	client := newHubHTTPClient(60 * time.Second)
 
 	reqBody, err := json.Marshal(enrollReq{
-		EnrollCode: enrollCode,
-		ServerID:   serverID,
-		Hostname:   hostname,
-		OS:         fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
-		Version:    version,
+		EnrollCode:   enrollCode,
+		ServerID:     serverID,
+		Hostname:     hostname,
+		OS:           fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
+		Version:      version,
+		CurrentToken: currentToken,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal enroll request: %w", err)
 	}
 
 	url := fmt.Sprintf("%s/api/enroll", hubURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("create enroll request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("enroll request failed: %w", err)
+	var resp *http.Response
+	for attempt := 1; attempt <= 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
+		if err != nil {
+			return nil, fmt.Errorf("create enroll request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = client.Do(req)
+		if err != nil {
+			if attempt < 2 {
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			return nil, fmt.Errorf("enroll request failed: %w", err)
+		}
+		break
 	}
 	defer resp.Body.Close()
 

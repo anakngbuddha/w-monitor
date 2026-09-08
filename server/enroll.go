@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -15,11 +16,12 @@ import (
 var serverIDRegex = regexp.MustCompile(`^[A-Za-z0-9._-]{3,128}$`)
 
 type enrollRequest struct {
-	EnrollCode string `json:"enroll_code"`
-	ServerID   string `json:"server_id"`
-	Hostname   string `json:"hostname"`
-	OS         string `json:"os"`
-	Version    string `json:"version"`
+	EnrollCode   string `json:"enroll_code"`
+	ServerID     string `json:"server_id"`
+	Hostname     string `json:"hostname"`
+	OS           string `json:"os"`
+	Version      string `json:"version"`
+	CurrentToken string `json:"current_token"`
 }
 
 type enrollResponse struct {
@@ -30,6 +32,7 @@ type enrollResponse struct {
 
 type adminEnrollCodeRequest struct {
 	ClientName string `json:"client_name"`
+	TenantID   string `json:"tenant_id"`
 	MaxUses    int    `json:"max_uses"`
 	TTLHours   int    `json:"ttl_hours"`
 }
@@ -61,7 +64,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 
 	// Security: Require HTTPS unless explicit test override is active
 	if os.Getenv("WMONITOR_ALLOW_INSECURE_ENROLL") != "1" {
-		isSecure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+		isSecure := requestIsHTTPS(r)
 		if !isSecure {
 			writeJSONError(w, http.StatusUpgradeRequired, "enrollment requires HTTPS")
 			return
@@ -89,6 +92,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 
 	req.EnrollCode = strings.TrimSpace(req.EnrollCode)
 	req.ServerID = strings.TrimSpace(req.ServerID)
+	req.CurrentToken = strings.TrimSpace(req.CurrentToken)
 	if req.EnrollCode == "" || req.ServerID == "" {
 		writeJSONError(w, http.StatusBadRequest, "enroll_code and server_id are required")
 		return
@@ -106,22 +110,6 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Atomic consume: validates code, checks expiry & max_uses, increments uses
-	codeHash := storage.HashAPIKey(req.EnrollCode)
-	codeRec, err := adminStore.ConsumeEnrollCode(codeHash)
-	if err != nil {
-		log.Printf("[server] failed enrollment attempt for server %q from %s", req.ServerID, ip)
-		// Byte-identical 401 response for all invalid/exhausted/expired codes
-		writeJSONError(w, http.StatusUnauthorized, "enrollment failed")
-		return
-	}
-
-	// Idempotent rotation: if an existing token was active for this (tenant, server_id), revoke it
-	if n, _ := adminStore.RevokeAgent(codeRec.TenantID, req.ServerID); n > 0 {
-		log.Printf("[server] rotated %d existing agent token(s) for server %q", n, req.ServerID)
-	}
-
-	// Generate new machine-bound agent token (scope: ingest)
 	agentToken, err := storage.GenerateToken(storage.KindAgent)
 	if err != nil {
 		log.Printf("[server] generate agent token error: %v", err)
@@ -129,34 +117,49 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agentHash := storage.HashAPIKey(agentToken)
-	prefix := storage.ExtractKeyPrefix(agentToken)
+	currentHash := ""
+	if req.CurrentToken != "" {
+		currentHash = storage.HashAPIKey(req.CurrentToken)
+	}
 
-	err = adminStore.UpsertAPIKey(storage.APIKeyRecord{
-		TenantID:   codeRec.TenantID,
-		ClientName: codeRec.ClientName,
-		KeyHash:    agentHash,
-		KeyPrefix:  prefix,
-		Kind:       storage.KindAgent,
-		Scope:      storage.ScopeIngest,
-		ServerID:   req.ServerID,
-		IssuedBy:   "enroll:" + codeRec.ClientName,
-		CreatedAt:  time.Now(),
+	result, err := adminStore.CompleteEnrollment(storage.EnrollmentRequest{
+		CodeHash:         storage.HashEnrollCode(req.EnrollCode),
+		ServerID:         req.ServerID,
+		CurrentTokenHash: currentHash,
+		Token:            agentToken,
+		TokenHash:        storage.HashAPIKey(agentToken),
+		TokenPrefix:      storage.ExtractKeyPrefix(agentToken),
 	})
 	if err != nil {
-		log.Printf("[server] store agent token error: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "internal server error")
+		switch {
+		case errors.Is(err, storage.ErrRotationRequiresProof):
+			writeJSONError(w, http.StatusConflict, "replacement requires current_token or operator approval")
+		case errors.Is(err, storage.ErrEnrollmentConflict):
+			writeJSONError(w, http.StatusConflict, "enrollment conflict; retry")
+		case errors.Is(err, storage.ErrAPIKeyNotFound):
+			log.Printf("[server] failed enrollment attempt for server %q from %s", req.ServerID, ip)
+			writeJSONError(w, http.StatusUnauthorized, "enrollment failed")
+		default:
+			log.Printf("[server] store agent token error: %v", err)
+			writeJSONError(w, http.StatusInternalServerError, "internal server error")
+		}
 		return
 	}
 
-	log.Printf("[server] successfully enrolled server %q (%s, %s, ver=%s) for client %q [prefix: %s]",
-		req.ServerID, req.Hostname, req.OS, req.Version, codeRec.ClientName, prefix)
+	s.invalidateHashes(result.RevokedHashes)
+	prefix := storage.ExtractKeyPrefix(result.Token)
+	if result.Recovered {
+		log.Printf("[server] recovered enrollment handshake for server %q [prefix: %s]", req.ServerID, prefix)
+	} else {
+		log.Printf("[server] successfully enrolled server %q (%s, %s, ver=%s) for client %q [prefix: %s]",
+			req.ServerID, req.Hostname, req.OS, req.Version, result.ClientName, prefix)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(enrollResponse{
-		Token:    agentToken,
-		TenantID: codeRec.TenantID,
+		Token:    result.Token,
+		TenantID: result.TenantID,
 		ServerID: req.ServerID,
 	})
 }
@@ -169,7 +172,7 @@ func (s *Server) handleAdminEnrollCodes(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Requires admin scope
+	// Requires platform admin (legacy/all cannot satisfy ScopeAdmin)
 	_, ok := s.authTenantScope(w, r, storage.ScopeAdmin)
 	if !ok {
 		return
@@ -203,14 +206,23 @@ func (s *Server) handleAdminEnrollCodes(w http.ResponseWriter, r *http.Request) 
 		ttlHours = 336 // default 14 days (336 hours)
 	}
 
-	// Find existing tenant ID for client_name or mint a fresh one
+	// Find existing tenant ID only when the display name is unique. Duplicates
+	// never resolve identity. An explicit tenant_id always wins.
 	var tenantID string
-	allKeys, _ := adminStore.ListAPIKeys()
-	for _, k := range allKeys {
-		if strings.EqualFold(k.ClientName, req.ClientName) && k.TenantID != "" {
-			tenantID = k.TenantID
-			break
+	if req.TenantID != "" {
+		tenantID = strings.TrimSpace(req.TenantID)
+	} else {
+		allKeys, err := adminStore.ListAPIKeys()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to list credentials")
+			return
 		}
+		id, err := storage.UniqueTenantForClientName(allKeys, req.ClientName)
+		if err != nil {
+			writeJSONError(w, http.StatusConflict, "client_name is ambiguous; pass tenant_id")
+			return
+		}
+		tenantID = id
 	}
 	if tenantID == "" {
 		var err error
@@ -227,7 +239,7 @@ func (s *Server) handleAdminEnrollCodes(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	codeHash := storage.HashAPIKey(code)
+	codeHash := storage.HashEnrollCode(code)
 	expiresAt := time.Now().Add(time.Duration(ttlHours) * time.Hour)
 
 	if err := adminStore.UpsertAPIKey(storage.APIKeyRecord{
@@ -236,7 +248,7 @@ func (s *Server) handleAdminEnrollCodes(w http.ResponseWriter, r *http.Request) 
 		KeyHash:    codeHash,
 		KeyPrefix:  "wme_",
 		Kind:       storage.KindEnroll,
-		Scope:      storage.ScopeIngest,
+		Scope:      storage.ScopeEnroll,
 		ExpiresAt:  expiresAt,
 		MaxUses:    maxUses,
 		IssuedBy:   "admin",
@@ -247,8 +259,8 @@ func (s *Server) handleAdminEnrollCodes(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	log.Printf("[server] created enroll code %s for client %q (max_uses=%d, ttl=%dh)",
-		code, req.ClientName, maxUses, ttlHours)
+	log.Printf("[server] created enroll code for client %q (max_uses=%d, ttl=%dh)",
+		req.ClientName, maxUses, ttlHours)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -265,7 +277,7 @@ func (s *Server) handleAdminEnrollCodes(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleAdminAgents(w http.ResponseWriter, r *http.Request) {
 	s.writeCORS(w, r)
 	// Requires read or admin scope
-	tenantID, ok := s.authTenantScope(w, r, storage.ScopeRead)
+	principal, ok := s.authPrincipal(w, r, storage.ScopeRead)
 	if !ok {
 		return
 	}
@@ -278,8 +290,15 @@ func (s *Server) handleAdminAgents(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		// Optional filter for tenant if caller is tenant-scoped
-		agents, err := adminStore.ListAgents(tenantID)
+		listTenant := principal.TenantID
+		if principal.Kind == storage.KindAdmin && principal.Permissions == storage.ScopeAdmin {
+			if q := strings.TrimSpace(r.URL.Query().Get("tenant_id")); q != "" {
+				listTenant = q
+			} else {
+				listTenant = ""
+			}
+		}
+		agents, err := adminStore.ListAgents(listTenant)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to list agents")
 			return
@@ -300,16 +319,28 @@ func (s *Server) handleAdminAgents(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{"agents": out})
 
 	case http.MethodDelete:
+		if !principal.permits(storage.ScopeAdmin) {
+			writeJSONError(w, http.StatusForbidden, "insufficient credential scope")
+			return
+		}
 		targetServerID := strings.TrimSpace(r.URL.Query().Get("server_id"))
 		if targetServerID == "" {
 			writeJSONError(w, http.StatusBadRequest, "server_id is required")
 			return
 		}
-		revoked, err := adminStore.RevokeAgent(tenantID, targetServerID)
+		revokeTenant := principal.TenantID
+		if principal.Kind == storage.KindAdmin {
+			if q := strings.TrimSpace(r.URL.Query().Get("tenant_id")); q != "" {
+				revokeTenant = q
+			}
+		}
+		hashes, _ := adminStore.ActiveAgentHashes(revokeTenant, targetServerID)
+		revoked, err := adminStore.RevokeAgent(revokeTenant, targetServerID)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to revoke agent")
 			return
 		}
+		s.invalidateHashes(hashes)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"server_id": targetServerID,
@@ -378,6 +409,22 @@ func (s *Server) handleAdminClients(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		existing, err := adminStore.ListAPIKeys()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "failed to list clients")
+			return
+		}
+		if _, err := storage.UniqueTenantForClientName(existing, req.ClientName); err != nil {
+			writeJSONError(w, http.StatusConflict, "client_name is ambiguous")
+			return
+		}
+		for _, k := range existing {
+			if strings.EqualFold(k.ClientName, req.ClientName) {
+				writeJSONError(w, http.StatusConflict, "client_name already exists")
+				return
+			}
+		}
+
 		readToken, err := storage.GenerateToken(storage.KindRead)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to generate read token")
@@ -418,4 +465,74 @@ func (s *Server) handleAdminClients(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// handleAdminAgentRotate issues a replacement agent token with operator approval
+// (POST /api/admin/agents/rotate). No enrollment code is consumed.
+func (s *Server) handleAdminAgentRotate(w http.ResponseWriter, r *http.Request) {
+	s.writeCORS(w, r)
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	principal, ok := s.authPrincipal(w, r, storage.ScopeAdmin)
+	if !ok {
+		return
+	}
+	adminStore, ok := s.keys.(AdminStore)
+	if !ok {
+		writeJSONError(w, http.StatusServiceUnavailable, "admin store unavailable")
+		return
+	}
+
+	var req struct {
+		ServerID string `json:"server_id"`
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.ServerID = strings.TrimSpace(req.ServerID)
+	if req.ServerID == "" {
+		writeJSONError(w, http.StatusBadRequest, "server_id is required")
+		return
+	}
+	tenantID := principal.TenantID
+	if principal.Kind == storage.KindAdmin {
+		if q := strings.TrimSpace(req.TenantID); q != "" {
+			tenantID = q
+		}
+	}
+	if tenantID == "" {
+		writeJSONError(w, http.StatusBadRequest, "tenant_id is required")
+		return
+	}
+
+	token, err := storage.GenerateToken(storage.KindAgent)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+	result, err := adminStore.ReplaceAgent(tenantID, req.ServerID, token, storage.HashAPIKey(token), storage.ExtractKeyPrefix(token))
+	if err != nil {
+		if errors.Is(err, storage.ErrAPIKeyNotFound) {
+			writeJSONError(w, http.StatusNotFound, "no active agent for that identity")
+			return
+		}
+		if errors.Is(err, storage.ErrEnrollmentConflict) {
+			writeJSONError(w, http.StatusConflict, "enrollment conflict; retry")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to rotate agent")
+		return
+	}
+	s.invalidateHashes(result.RevokedHashes)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(enrollResponse{
+		Token:    result.Token,
+		TenantID: result.TenantID,
+		ServerID: result.ServerID,
+	})
 }

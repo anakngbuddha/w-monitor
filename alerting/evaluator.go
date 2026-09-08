@@ -89,7 +89,15 @@ func (e *Evaluator) Run(ctx context.Context) {
 
 // EvaluateOnce runs a single evaluation pass.
 func (e *Evaluator) EvaluateOnce(now time.Time) error {
-	rows, err := e.store.QueryMetrics(now.Add(-lookback), "")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var rows []storage.MetricRow
+	var err error
+	if q, ok := e.store.(storage.AllTenantsQuerier); ok {
+		rows, err = q.QueryMetricsAllTenants(ctx, now.Add(-lookback), 0)
+	} else {
+		rows, err = e.store.QueryMetrics(now.Add(-lookback), storage.LocalTenantID)
+	}
 	if err != nil {
 		return fmt.Errorf("query metrics: %w", err)
 	}
@@ -97,16 +105,17 @@ func (e *Evaluator) EvaluateOnce(now time.Time) error {
 		return nil
 	}
 
-	// Keep only the newest sample per server. Alerting on an average over the
+	// Keep only the newest sample per tenant+server. Alerting on an average over the
 	// lookback window would blunt exactly the spikes we care about.
 	latest := make(map[string]storage.MetricRow)
 	for _, row := range rows {
-		if cur, ok := latest[row.ServerID]; !ok || row.Timestamp.After(cur.Timestamp) {
-			latest[row.ServerID] = row
+		key := row.TenantID + "\x00" + row.ServerID
+		if cur, ok := latest[key]; !ok || row.Timestamp.After(cur.Timestamp) {
+			latest[key] = row
 		}
 	}
 
-	for serverID, row := range latest {
+	for _, row := range latest {
 		for _, rule := range e.rules {
 			if !rule.IsEnabled() {
 				continue
@@ -115,7 +124,7 @@ func (e *Evaluator) EvaluateOnce(now time.Time) error {
 			if !ok {
 				continue
 			}
-			e.evaluateRule(rule, serverID, row, value, now)
+			e.evaluateRule(rule, row.ServerID, row, value, now)
 		}
 	}
 	return nil
@@ -123,7 +132,7 @@ func (e *Evaluator) EvaluateOnce(now time.Time) error {
 
 // evaluateRule advances the state machine for one rule/server pair.
 func (e *Evaluator) evaluateRule(rule Rule, serverID string, row storage.MetricRow, value float64, now time.Time) {
-	key := alertKey(rule.Name, serverID)
+	key := alertKey(rule.Name, row.TenantID, serverID)
 
 	e.mu.Lock()
 	st, ok := e.states[key]
@@ -211,10 +220,14 @@ func buildAlert(rule Rule, serverID string, row storage.MetricRow, value float64
 		state = StateOK
 	}
 
+	tenantID := row.TenantID
+	if tenantID == "" {
+		tenantID = storage.LocalTenantID
+	}
 	return Alert{
 		Rule:      rule.Name,
 		ServerID:  serverID,
-		TenantID:  row.TenantID,
+		TenantID:  tenantID,
 		Metric:    rule.Metric,
 		Severity:  rule.Severity,
 		State:     state,

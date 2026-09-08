@@ -1,6 +1,7 @@
 package alerting
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,21 @@ func (f *fakeStore) set(rows ...storage.MetricRow) {
 }
 
 func (f *fakeStore) QueryMetrics(since time.Time, tenantID string) ([]storage.MetricRow, error) {
+	if err := storage.RequireTenant(tenantID); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []storage.MetricRow
+	for _, r := range f.rows {
+		if r.TenantID == tenantID || (r.TenantID == "" && tenantID == storage.LocalTenantID) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) QueryMetricsAllTenants(context.Context, time.Time, int) ([]storage.MetricRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]storage.MetricRow, len(f.rows))
@@ -378,6 +394,26 @@ func TestOneFailingNotifierDoesNotBlockOthers(t *testing.T) {
 
 	if cap.count() == 0 {
 		t.Error("a failing notifier prevented the working notifier from receiving the alert")
+	}
+}
+
+func TestTwoTenantsSameServerDoNotShareAlertState(t *testing.T) {
+	store := &fakeStore{}
+	cap := &captureNotifier{}
+	e := New(store, []Rule{cpuRule(90, "0s")}, cap)
+	now := time.Now()
+	hot := sample("web-01", 99, now)
+	hot.TenantID = "t_a"
+	cool := sample("web-01", 10, now)
+	cool.TenantID = "t_b"
+	store.set(hot, cool)
+	e.EvaluateOnce(now)
+	e.EvaluateOnce(now.Add(time.Second))
+	if cap.count() != 1 {
+		t.Fatalf("got %d alerts, want 1 (only tenant t_a is hot)", cap.count())
+	}
+	if cap.last().TenantID != "t_a" {
+		t.Fatalf("tenant = %q, want t_a", cap.last().TenantID)
 	}
 }
 

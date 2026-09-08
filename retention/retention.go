@@ -1,67 +1,141 @@
-// Package retention implements the hourly cleanup job:
-//   - Deletes rows older than 30 days
-//   - Collapses raw rows older than 24h into hourly averages
+// Package retention implements the hourly cleanup job.
+//
+// P1.02 containment (V07): destructive SQLite downsampling and automatic
+// 30-day purge are disabled until P2.03. Run() reports status and enforces a
+// disk budget instead of merging tenants/servers into unowned hourly averages.
 package retention
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"os"
+	"sync"
 	"time"
 )
 
 const (
-	retentionDays  = 30
+	retentionDays   = 30
 	downsampleAfter = 24 * time.Hour
+	// DefaultDiskBudgetBytes is 10 GiB. Override with SetDiskBudget or
+	// WMONITOR_DISK_BUDGET_BYTES. Zero means no budget check.
+	DefaultDiskBudgetBytes int64 = 10 << 30
+	DisabledReason               = "destructive downsampling and automatic purge are disabled until P2.03 (V07 containment); original tenant/server rows are preserved"
 )
+
+// ErrDiskPressure is returned when the data file exceeds the configured budget.
+var ErrDiskPressure = errors.New("retention: disk budget exhausted")
 
 // Pruner is implemented by storage backends that can delete rows older than a cutoff (e.g. PostgresDB).
 type Pruner interface {
 	PurgeOld(cutoff time.Time) (mDel, pDel int64, err error)
 }
 
+// Status is the operator-visible retention containment state.
+type Status struct {
+	DownsamplingEnabled bool   `json:"downsampling_enabled"`
+	PurgeEnabled        bool   `json:"purge_enabled"`
+	Reason              string `json:"reason"`
+	DiskUsedBytes       int64  `json:"disk_used_bytes"`
+	DiskBudgetBytes     int64  `json:"disk_budget_bytes"`
+	DiskPressure        bool   `json:"disk_pressure"`
+}
+
 // Job holds a reference to the underlying *sql.DB for SQLite queries or a Pruner for Postgres.
 type Job struct {
 	conn   *sql.DB
 	pruner Pruner
+
+	dataPath        string
+	diskBudgetBytes int64
+
+	mu         sync.Mutex
+	lastStatus Status
 }
 
 // New creates a retention Job for SQLite.
 func New(conn *sql.DB) *Job {
-	return &Job{conn: conn}
+	j := &Job{conn: conn, diskBudgetBytes: DefaultDiskBudgetBytes}
+	j.lastStatus = Status{Reason: DisabledReason, DiskBudgetBytes: DefaultDiskBudgetBytes}
+	return j
 }
 
 // NewWithPruner creates a retention Job for any backend implementing Pruner.
 func NewWithPruner(pruner Pruner) *Job {
-	return &Job{pruner: pruner}
+	j := &Job{pruner: pruner, diskBudgetBytes: DefaultDiskBudgetBytes}
+	j.lastStatus = Status{Reason: DisabledReason, DiskBudgetBytes: DefaultDiskBudgetBytes}
+	return j
 }
 
-// Run executes one retention pass: purge old rows then downsample (if supported).
+// SetDataPath is the SQLite file or data directory used for disk-budget accounting.
+func (j *Job) SetDataPath(path string) {
+	j.mu.Lock()
+	j.dataPath = path
+	j.mu.Unlock()
+}
+
+// SetDiskBudget sets the maximum allowed size of the data path. 0 disables the check.
+func (j *Job) SetDiskBudget(bytes int64) {
+	j.mu.Lock()
+	j.diskBudgetBytes = bytes
+	j.mu.Unlock()
+}
+
+// Status returns the last computed containment state.
+func (j *Job) Status() Status {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.lastStatus
+}
+
+// Run records containment status and enforces the disk budget. It does not
+// downsample or purge (V07).
 func (j *Job) Run() error {
-	cutoff30d := time.Now().Add(-retentionDays * 24 * time.Hour)
-	cutoff24h := time.Now().Add(-downsampleAfter)
+	used := j.diskUsed()
+	j.mu.Lock()
+	budget := j.diskBudgetBytes
+	j.mu.Unlock()
 
-	if j.pruner != nil {
-		mDel, pDel, err := j.pruner.PurgeOld(cutoff30d)
-		if err != nil {
-			return fmt.Errorf("purge: %w", err)
-		}
-		log.Printf("[retention] purged %d metric rows, %d process rows older than %s", mDel, pDel, cutoff30d.Format(time.RFC3339))
-		return nil
+	st := Status{
+		DownsamplingEnabled: false,
+		PurgeEnabled:        false,
+		Reason:              DisabledReason,
+		DiskUsedBytes:       used,
+		DiskBudgetBytes:     budget,
 	}
-
-	if j.conn != nil {
-		if err := j.purgeOld(cutoff30d); err != nil {
-			return fmt.Errorf("purge: %w", err)
-		}
-		if err := j.downsampleMetrics(cutoff24h); err != nil {
-			return fmt.Errorf("downsample metrics: %w", err)
-		}
-		if err := j.downsampleProcesses(cutoff24h); err != nil {
-			return fmt.Errorf("downsample processes: %w", err)
-		}
+	if budget > 0 && used > budget {
+		st.DiskPressure = true
+		j.setStatus(st)
+		log.Printf("[retention] disk pressure: used=%d budget=%d — refusing destructive cleanup; %s", used, budget, DisabledReason)
+		return fmt.Errorf("%w: used %d bytes, budget %d", ErrDiskPressure, used, budget)
 	}
+	j.setStatus(st)
+	log.Printf("[retention] skipped destructive downsampling/purge: %s", DisabledReason)
 	return nil
+}
+
+func (j *Job) setStatus(st Status) {
+	j.mu.Lock()
+	j.lastStatus = st
+	j.mu.Unlock()
+}
+
+func (j *Job) diskUsed() int64 {
+	j.mu.Lock()
+	path := j.dataPath
+	j.mu.Unlock()
+	if path == "" {
+		return 0
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	if fi.IsDir() {
+		return 0
+	}
+	return fi.Size()
 }
 
 // purgeOld deletes all rows older than cutoff.
@@ -83,8 +157,9 @@ func (j *Job) purgeOld(cutoff time.Time) error {
 	return nil
 }
 
-// downsampleMetrics collapses raw metric rows older than cutoff into hourly averages.
-// It computes averages per hour bucket, inserts them, then deletes the originals.
+// unsafeDownsampleMetrics is the pre-P1.02 implementation. It MUST NOT be
+// called: grouping by hour without tenant/server destroys ownership (V07).
+// P2.03 will replace it with typed rollups. Kept only as a reference for that work.
 func (j *Job) downsampleMetrics(cutoff time.Time) error {
 	tx, err := j.conn.Begin()
 	if err != nil {

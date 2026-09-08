@@ -32,6 +32,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -70,6 +71,7 @@ var (
 	flagStop      = flag.Bool("stop", false, "Stop the running service")
 	flagExportCSV = flag.String("export-csv", "", "Export 30-day CSV report to this path and exit")
 	flagExportTxt = flag.String("export-txt", "", "Export 30-day text report to this path and exit")
+	flagTenant    = flag.String("tenant", "", "Tenant ID for CSV/HTML/text export (required for hub data; default t_local)")
 	flagRunFor    = flag.Duration("run-for", 0, "Run for this duration then export and exit (e.g. 1h, 30m)")
 	flagExportFlt = flag.String("export-filter", "", "Filter for automatic export (daily, weekly, monthly)")
 
@@ -107,6 +109,8 @@ var (
 	flagNewAdminToken = flag.Bool("new-admin-token", false, "Generate and register a new admin token (wmk_...) and exit")
 	flagListAgents    = flag.String("list-agents", "", "List enrolled agents for a client or tenant and exit")
 	flagRevokeAgent   = flag.String("revoke-agent", "", "Revoke agent token for a server ID and exit")
+	flagMigrateOpaqueTenants = flag.Bool("migrate-opaque-tenants", false, "One-time remap of plaintext tenant IDs to t_<hex> (SQLite; requires backup dir)")
+	flagOpaqueBackupDir      = flag.String("opaque-tenant-backup-dir", "", "Directory for the pre-migration SQLite copy (required with -migrate-opaque-tenants)")
 
 	// Phase 13 — observability & tuning
 	flagUserWindow  = flag.Duration("user-window", 60*time.Second, "Sliding window for counting concurrent users")
@@ -263,8 +267,82 @@ func main() {
 
 	// ── Client credential management (needs a store, no collector) ──
 	if *flagAddClient != "" || *flagListClients || *flagRevokeClient != "" || *flagImportClients != "" ||
-		*flagNewEnrollCode != "" || *flagNewAdminToken || *flagListAgents != "" || *flagRevokeAgent != "" {
+		*flagNewEnrollCode != "" || *flagNewAdminToken || *flagListAgents != "" || *flagRevokeAgent != "" ||
+		*flagMigrateOpaqueTenants {
 		runClientAdmin()
+		return
+	}
+
+	// ── Service control commands (-install, -uninstall, -start, -stop) ──
+	if *flagInstall {
+		var svcArgs []string
+		if *flagAgentHub != "" {
+			ensureAgentCredentials()
+			svcArgs = append(svcArgs, "-agent", *flagAgentHub)
+			if *flagExternalIface != "" {
+				svcArgs = append(svcArgs, "-external-iface", *flagExternalIface)
+			}
+			if *flagAppPort != "" {
+				svcArgs = append(svcArgs, "-app-port", *flagAppPort)
+			}
+		} else {
+			for _, arg := range os.Args[1:] {
+				if arg != "-install" && arg != "--install" {
+					svcArgs = append(svcArgs, arg)
+				}
+			}
+		}
+
+		svcConfig := &service.Config{
+			Name:        "wmonitor",
+			DisplayName: "W-Monitor System Monitor",
+			Description: "W-Monitor Monitoring Service",
+			Arguments:   serviceSafeArgs(svcArgs),
+		}
+		svc, err := service.New(&program{}, svcConfig)
+		if err != nil {
+			log.Fatalf("service.New: %v", err)
+		}
+		if err := svc.Install(); err != nil {
+			log.Fatalf("install: %v", err)
+		}
+		fmt.Println("Service installed. Start it with: wmonitor -start")
+		return
+	}
+
+	if *flagUninstall {
+		svc, err := service.New(&program{}, &service.Config{Name: "wmonitor"})
+		if err != nil {
+			log.Fatalf("service.New: %v", err)
+		}
+		if err := svc.Uninstall(); err != nil {
+			log.Fatalf("uninstall: %v", err)
+		}
+		fmt.Println("Service uninstalled.")
+		return
+	}
+
+	if *flagStart {
+		svc, err := service.New(&program{}, &service.Config{Name: "wmonitor"})
+		if err != nil {
+			log.Fatalf("service.New: %v", err)
+		}
+		if err := service.Control(svc, "start"); err != nil {
+			log.Fatalf("start: %v", err)
+		}
+		fmt.Println("Service started.")
+		return
+	}
+
+	if *flagStop {
+		svc, err := service.New(&program{}, &service.Config{Name: "wmonitor"})
+		if err != nil {
+			log.Fatalf("service.New: %v", err)
+		}
+		if err := service.Control(svc, "stop"); err != nil {
+			log.Fatalf("stop: %v", err)
+		}
+		fmt.Println("Service stopped.")
 		return
 	}
 
@@ -282,7 +360,7 @@ func main() {
 
 	// ── One-shot modes (export / report) ──
 	if *flagExportCSV != "" {
-		n, err := export.CSVReport(store, time.Now().Add(-*flagSince), *flagExportCSV)
+		n, err := export.CSVReport(store, time.Now().Add(-*flagSince), *flagExportCSV, exportTenant())
 		if err != nil {
 			log.Fatalf("CSV export: %v", err)
 		}
@@ -291,7 +369,7 @@ func main() {
 		return
 	}
 	if *flagExportTxt != "" {
-		s, err := export.TextReport(store, time.Now().Add(-*flagSince), *flagExportTxt)
+		s, err := export.TextReport(store, time.Now().Add(-*flagSince), *flagExportTxt, exportTenant())
 		if err != nil {
 			log.Fatalf("text export: %v", err)
 		}
@@ -302,7 +380,7 @@ func main() {
 	if *flagAssessmentReport != "" {
 		end := time.Now()
 		start := end.Add(-*flagSince)
-		if err := export.GenerateAssessmentReport(store, start, end, *flagAssessmentReport); err != nil {
+		if err := export.GenerateAssessmentReport(store, start, end, *flagAssessmentReport, exportTenant()); err != nil {
 			log.Fatalf("assessment report: %v", err)
 		}
 		fmt.Printf("Assessment report written to %s\n", *flagAssessmentReport)
@@ -317,16 +395,40 @@ func main() {
 	}
 	configureUserTracker(col)
 
-	// Retention: downsampling & purge for SQLite, automated purge for Postgres.
+	// Retention: destructive downsampling/purge are contained (V07) until P2.03.
 	var ret *retention.Job
 	if sqliteDB != nil {
 		ret = retention.New(sqliteDB.Conn())
+		ret.SetDataPath(sqliteDB.Path)
 	} else if pruner, ok := store.(retention.Pruner); ok {
 		ret = retention.NewWithPruner(pruner)
-		log.Println("[wmonitor] retention enabled for Postgres backend (hourly purge older than 30 days)")
+	}
+	if ret != nil {
+		if v := strings.TrimSpace(os.Getenv("WMONITOR_DISK_BUDGET_BYTES")); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				ret.SetDiskBudget(n)
+			} else {
+				log.Printf("[wmonitor] ignoring invalid WMONITOR_DISK_BUDGET_BYTES=%q: %v", v, err)
+			}
+		}
+		log.Printf("[wmonitor] retention containment: %s", retention.DisabledReason)
 	}
 
 	srv := server.New(store, *flagPort)
+	if ret != nil {
+		job := ret
+		srv.SetRetentionStatusProvider(func() map[string]interface{} {
+			st := job.Status()
+			return map[string]interface{}{
+				"downsampling_enabled": st.DownsamplingEnabled,
+				"purge_enabled":        st.PurgeEnabled,
+				"reason":               st.Reason,
+				"disk_pressure":        st.DiskPressure,
+				"disk_used_bytes":      st.DiskUsedBytes,
+				"disk_budget_bytes":    st.DiskBudgetBytes,
+			}
+		})
+	}
 
 	if *flagHub {
 		keys, ok := store.(server.KeyStore)
@@ -366,42 +468,12 @@ func main() {
 		Name:        "wmonitor",
 		DisplayName: "W-Monitor System Monitor",
 		Description: "Collects system metrics and serves the monitoring dashboard at localhost:" + *flagPort,
-		Arguments:   svcArgs,
+		Arguments:   serviceSafeArgs(svcArgs),
 	}
 
 	svc, err := service.New(prg, svcConfig)
 	if err != nil {
 		log.Fatalf("service.New: %v", err)
-	}
-
-	// ── Service control commands ──
-	if *flagInstall {
-		if err := svc.Install(); err != nil {
-			log.Fatalf("install: %v", err)
-		}
-		fmt.Println("Service installed. Start it with: wmonitor -start")
-		return
-	}
-	if *flagUninstall {
-		if err := svc.Uninstall(); err != nil {
-			log.Fatalf("uninstall: %v", err)
-		}
-		fmt.Println("Service uninstalled.")
-		return
-	}
-	if *flagStart {
-		if err := service.Control(svc, "start"); err != nil {
-			log.Fatalf("start: %v", err)
-		}
-		fmt.Println("Service started.")
-		return
-	}
-	if *flagStop {
-		if err := service.Control(svc, "stop"); err != nil {
-			log.Fatalf("stop: %v", err)
-		}
-		fmt.Println("Service stopped.")
-		return
 	}
 
 	// ── Interactive/foreground mode ──
@@ -493,7 +565,7 @@ func writeShutdownExport(store storage.Store) {
 
 	if runtime.GOOS == "windows" {
 		outPath := fmt.Sprintf("wmonitor_export_%s.csv", time.Now().Format("20060102_150405"))
-		n, err := export.CSVReport(store, since, outPath)
+		n, err := export.CSVReport(store, since, outPath, exportTenant())
 		if err != nil {
 			log.Printf("Auto-export CSV error: %v", err)
 			return
@@ -503,7 +575,7 @@ func writeShutdownExport(store storage.Store) {
 	}
 
 	outPath := fmt.Sprintf("wmonitor_export_%s.txt", time.Now().Format("20060102_150405"))
-	s, err := export.TextReport(store, since, outPath)
+	s, err := export.TextReport(store, since, outPath, exportTenant())
 	if err != nil {
 		log.Printf("Auto-export TXT error: %v", err)
 		return
@@ -594,10 +666,7 @@ func mask(s string) string {
 	if s == "" {
 		return "(not set)"
 	}
-	if len(s) <= 8 {
-		return "********"
-	}
-	return s[:4] + "..." + s[len(s)-4:]
+	return "(set)"
 }
 
 func maskDSN() string {
@@ -637,6 +706,8 @@ func runClientAdmin() {
 		listAgents(keys, *flagListAgents)
 	case *flagRevokeAgent != "":
 		revokeAgent(keys, *flagRevokeAgent)
+	case *flagMigrateOpaqueTenants:
+		runOpaqueTenantMigration(store)
 	case *flagAddClient != "":
 		addClient(keys, *flagAddClient)
 	case *flagListClients:
@@ -656,6 +727,7 @@ type clientAdminStore interface {
 	ConsumeEnrollCode(codeHash string) (storage.APIKeyRecord, error)
 	RevokeAgent(tenantID, serverID string) (int64, error)
 	ListAgents(tenantID string) ([]storage.APIKeyRecord, error)
+	LookupAPIKey(keyHash string) (storage.APIKeyRecord, error)
 }
 
 func newEnrollCode(keys clientAdminStore, name string, ttl time.Duration, maxUses int) {
@@ -665,12 +737,13 @@ func newEnrollCode(keys clientAdminStore, name string, ttl time.Duration, maxUse
 	}
 
 	var tenantID string
-	allKeys, _ := keys.ListAPIKeys()
-	for _, k := range allKeys {
-		if strings.EqualFold(k.ClientName, name) && k.TenantID != "" {
-			tenantID = k.TenantID
-			break
-		}
+	allKeys, err := keys.ListAPIKeys()
+	if err != nil {
+		log.Fatalf("list keys: %v", err)
+	}
+	tenantID, err = storage.UniqueTenantForClientName(allKeys, name)
+	if err != nil {
+		log.Fatalf("client name %q is ambiguous; pass a unique name or create the code with an explicit tenant", name)
 	}
 	if tenantID == "" {
 		tenantID, err = storage.NewTenantID()
@@ -679,7 +752,7 @@ func newEnrollCode(keys clientAdminStore, name string, ttl time.Duration, maxUse
 		}
 	}
 
-	codeHash := storage.HashAPIKey(code)
+	codeHash := storage.HashEnrollCode(code)
 	expiresAt := time.Now().Add(ttl)
 
 	if err := keys.UpsertAPIKey(storage.APIKeyRecord{
@@ -688,7 +761,7 @@ func newEnrollCode(keys clientAdminStore, name string, ttl time.Duration, maxUse
 		KeyHash:    codeHash,
 		KeyPrefix:  "wme_",
 		Kind:       storage.KindEnroll,
-		Scope:      storage.ScopeIngest,
+		Scope:      storage.ScopeEnroll,
 		ExpiresAt:  expiresAt,
 		MaxUses:    maxUses,
 		IssuedBy:   "cli",
@@ -773,19 +846,30 @@ func revokeAgent(keys clientAdminStore, serverID string) {
 	if err != nil {
 		log.Fatalf("list agents: %v", err)
 	}
-	var count int64
+	var matches []storage.APIKeyRecord
 	for _, a := range agents {
 		if strings.EqualFold(a.ServerID, serverID) && !a.Revoked {
-			n, err := keys.RevokeAgent(a.TenantID, a.ServerID)
-			if err != nil {
-				log.Fatalf("revoke agent: %v", err)
-			}
-			count += n
+			matches = append(matches, a)
 		}
 	}
-	if count == 0 {
+	tenants := map[string]struct{}{}
+	for _, a := range matches {
+		tenants[a.TenantID] = struct{}{}
+	}
+	if len(tenants) > 1 {
+		log.Fatalf("server ID %q exists in %d tenants; refusing to revoke by display identity. Use tenant-scoped revocation.", serverID, len(tenants))
+	}
+	if len(matches) == 0 {
 		fmt.Printf("No active agent token found for server ID %q.\n", serverID)
 		return
+	}
+	var count int64
+	for _, a := range matches {
+		n, err := keys.RevokeAgent(a.TenantID, a.ServerID)
+		if err != nil {
+			log.Fatalf("revoke agent: %v", err)
+		}
+		count += n
 	}
 	fmt.Printf("Revoked %d agent token(s) for server ID %q.\n", count, serverID)
 }
@@ -794,6 +878,18 @@ func addClient(keys clientAdminStore, name string) {
 	readToken, err := storage.GenerateToken(storage.KindRead)
 	if err != nil {
 		log.Fatalf("generate read token: %v", err)
+	}
+	existing, err := keys.ListAPIKeys()
+	if err != nil {
+		log.Fatalf("list keys: %v", err)
+	}
+	if _, err := storage.UniqueTenantForClientName(existing, name); err != nil {
+		log.Fatalf("client name %q is ambiguous", name)
+	}
+	for _, k := range existing {
+		if strings.EqualFold(k.ClientName, name) {
+			log.Fatalf("client name %q already exists (tenant %s); not minting a second identity", name, k.TenantID)
+		}
 	}
 	tenantID, err := storage.NewTenantID()
 	if err != nil {
@@ -895,10 +991,39 @@ func importClientsFromCSV(keys clientAdminStore, path string) (int, error) {
 			continue
 		}
 
+		hash := storage.HashAPIKey(rawKey)
+		if _, err := keys.LookupAPIKey(hash); err == nil || errors.Is(err, storage.ErrAPIKeyRevoked) {
+			log.Printf("row %d (%s): key already registered; not importing (will not un-revoke)", row, name)
+			continue
+		}
+
+		known, listErr := keys.ListAPIKeys()
+		if listErr != nil {
+			return imported, listErr
+		}
+		existingTenant, ambErr := storage.UniqueTenantForClientName(known, name)
+		if ambErr != nil {
+			log.Printf("row %d (%s): ambiguous client name; skipped", row, name)
+			continue
+		}
+		if existingTenant != "" {
+			log.Printf("row %d (%s): client name already bound to %s; skipped", row, name, existingTenant)
+			continue
+		}
+
+		tenantID, err := storage.NewTenantID()
+		if err != nil {
+			return imported, err
+		}
+
 		if err := keys.UpsertAPIKey(storage.APIKeyRecord{
-			KeyHash:    storage.HashAPIKey(rawKey),
-			TenantID:   rawKey, // preserves the tenant_id already on historical rows
+			KeyHash:    hash,
+			TenantID:   tenantID,
 			ClientName: name,
+			Kind:       storage.KindLegacy,
+			Scope:      storage.ScopeRead,
+			IssuedBy:   "import-clients",
+			CreatedAt:  time.Now(),
 		}); err != nil {
 			log.Printf("row %d (%s): %v", row, name, err)
 			continue
@@ -908,96 +1033,96 @@ func importClientsFromCSV(keys clientAdminStore, path string) (int, error) {
 	return imported, nil
 }
 
-// importClients migrates the legacy plaintext clients_registry.csv.
-//
-// Existing metric rows were written with tenant_id set to the raw API key, so
-// the imported tenant_id must stay equal to that raw key. Assigning fresh tenant
-// IDs here would orphan every historical row belonging to these clients.
+// importClients is an explicit, operator-run import. It never stores the raw
+// key as tenant_id. Historical telemetry still using a plaintext tenant_id
+// must be remapped with -migrate-opaque-tenants after a verified backup.
 func importClients(keys clientAdminStore, path string) {
 	imported, err := importClientsFromCSV(keys, path)
 	if err != nil {
 		log.Fatalf("open %s: %v", path, err)
 	}
 
-	fmt.Printf("\nImported %d client key(s) as hashes.\n", imported)
+	fmt.Printf("\nImported %d new client key(s) as hashes with opaque tenant IDs.\n", imported)
+	fmt.Printf("Existing or revoked hashes were left unchanged.\n")
 	fmt.Printf("Now delete %s: it holds plaintext credentials that are no longer needed.\n", path)
+	fmt.Printf("If historical metrics still use raw keys as tenant_id, run -migrate-opaque-tenants with a backup directory.\n")
 }
 
-// autoSeedHubKeys automatically registers the configured hub API key and any client keys
-// found in clients_registry.csv when running in Hub mode.
+// autoSeedHubKeys may register a never-seen configured token on first boot.
+// It never imports CSV files and never un-revokes an existing hash.
 func autoSeedHubKeys(store storage.Store) {
 	adminStore, ok := store.(clientAdminStore)
 	if !ok {
 		return
 	}
 
-	// 1. If an API key is configured on the Hub (via WMONITOR_API_KEY, -api-key, or baked in), ensure it's registered
-	if apiKey := resolveAPIKey(); apiKey != "" {
-		keyHash := storage.HashAPIKey(apiKey)
-		if keyStore, ok := store.(server.KeyStore); ok {
-			if _, err := keyStore.ResolveAPIKey(keyHash); err != nil {
-				if err := adminStore.UpsertAPIKey(storage.APIKeyRecord{
-					KeyHash:    keyHash,
-					TenantID:   apiKey,
-					ClientName: "default",
-				}); err == nil {
-					log.Printf("[server] registered configured API key for client \"default\"")
-				} else {
-					log.Printf("[server] failed to register configured API key: %v", err)
-				}
+	log.Printf("[server] clients_registry.csv is not auto-imported; use -import-clients then -migrate-opaque-tenants")
+
+	registerIfAbsent := func(plaintext, tenantID, clientName, kind, scope, issuedBy string) {
+		if plaintext == "" {
+			return
+		}
+		keyHash := storage.HashAPIKey(plaintext)
+		_, err := adminStore.LookupAPIKey(keyHash)
+		if errors.Is(err, storage.ErrAPIKeyRevoked) {
+			log.Printf("[server] configured credential for %q is revoked; leaving it revoked", clientName)
+			return
+		}
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, storage.ErrAPIKeyNotFound) {
+			log.Printf("[server] lookup configured credential for %q: %v", clientName, err)
+			return
+		}
+		rec := storage.APIKeyRecord{
+			KeyHash:    keyHash,
+			KeyPrefix:  storage.ExtractKeyPrefix(plaintext),
+			TenantID:   tenantID,
+			ClientName: clientName,
+			Kind:       kind,
+			Scope:      scope,
+			IssuedBy:   issuedBy,
+			CreatedAt:  time.Now(),
+		}
+		if rec.TenantID == "" {
+			id, genErr := storage.NewTenantID()
+			if genErr != nil {
+				log.Printf("[server] generate tenant id: %v", genErr)
+				return
 			}
+			rec.TenantID = id
 		}
+		if err := adminStore.UpsertAPIKey(rec); err != nil {
+			log.Printf("[server] failed to register configured credential for %q: %v", clientName, err)
+			return
+		}
+		log.Printf("[server] registered first-boot credential for %q (kind=%s scope=%s)", clientName, kind, scope)
 	}
 
-	// 2. If an admin token is configured on the Hub (via WMONITOR_ADMIN_TOKEN env var), ensure it's registered with admin scope
-	if adminToken := strings.TrimSpace(os.Getenv("WMONITOR_ADMIN_TOKEN")); adminToken != "" {
-		adminHash := storage.HashAPIKey(adminToken)
-		if keyStore, ok := store.(server.KeyStore); ok {
-			if _, err := keyStore.ResolveAPIKey(adminHash); err != nil {
-				prefix := storage.ExtractKeyPrefix(adminToken)
-				if err := adminStore.UpsertAPIKey(storage.APIKeyRecord{
-					KeyHash:    adminHash,
-					KeyPrefix:  prefix,
-					TenantID:   "admin",
-					ClientName: "Admin",
-					Kind:       storage.KindAdmin,
-					Scope:      storage.ScopeAdmin,
-					IssuedBy:   "env",
-					CreatedAt:  time.Now(),
-				}); err == nil {
-					log.Printf("[server] registered configured WMONITOR_ADMIN_TOKEN")
-				} else {
-					log.Printf("[server] failed to register admin token: %v", err)
-				}
-			}
-		}
-	}
+	registerIfAbsent(resolveAPIKey(), "", "default", storage.KindLegacy, storage.ScopeRead, "env")
+	registerIfAbsent(strings.TrimSpace(os.Getenv("WMONITOR_ADMIN_TOKEN")), "admin", "Admin", storage.KindAdmin, storage.ScopeAdmin, "env")
+}
 
-	// 3. If clients_registry.csv exists in current dir, exe dir, or data dir, auto-import any keys from it.
-	var candidates []string
-	if d, err := storage.DataDir(); err == nil {
-		candidates = append(candidates, filepath.Join(d, "clients_registry.csv"))
+func runOpaqueTenantMigration(store storage.Store) {
+	db, ok := store.(*storage.DB)
+	if !ok {
+		log.Fatalf("-migrate-opaque-tenants currently supports SQLite only; snapshot Postgres separately and do not blindly downgrade credentials")
 	}
-	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "clients_registry.csv"))
+	backupDir := strings.TrimSpace(*flagOpaqueBackupDir)
+	if backupDir == "" {
+		log.Fatalf("-opaque-tenant-backup-dir is required")
 	}
-	candidates = append(candidates, "clients_registry.csv")
-
-	seen := make(map[string]bool)
-	for _, p := range candidates {
-		abs, err := filepath.Abs(p)
-		if err != nil || seen[abs] {
-			continue
-		}
-		seen[abs] = true
-
-		if _, err := os.Stat(abs); err == nil {
-			n, err := importClientsFromCSV(adminStore, abs)
-			if err == nil && n > 0 {
-				log.Printf("[server] auto-imported %d client key(s) from %s", n, filepath.Base(abs))
-			}
-		}
+	report, err := db.MigrateOpaqueTenants(backupDir)
+	if err != nil {
+		log.Fatalf("opaque tenant migration failed (database unchanged if the transaction rolled back): %v\nBackup (if written): %s", err, report.BackupPath)
 	}
+	fmt.Printf("Opaque tenant migration complete.\n")
+	fmt.Printf("Backup:        %s\n", report.BackupPath)
+	fmt.Printf("Credentials:   %d remapped\n", report.CredentialsMoved)
+	fmt.Printf("Metrics rows:  %d remapped\n", report.MetricsMoved)
+	fmt.Printf("Process rows:  %d remapped\n", report.ProcessesMoved)
+	fmt.Printf("Rollback: stop the hub and replace the live DB with the backup file. Do not downgrade into legacy plaintext tenant IDs.\n")
 }
 
 // openStore opens the appropriate backend based on -db flag and DSN resolution.
@@ -1037,10 +1162,11 @@ func openStore() (storage.Store, *storage.DB, error) {
 // 2. -dsn-file flag (first non-empty line)
 // 3. -dsn flag (quick-test fallback only)
 func resolveDSN() (string, error) {
-	if v := os.Getenv("WMONITOR_DB_DSN"); v != "" {
-		return v, nil
-	}
-	if *flagDSNFile != "" {
+	var dsn string
+	switch {
+	case os.Getenv("WMONITOR_DB_DSN") != "":
+		dsn = os.Getenv("WMONITOR_DB_DSN")
+	case *flagDSNFile != "":
 		content, err := os.ReadFile(*flagDSNFile)
 		if err != nil {
 			return "", fmt.Errorf("read dsn-file %s: %w", *flagDSNFile, err)
@@ -1049,16 +1175,71 @@ func resolveDSN() (string, error) {
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line != "" && !strings.HasPrefix(line, "#") {
-				return line, nil
+				dsn = line
+				break
 			}
 		}
-		return "", fmt.Errorf("dsn-file %s is empty or contains only comments", *flagDSNFile)
-	}
-	if *flagDSN != "" {
+		if dsn == "" {
+			return "", fmt.Errorf("dsn-file %s is empty or contains only comments", *flagDSNFile)
+		}
+	case *flagDSN != "":
 		log.Println("[wmonitor] WARNING: using -dsn flag — DSN visible in process list. Use WMONITOR_DB_DSN env var for production.")
-		return *flagDSN, nil
+		dsn = *flagDSN
+	default:
+		return "", fmt.Errorf("postgres backend requires a DSN: set WMONITOR_DB_DSN env var, use -dsn-file, or -dsn (test only)")
 	}
-	return "", fmt.Errorf("postgres backend requires a DSN: set WMONITOR_DB_DSN env var, use -dsn-file, or -dsn (test only)")
+	if err := rejectInsecureRemotePostgres(dsn); err != nil {
+		return "", err
+	}
+	return dsn, nil
+}
+
+func rejectInsecureRemotePostgres(dsn string) error {
+	host := postgresDSNHost(dsn)
+	if host == "" || isLoopbackDSNHost(host) {
+		return nil
+	}
+	mode := postgresDSNSSLMode(dsn)
+	switch mode {
+	case "require", "verify-ca", "verify-full":
+		return nil
+	default:
+		return fmt.Errorf("postgres: remote DSN must set sslmode=require, verify-ca, or verify-full (got %q)", mode)
+	}
+}
+
+func postgresDSNHost(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err == nil && u.Host != "" {
+		return strings.ToLower(u.Hostname())
+	}
+	return strings.ToLower(dsnKV(dsn, "host"))
+}
+
+func postgresDSNSSLMode(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err == nil {
+		if m := strings.ToLower(u.Query().Get("sslmode")); m != "" {
+			return m
+		}
+	}
+	return strings.ToLower(dsnKV(dsn, "sslmode"))
+}
+
+func dsnKV(dsn, key string) string {
+	normalized := strings.ReplaceAll(dsn, ";", " ")
+	for _, part := range strings.Fields(normalized) {
+		k, v, ok := strings.Cut(part, "=")
+		if ok && strings.EqualFold(strings.TrimSpace(k), key) {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func isLoopbackDSNHost(host string) bool {
+	h := strings.ToLower(strings.Trim(host, "[]"))
+	return h == "localhost" || h == "::1" || h == "127.0.0.1" || strings.HasPrefix(h, "127.")
 }
 
 // logSafeDSN logs only host/dbname from the DSN, never user/password.
@@ -1108,47 +1289,110 @@ func parseAppPorts(raw string) []uint32 {
 	return ports
 }
 
-// runAgentMode starts the collector in agent mode — no local DB, no dashboard.
-// Metrics are POSTed to the hub's /api/ingest endpoint.
-func runAgentMode() {
+func exportTenant() string {
+	if t := strings.TrimSpace(*flagTenant); t != "" {
+		return t
+	}
+	return storage.LocalTenantID
+}
+
+// ensureAgentCredentials resolves or auto-enrolls agent credentials.
+func ensureAgentCredentials() string {
 	hubURL := strings.TrimRight(*flagAgentHub, "/")
+	if err := agent.RequireHTTPSHub(hubURL); err != nil {
+		log.Fatalf("[agent] %v", err)
+	}
 	serverID := resolveServerID()
 	hostname, _ := os.Hostname()
 
 	apiKey := resolveAPIKey()
 	enrollCode := resolveEnrollCode()
 
-	// 1. If explicit API key provided via flag or env var, use it
-	if apiKey == "" {
-		// 2. Check if machine already has stored DPAPI/0600 credentials
-		if creds, err := agent.LoadCredentials(); err == nil && creds != nil && creds.Token != "" {
-			apiKey = creds.Token
-			log.Printf("[agent] using previously enrolled credentials (server_id=%s)", creds.ServerID)
-		} else if enrollCode != "" {
-			// 3. First run auto-enrollment using enrollment code
-			log.Printf("[agent] performing first-run enrollment with hub %s...", hubURL)
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			creds, err := agent.Enroll(ctx, hubURL, enrollCode, serverID, hostname, buildVersion)
-			cancel()
-			if err != nil {
-				log.Fatalf("[agent] enrollment failed: %v", err)
-			}
-			apiKey = creds.Token
-			log.Printf("[agent] successfully enrolled! Machine token saved to local credential store.")
+	if apiKey != "" {
+		return apiKey
+	}
+
+	if creds, err := agent.LoadCredentials(); err == nil && creds != nil && creds.Token != "" {
+		if !agent.SameHubOrigin(creds.HubURL, hubURL) {
+			log.Fatalf("[agent] stored credentials are bound to %s, not %s; re-enroll at the new hub (previous token was not sent)", creds.HubURL, hubURL)
 		}
+		log.Printf("[agent] using previously enrolled credentials (server_id=%s)", creds.ServerID)
+		return creds.Token
 	}
 
-	if apiKey == "" {
-		log.Fatal("[agent] API key or enrollment code required: use -enroll-code <code or -api-key <key>")
+	if enrollCode != "" {
+		log.Printf("[agent] performing first-run enrollment with hub %s (please wait if hub is waking up)...", hubURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+		defer cancel()
+		creds, err := agent.Enroll(ctx, hubURL, enrollCode, serverID, hostname, buildVersion, "")
+		if err != nil {
+			log.Fatalf("[agent] enrollment failed: %v", err)
+		}
+		log.Printf("[agent] successfully enrolled! Machine token saved to local credential store.")
+		return creds.Token
 	}
 
-	log.Printf("[agent] starting (version %s) — pushing to %s (server: %s)", buildVersion, hubURL, serverID)
+	log.Fatal("[agent] API key or enrollment code required: use -enroll-code <code or -api-key <key>")
+	return ""
+}
+
+// runAgentAsService runs the agent under the Windows Service Control Manager.
+func runAgentAsService(apiKey string) {
+	hubURL := strings.TrimRight(*flagAgentHub, "/")
+	serverID := resolveServerID()
+
+	ag := agent.New(hubURL, apiKey)
+	bindAgentSpool(ag)
+	defer ag.Close()
+
+	col := collector.New(ag)
+	if *flagExternalIface != "" {
+		col.SetExternalIface(*flagExternalIface)
+	}
+	configureUserTracker(col)
+	col.SetServerID(serverID)
+
+	prg := &program{
+		store:     ag,
+		collector: col,
+	}
+
+	svcConfig := &service.Config{
+		Name:        "wmonitor",
+		DisplayName: "W-Monitor System Monitor",
+		Description: "Pushes system metrics to central hub at " + hubURL,
+	}
+
+	svc, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatalf("[agent] service.New: %v", err)
+	}
+
+	if err := svc.Run(); err != nil {
+		log.Fatalf("[agent] service run: %v", err)
+	}
+}
+
+// runAgentMode starts the collector in agent mode — no local DB, no dashboard.
+// Metrics are POSTed to the hub's /api/ingest endpoint.
+func runAgentMode() {
+	apiKey := ensureAgentCredentials()
+
+	// If running under Service Manager (non-interactive):
+	if !service.Interactive() {
+		runAgentAsService(apiKey)
+		return
+	}
+
+	hubURL := strings.TrimRight(*flagAgentHub, "/")
+	serverID := resolveServerID()
+
+	log.Printf("[agent] starting in foreground mode (version %s) — pushing to %s (server: %s)", buildVersion, hubURL, serverID)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	ag := agent.New(hubURL, apiKey)
-	// Retry spooled samples in the background; without this the spool would fill
-	// during an outage and never drain.
+	bindAgentSpool(ag)
 	ag.StartDrainer(ctx)
 	defer ag.Close()
 
@@ -1224,6 +1468,7 @@ func loadConfigEnv() {
 	if exe, err := os.Executable(); err == nil {
 		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "config.env"))
 	}
+	candidates = append(candidates, machineConfigEnvPath())
 	candidates = append(candidates, "config.env")
 
 	for _, path := range candidates {
@@ -1249,4 +1494,53 @@ func loadConfigEnv() {
 		}
 		break
 	}
+}
+
+func machineConfigEnvPath() string {
+	if runtime.GOOS == "windows" {
+		pd := os.Getenv("PROGRAMDATA")
+		if pd == "" {
+			pd = `C:\ProgramData`
+		}
+		return filepath.Join(pd, "wmonitor", "config.env")
+	}
+	return "/etc/wmonitor/config.env"
+}
+
+func bindAgentSpool(ag *agent.Agent) {
+	if creds, err := agent.LoadCredentials(); err == nil && creds != nil {
+		ag.BindIdentity(creds.TenantID, creds.ServerID)
+	}
+}
+
+var secretServiceFlags = map[string]struct{}{
+	"-api-key": {}, "--api-key": {},
+	"-dsn": {}, "--dsn": {},
+	"-enroll-code": {}, "--enroll-code": {},
+	"-alert-slack": {}, "--alert-slack": {},
+}
+
+// serviceSafeArgs drops install and secret flags so they never appear in the
+// SCM/systemd argument list. Secrets belong in config.env / environment.
+func serviceSafeArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	skipVal := false
+	for _, arg := range args {
+		if skipVal {
+			skipVal = false
+			continue
+		}
+		if arg == "-install" || arg == "--install" {
+			continue
+		}
+		name, _, hasEq := strings.Cut(arg, "=")
+		if _, secret := secretServiceFlags[name]; secret {
+			if !hasEq {
+				skipVal = true
+			}
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }

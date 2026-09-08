@@ -3,6 +3,8 @@ package agent
 import (
 	"errors"
 	"testing"
+
+	"Zeus/internal/fsroot"
 )
 
 func TestSpoolAppendAndDrain(t *testing.T) {
@@ -161,4 +163,82 @@ func TestSpoolSizeReporting(t *testing.T) {
 	if size, _ := sp.SizeBytes(); size == 0 {
 		t.Error("spool size still 0 after an append")
 	}
+}
+
+func TestSpoolChangedDestinationDoesNotSendBacklog(t *testing.T) {
+	dir := t.TempDir()
+	sp, err := NewSpool(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.BindDestination("https://old.example", "t_old", "srv-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.Append("metric", []byte(`{"CPUPct":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	sp.Close()
+
+	sp2, err := NewSpool(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp2.Close()
+	if err := sp2.BindDestination("https://new.example", "t_old", "srv-a"); err != nil {
+		t.Fatal(err)
+	}
+	if depth, _ := sp2.Depth(); depth != 0 {
+		t.Fatalf("depth after destination change = %d, want 0 (backlog must not be sent)", depth)
+	}
+	delivered, err := sp2.Drain(func(string, []byte) error {
+		t.Fatal("drain delivered a quarantined sample")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivered != 0 {
+		t.Fatalf("delivered %d, want 0", delivered)
+	}
+}
+
+func TestSpoolSameDestinationKeepsBacklog(t *testing.T) {
+	dir := t.TempDir()
+	sp, err := NewSpool(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.BindDestination("https://hub.example", "t1", "srv-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.Append("metric", []byte(`{"CPUPct":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	sp.Close()
+
+	sp2, err := NewSpool(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp2.Close()
+	if err := sp2.BindDestination("https://hub.example/", "t1", "srv-a"); err != nil {
+		t.Fatal(err)
+	}
+	if depth, _ := sp2.Depth(); depth != 1 {
+		t.Fatalf("depth = %d, want 1", depth)
+	}
+}
+
+func TestNewSpoolRejectsProductionPath(t *testing.T) {
+	t.Setenv(fsroot.EnvTestIsolation, "1")
+	for _, root := range fsroot.WellKnownProductionRoots() {
+		if _, err := NewSpool(root); err == nil {
+			t.Errorf("NewSpool(%q) succeeded; production paths must be rejected under isolation", root)
+		}
+	}
+	sp, err := NewSpool(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp.Close()
 }

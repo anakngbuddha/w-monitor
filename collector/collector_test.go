@@ -38,7 +38,7 @@ func TestCollectorRealData(t *testing.T) {
 	cancel()
 
 	// Query all rows
-	rows, err := db.QueryMetrics(time.Now().Add(-2*time.Minute), "")
+	rows, err := db.QueryMetrics(time.Now().Add(-2*time.Minute), storage.LocalTenantID)
 	if err != nil {
 		t.Fatalf("QueryMetrics: %v", err)
 	}

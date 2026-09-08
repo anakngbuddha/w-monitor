@@ -12,14 +12,13 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func tokenFilePath() string {
+// defaultTokenFilePath returns the OS-default token path without creating it.
+func defaultTokenFilePath() string {
 	base := os.Getenv("PROGRAMDATA")
 	if base == "" {
 		base = `C:\ProgramData`
 	}
-	dir := filepath.Join(base, "wmonitor")
-	_ = os.MkdirAll(dir, 0755)
-	return filepath.Join(dir, "token.dat")
+	return filepath.Join(base, "wmonitor", "token.dat")
 }
 
 func protectBytes(plaintext []byte) ([]byte, error) {
@@ -67,6 +66,9 @@ func unprotectBytes(cipher []byte) ([]byte, error) {
 // LoadCredentials decrypts and loads stored agent credentials from %PROGRAMDATA%\wmonitor\token.dat.
 func LoadCredentials() (*StoredCredentials, error) {
 	path := tokenFilePath()
+	if err := rejectSymlink(path); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
 	cipher, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -100,8 +102,14 @@ func SaveCredentials(creds StoredCredentials) error {
 	}
 
 	path := tokenFilePath()
-	if err := os.WriteFile(path, cipher, 0600); err != nil {
+	if err := ensureCredentialDir(path); err != nil {
+		return err
+	}
+	if err := atomicWriteFile(path, cipher, 0600); err != nil {
 		return fmt.Errorf("write token file: %w", err)
+	}
+	if err := applyTokenDACL(path); err != nil {
+		return fmt.Errorf("restrict token ACL: %w", err)
 	}
 	return nil
 }
@@ -114,4 +122,43 @@ func ClearCredentials() error {
 		return err
 	}
 	return nil
+}
+
+// applyTokenDACL sets a protected DACL: SYSTEM, Administrators, and the
+// current user. Built-in Users / Everyone are omitted so a standard account
+// cannot read or replace the token.
+func applyTokenDACL(path string) error {
+	sid, err := currentUserSID()
+	if err != nil {
+		return err
+	}
+	sddl := fmt.Sprintf("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;%s)", sid)
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return fmt.Errorf("token SDDL: %w", err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return fmt.Errorf("token DACL: %w", err)
+	}
+	return windows.SetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil,
+	)
+}
+
+func currentUserSID() (string, error) {
+	proc := windows.CurrentProcess()
+	var tok windows.Token
+	if err := windows.OpenProcessToken(proc, windows.TOKEN_QUERY, &tok); err != nil {
+		return "", err
+	}
+	defer tok.Close()
+	tu, err := tok.GetTokenUser()
+	if err != nil {
+		return "", err
+	}
+	return tu.User.Sid.String(), nil
 }
