@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +19,8 @@ const (
 	sessionCookieName = "wmonitor_session"
 	sessionTTL        = 7 * 24 * time.Hour
 	sessionIDPrefix   = "wms_"
+	maxSessions      = 4096
+	maxCredentialSessions = 5
 )
 
 type sessionRequest struct {
@@ -52,20 +56,44 @@ func newSessionID() (string, error) {
 	return sessionIDPrefix + hex.EncodeToString(b), nil
 }
 
-func (st *sessionStore) put(id string, ent sessionEntry) {
+// put rejects exhaustion rather than evicting another tenant's live session.
+// Expired entries are reclaimed at every insertion. A credential may have five
+// concurrent browser sessions; signing in again replaces its oldest one.
+func (st *sessionStore) put(id string, ent sessionEntry) bool {
 	st.mu.Lock()
+	defer st.mu.Unlock()
+	now := time.Now()
+	oldest := ""
+	var oldestExpiry time.Time
+	count := 0
+	for key, value := range st.m {
+		if !now.Before(value.expires) {
+			delete(st.m, key)
+			continue
+		}
+		if value.credHash == ent.credHash {
+			count++
+			if oldest == "" || value.expires.Before(oldestExpiry) {
+				oldest, oldestExpiry = key, value.expires
+			}
+		}
+	}
+	if count >= maxCredentialSessions {
+		delete(st.m, oldest)
+	}
+	if len(st.m) >= maxSessions {
+		return false
+	}
 	st.m[id] = ent
-	st.mu.Unlock()
+	return true
 }
 
 func (st *sessionStore) get(id string) (sessionEntry, bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	ent, ok := st.m[id]
-	if !ok || time.Now().After(ent.expires) {
-		if ok {
-			delete(st.m, id)
-		}
+	if !ok || !time.Now().Before(ent.expires) {
+		delete(st.m, id)
 		return sessionEntry{}, false
 	}
 	return ent, true
@@ -77,36 +105,42 @@ func (st *sessionStore) delete(id string) {
 	st.mu.Unlock()
 }
 
-func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, value string, maxAge int) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    value,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   maxAge,
-	})
+func loopbackSessionRequest(r *http.Request) bool {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	peer := net.ParseIP(clientIP(r))
+	ip := net.ParseIP(host)
+	return peer != nil && peer.IsLoopback() && (host == "localhost" || (ip != nil && ip.IsLoopback())) && !trustedProxyPeer(r)
 }
 
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, value string, maxAge int) {
+	cookie := &http.Cookie{
+		Name: sessionCookieName, Value: value, Path: "/",
+		HttpOnly: true, Secure: !loopbackSessionRequest(r) || requestIsHTTPS(r),
+		SameSite: http.SameSiteStrictMode, MaxAge: maxAge,
+	}
+	if maxAge < 0 {
+		cookie.Expires = time.Unix(1, 0)
+	}
+	http.SetCookie(w, cookie)
+}
+
+// Session CSRF checks compare the entire origin, not merely the hostname.
+// The API CORS allowlist does not authorize cross-site session mutations.
 func (s *Server) originOK(r *http.Request) bool {
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
+	raw := r.Header.Get("Origin")
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
 		return false
 	}
-	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
-		return false
+	scheme := "http"
+	if requestIsHTTPS(r) {
+		scheme = "https"
 	}
-	if strings.EqualFold(u.Host, r.Host) {
-		return true
-	}
-	for _, allowed := range s.allowedOrigins {
-		if allowed != "" && strings.EqualFold(strings.TrimRight(allowed, "/"), strings.TrimRight(origin, "/")) {
-			return true
-		}
-	}
-	return false
+	return u.Scheme == scheme && strings.EqualFold(u.Host, r.Host)
 }
 
 func (s *Server) requireSameOrigin(w http.ResponseWriter, r *http.Request) bool {
@@ -117,9 +151,9 @@ func (s *Server) requireSameOrigin(w http.ResponseWriter, r *http.Request) bool 
 	return false
 }
 
-// handleSession manages opaque server-side dashboard sessions (HttpOnly cookie).
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
-	s.writeCORS(w, r)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
 	case http.MethodGet:
 		ent, ok := s.lookupSession(r)
@@ -127,12 +161,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusUnauthorized, "no session")
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(sessionResponse{
-			ClientName: ent.clientName,
-			TenantID:   ent.principal.TenantID,
-		})
-
+		json.NewEncoder(w).Encode(sessionResponse{ClientName: ent.clientName, TenantID: ent.principal.TenantID})
 	case http.MethodPost:
 		if !s.requireSameOrigin(w, r) {
 			return
@@ -142,93 +171,95 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusTooManyRequests, "too many login attempts")
 			return
 		}
-
-		var req sessionRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
-			req.ReadToken = r.Header.Get("X-API-Key")
+		if !requestIsHTTPS(r) && !loopbackSessionRequest(r) {
+			writeJSONError(w, http.StatusForbidden, "HTTPS is required for browser login")
+			return
 		}
-		rawToken := strings.TrimSpace(req.ReadToken)
-		if rawToken == "" {
+		var req sessionRequest
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid login request")
+			return
+		}
+		if err := dec.Decode(&struct{}{}); err != io.EOF {
+			writeJSONError(w, http.StatusBadRequest, "exactly one JSON object is required")
+			return
+		}
+		// Credentials are opaque: do not normalize or fall back to a header
+		// after a malformed body. In particular, never log the request body.
+		if req.ReadToken == "" || len(req.ReadToken) > 1024 {
 			writeJSONError(w, http.StatusBadRequest, "read_token is required")
 			return
 		}
-		if s.keys == nil {
+		if s.keys == nil || s.sessions == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "authentication unavailable")
 			return
 		}
-
-		hash := storage.HashAPIKey(rawToken)
+		hash := storage.HashAPIKey(req.ReadToken)
 		rec, err := s.keys.ResolveAPIKey(hash)
-		if err != nil {
+		if err != nil || rec.Revoked || (credentialExpiryUnix(rec.ExpiresAt) > 0 && !time.Now().Before(rec.ExpiresAt)) {
 			writeJSONError(w, http.StatusUnauthorized, "invalid read token")
 			return
 		}
-		if rec.Kind == storage.KindEnroll || !credentialPermits(rec.Kind, rec.Scope, storage.ScopeRead) {
-			writeJSONError(w, http.StatusForbidden, "token lacks read scope")
+		if !credentialPermits(rec.Kind, rec.Scope, storage.ScopeRead) || rec.Kind == storage.KindAgent {
+			writeJSONError(w, http.StatusForbidden, "token lacks browser read scope")
 			return
 		}
-
 		id, err := newSessionID()
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "failed to create session")
 			return
 		}
-		s.sessions.put(id, sessionEntry{
-			credHash:   hash,
-			principal:  principalFromRecord(rec),
-			clientName: rec.ClientName,
-			expires:    time.Now().Add(sessionTTL),
-		})
-		s.setSessionCookie(w, r, id, int(sessionTTL.Seconds()))
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(sessionResponse{
-			ClientName: rec.ClientName,
-			TenantID:   rec.TenantID,
-		})
-
+		expires := time.Now().Add(sessionTTL)
+		if credentialExpiryUnix(rec.ExpiresAt) > 0 && rec.ExpiresAt.Before(expires) {
+			expires = rec.ExpiresAt
+		}
+		if !s.sessions.put(id, sessionEntry{credHash: hash, principal: principalFromRecord(rec), clientName: rec.ClientName, expires: expires}) {
+			writeJSONError(w, http.StatusServiceUnavailable, "browser session capacity reached")
+			return
+		}
+		if old, err := r.Cookie(sessionCookieName); err == nil {
+			s.sessions.delete(old.Value)
+		}
+		maxAge := int(time.Until(expires).Seconds())
+		if maxAge < 1 {
+			maxAge = 1
+		}
+		s.setSessionCookie(w, r, id, maxAge)
+		json.NewEncoder(w).Encode(sessionResponse{ClientName: rec.ClientName, TenantID: rec.TenantID})
 	case http.MethodDelete:
 		if !s.requireSameOrigin(w, r) {
 			return
 		}
-		if c, err := r.Cookie(sessionCookieName); err == nil {
+		if c, err := r.Cookie(sessionCookieName); err == nil && s.sessions != nil {
 			s.sessions.delete(c.Value)
 		}
 		s.setSessionCookie(w, r, "", -1)
-		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "logged_out"})
-
 	default:
+		w.Header().Set("Allow", "GET, POST, DELETE")
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
+// Human sessions are checked against the registry on every request. Replica
+// restart logs browsers out; credential revocation does not wait for cache TTL.
 func (s *Server) lookupSession(r *http.Request) (sessionEntry, bool) {
 	c, err := r.Cookie(sessionCookieName)
-	if err != nil || c.Value == "" || s.sessions == nil {
+	if err != nil || len(c.Value) != len(sessionIDPrefix)+64 || !strings.HasPrefix(c.Value, sessionIDPrefix) || s.sessions == nil || s.keys == nil {
 		return sessionEntry{}, false
 	}
 	ent, ok := s.sessions.get(c.Value)
 	if !ok {
 		return sessionEntry{}, false
 	}
-	if s.keys == nil {
-		return sessionEntry{}, false
-	}
-	epoch := s.currentAuthEpoch()
-	if cached, hit := s.authCache.get(ent.credHash, epoch); hit {
-		if !cached.valid {
-			s.sessions.delete(c.Value)
-			return sessionEntry{}, false
-		}
-		ent.principal = cached.principal
-		return ent, true
-	}
 	rec, err := s.keys.ResolveAPIKey(ent.credHash)
-	if err != nil {
+	if err != nil || rec.Revoked || rec.TenantID != ent.principal.TenantID || rec.Kind == storage.KindAgent || !credentialPermits(rec.Kind, rec.Scope, storage.ScopeRead) || (credentialExpiryUnix(rec.ExpiresAt) > 0 && !time.Now().Before(rec.ExpiresAt)) {
 		s.sessions.delete(c.Value)
 		return sessionEntry{}, false
 	}
 	ent.principal = principalFromRecord(rec)
+	ent.clientName = rec.ClientName
 	return ent, true
 }
