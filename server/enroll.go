@@ -148,6 +148,17 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 
 	s.invalidateHashes(result.RevokedHashes)
 	prefix := storage.ExtractKeyPrefix(result.Token)
+	if err := s.recordAudit(storage.AuditEvent{TenantID: result.TenantID, ActorKind: storage.KindEnroll, ActorPrefix: "wme_", Action: "enroll.completed", TargetType: "agent", TargetID: req.ServerID}); err != nil {
+		if !result.Recovered {
+			if adminStore, ok := s.keys.(AdminStore); ok {
+				if _, revErr := adminStore.RevokeAgent(result.TenantID, req.ServerID); revErr == nil {
+					s.invalidateHashes([]string{storage.HashAPIKey(result.Token)})
+				}
+			}
+		}
+		writeJSONError(w, http.StatusServiceUnavailable, "audit unavailable")
+		return
+	}
 	if result.Recovered {
 		log.Printf("[server] recovered enrollment handshake for server %q [prefix: %s]", req.ServerID, prefix)
 	} else {
@@ -172,8 +183,7 @@ func (s *Server) handleAdminEnrollCodes(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Requires platform admin (legacy/all cannot satisfy ScopeAdmin)
-	_, ok := s.authTenantScope(w, r, storage.ScopeAdmin)
+	principal, ok := s.authPrincipal(w, r, storage.ScopeAdmin)
 	if !ok {
 		return
 	}
@@ -261,6 +271,11 @@ func (s *Server) handleAdminEnrollCodes(w http.ResponseWriter, r *http.Request) 
 
 	log.Printf("[server] created enroll code for client %q (max_uses=%d, ttl=%dh)",
 		req.ClientName, maxUses, ttlHours)
+	if err := s.recordAudit(storage.AuditEvent{TenantID: tenantID, ActorKind: principal.Kind, ActorPrefix: s.actorPrefix(principal.Kind, principal.CredentialID), Action: "enroll.code_issued", TargetType: "client", TargetID: req.ClientName}); err != nil {
+		s.revokeUnauditedHash(codeHash)
+		writeJSONError(w, http.StatusServiceUnavailable, "audit unavailable")
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -341,6 +356,10 @@ func (s *Server) handleAdminAgents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.invalidateHashes(hashes)
+		if err := s.recordAudit(storage.AuditEvent{TenantID: revokeTenant, ActorKind: principal.Kind, ActorPrefix: s.actorPrefix(principal.Kind, principal.CredentialID), Action: "agent.revoked", TargetType: "agent", TargetID: targetServerID}); err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "audit unavailable")
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"server_id": targetServerID,
@@ -355,7 +374,7 @@ func (s *Server) handleAdminAgents(w http.ResponseWriter, r *http.Request) {
 // handleAdminClients creates a new client read token or lists clients (POST/GET /api/admin/clients).
 func (s *Server) handleAdminClients(w http.ResponseWriter, r *http.Request) {
 	s.writeCORS(w, r)
-	_, ok := s.authTenantScope(w, r, storage.ScopeAdmin)
+	principal, ok := s.authPrincipal(w, r, storage.ScopeAdmin)
 	if !ok {
 		return
 	}
@@ -454,6 +473,11 @@ func (s *Server) handleAdminClients(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if err := s.recordAudit(storage.AuditEvent{TenantID: tenantID, ActorKind: principal.Kind, ActorPrefix: s.actorPrefix(principal.Kind, principal.CredentialID), Action: "client.created", TargetType: "client", TargetID: req.ClientName}); err != nil {
+			s.revokeUnauditedHash(hash)
+			writeJSONError(w, http.StatusServiceUnavailable, "audit unavailable")
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{
@@ -528,6 +552,11 @@ func (s *Server) handleAdminAgentRotate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.invalidateHashes(result.RevokedHashes)
+	if err := s.recordAudit(storage.AuditEvent{TenantID: result.TenantID, ActorKind: principal.Kind, ActorPrefix: s.actorPrefix(principal.Kind, principal.CredentialID), Action: "agent.rotated", TargetType: "agent", TargetID: result.ServerID}); err != nil {
+		s.revokeUnauditedHash(storage.HashAPIKey(token))
+		writeJSONError(w, http.StatusServiceUnavailable, "audit unavailable")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(enrollResponse{

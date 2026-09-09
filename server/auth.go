@@ -25,6 +25,7 @@ type AdminStore interface {
 	RevokeAgent(tenantID, serverID string) (int64, error)
 	ListAgents(tenantID string) ([]storage.APIKeyRecord, error)
 	RevokeAPIKey(clientName string) (int64, error)
+	RevokeKeyHash(keyHash string) (int64, error)
 	ListAPIKeys() ([]storage.APIKeyRecord, error)
 	CompleteEnrollment(req storage.EnrollmentRequest) (storage.EnrollmentResult, error)
 	ReplaceAgent(tenantID, serverID, token, tokenHash, prefix string) (storage.EnrollmentResult, error)

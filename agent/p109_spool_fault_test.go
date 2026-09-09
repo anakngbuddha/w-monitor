@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -85,5 +86,40 @@ func TestSpoolCorruptSegmentIsRetainedNotSilentlyDeleted(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, spoolDirName, "quarantine", filepath.Base(path))); err != nil {
 		t.Fatalf("corrupt source not retained: %v", err)
+	}
+}
+
+func TestSpoolFullAppliesBackpressureWithoutEviction(t *testing.T) {
+	root := t.TempDir()
+	sp, err := NewSpool(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Close()
+	if err := sp.Append("metric", []byte(`{"keep":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	filler := filepath.Join(root, spoolDirName, "filler.bin")
+	f, err := os.Create(filler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxSpoolBytes); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.Append("metric", []byte(`{"overflow":true}`)); !errors.Is(err, ErrSpoolFull) {
+		t.Fatalf("full queue: %v", err)
+	}
+	depth, err := sp.Depth()
+	if err != nil || depth != 1 {
+		t.Fatalf("queued evidence evicted: depth=%d err=%v", depth, err)
+	}
+	loss, err := os.ReadFile(filepath.Join(root, spoolDirName, "loss.json"))
+	if err != nil || !strings.Contains(string(loss), "overflow") {
+		t.Fatalf("overflow not persisted: %s err=%v", loss, err)
 	}
 }

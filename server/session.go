@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	sessionCookieName = "wmonitor_session"
-	sessionTTL        = 7 * 24 * time.Hour
-	sessionIDPrefix   = "wms_"
-	maxSessions      = 4096
+	sessionCookieName     = "wmonitor_session"
+	sessionTTL            = 7 * 24 * time.Hour
+	sessionIDPrefix       = "wms_"
+	maxSessions           = 4096
 	maxCredentialSessions = 5
 )
 
@@ -227,12 +227,24 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			maxAge = 1
 		}
 		s.setSessionCookie(w, r, id, maxAge)
+		if err := s.recordAudit(storage.AuditEvent{TenantID: rec.TenantID, ActorKind: rec.Kind, ActorPrefix: rec.KeyPrefix, Action: "session.login", TargetType: "session", TargetID: "browser"}); err != nil {
+			s.sessions.delete(id)
+			s.setSessionCookie(w, r, "", -1)
+			writeJSONError(w, http.StatusServiceUnavailable, "audit unavailable")
+			return
+		}
 		json.NewEncoder(w).Encode(sessionResponse{ClientName: rec.ClientName, TenantID: rec.TenantID})
 	case http.MethodDelete:
 		if !s.requireSameOrigin(w, r) {
 			return
 		}
 		if c, err := r.Cookie(sessionCookieName); err == nil && s.sessions != nil {
+			if ent, ok := s.sessions.get(c.Value); ok {
+				if err := s.recordAudit(storage.AuditEvent{TenantID: ent.principal.TenantID, ActorKind: ent.principal.Kind, ActorPrefix: s.actorPrefix(ent.principal.Kind, ent.credHash), Action: "session.logout", TargetType: "session", TargetID: "browser"}); err != nil {
+					writeJSONError(w, http.StatusServiceUnavailable, "audit unavailable")
+					return
+				}
+			}
 			s.sessions.delete(c.Value)
 		}
 		s.setSessionCookie(w, r, "", -1)

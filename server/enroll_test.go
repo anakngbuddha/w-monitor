@@ -239,9 +239,9 @@ func TestSessionLoginAndCookieAuth(t *testing.T) {
 
 	// Login
 	loginBody, _ := json.Marshal(map[string]string{"read_token": readToken})
-	loginReq := httptest.NewRequest("POST", "/api/session", bytes.NewReader(loginBody))
+	loginReq := httptest.NewRequest("POST", "https://example.com/api/session", bytes.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
-	loginReq.Header.Set("Origin", "http://example.com")
+	loginReq.Header.Set("Origin", "https://example.com")
 	loginW := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(loginW, loginReq)
 

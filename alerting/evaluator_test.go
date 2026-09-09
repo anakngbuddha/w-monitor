@@ -44,15 +44,15 @@ func (f *fakeStore) QueryMetricsAllTenants(context.Context, time.Time, int) ([]s
 	return out, nil
 }
 
-func (f *fakeStore) InsertMetric(storage.MetricRow) error  { return nil }
+func (f *fakeStore) InsertMetric(storage.MetricRow) error   { return nil }
 func (f *fakeStore) InsertProcess(storage.ProcessRow) error { return nil }
 func (f *fakeStore) QueryProcesses(time.Time, string) ([]storage.ProcessRow, error) {
 	return nil, nil
 }
-func (f *fakeStore) CountMetrics() (int, error)             { return len(f.rows), nil }
-func (f *fakeStore) CountProcesses() (int, error)           { return 0, nil }
-func (f *fakeStore) QueryServers(string) ([]string, error)  { return nil, nil }
-func (f *fakeStore) Close() error                           { return nil }
+func (f *fakeStore) CountMetrics() (int, error)            { return len(f.rows), nil }
+func (f *fakeStore) CountProcesses() (int, error)          { return 0, nil }
+func (f *fakeStore) QueryServers(string) ([]string, error) { return nil, nil }
+func (f *fakeStore) Close() error                          { return nil }
 
 // captureNotifier records what was dispatched.
 type captureNotifier struct {
@@ -419,8 +419,8 @@ func TestTwoTenantsSameServerDoNotShareAlertState(t *testing.T) {
 
 type failingNotifier struct{}
 
-func (failingNotifier) Name() string      { return "broken" }
-func (failingNotifier) Send(Alert) error  { return errBroken }
+func (failingNotifier) Name() string     { return "broken" }
+func (failingNotifier) Send(Alert) error { return errBroken }
 
 var errBroken = &notifierError{"sink is down"}
 

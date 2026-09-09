@@ -68,10 +68,14 @@ func TestNoProductionPathCallsInTests(t *testing.T) {
 			aliases[alias] = pkg
 		}
 		localPkg := "Zeus/" + f.Name.Name
+		dedicatedDataDirIsolation := filepath.Base(path) == "datadir_test.go"
 		ast.Inspect(f, func(node ast.Node) bool {
 			switch expr := node.(type) {
 			case *ast.SelectorExpr:
 				if ident, ok := expr.X.(*ast.Ident); ok {
+					if dedicatedDataDirIsolation && aliases[ident.Name] == "Zeus/storage" && expr.Sel.Name == "DataDir" {
+						return true
+					}
 					if blocked[aliases[ident.Name]][expr.Sel.Name] {
 						t.Errorf("%s: production-path entry point %s.%s; inject t.TempDir instead", fset.Position(expr.Pos()), ident.Name, expr.Sel.Name)
 					}

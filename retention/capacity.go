@@ -13,20 +13,29 @@ func (j *Job) CheckCapacity() error {
 	path, budget := j.dataPath, j.diskBudgetBytes
 	j.mu.Unlock()
 	status := Status{Reason: DisabledReason, DiskBudgetBytes: budget}
-	if path == "" { j.setStatus(status); return nil }
+	if path == "" {
+		j.setStatus(status)
+		return nil
+	}
 	for index, suffix := range []string{"", "-wal", "-shm"} {
-		info, err := os.Stat(path+suffix)
+		info, err := os.Stat(path + suffix)
 		if err != nil {
-			if index > 0 && os.IsNotExist(err) { continue }
+			if index > 0 && os.IsNotExist(err) {
+				continue
+			}
 			status.DiskPressure = true
 			j.setStatus(status)
 			return fmt.Errorf("retention: capacity check unavailable")
 		}
-		if !info.Mode().IsRegular() { return fmt.Errorf("retention: data path is not a regular file") }
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("retention: data path is not a regular file")
+		}
 		status.DiskUsedBytes += info.Size()
 	}
 	status.DiskPressure = budget > 0 && status.DiskUsedBytes >= budget
 	j.setStatus(status)
-	if status.DiskPressure { return ErrDiskPressure }
+	if status.DiskPressure {
+		return ErrDiskPressure
+	}
 	return nil
 }

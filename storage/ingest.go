@@ -29,9 +29,9 @@ CREATE INDEX IF NOT EXISTS processes_scope_time ON processes(tenant_id, server_i
 `
 
 type ingestTx struct {
-	exec func(context.Context, string, ...any) (int64, error)
-	scan func(context.Context, string, []any, ...any) error
-	commit func(context.Context) error
+	exec     func(context.Context, string, ...any) (int64, error)
+	scan     func(context.Context, string, []any, ...any) error
+	commit   func(context.Context) error
 	rollback func(context.Context) error
 }
 
@@ -48,8 +48,10 @@ func (db *DB) beginIngest(ctx context.Context) (ingestTx, error) {
 			}
 			return result.RowsAffected()
 		},
-		scan: func(ctx context.Context, q string, args []any, dest ...any) error { return tx.QueryRowContext(ctx, q, args...).Scan(dest...) },
-		commit: func(context.Context) error { return tx.Commit() },
+		scan: func(ctx context.Context, q string, args []any, dest ...any) error {
+			return tx.QueryRowContext(ctx, q, args...).Scan(dest...)
+		},
+		commit:   func(context.Context) error { return tx.Commit() },
 		rollback: func(context.Context) error { return tx.Rollback() },
 	}, nil
 }
@@ -64,8 +66,10 @@ func (pg *PostgresDB) beginIngest(ctx context.Context) (ingestTx, error) {
 			result, err := tx.Exec(ctx, q, args...)
 			return result.RowsAffected(), err
 		},
-		scan: func(ctx context.Context, q string, args []any, dest ...any) error { return tx.QueryRow(ctx, q, args...).Scan(dest...) },
-		commit: tx.Commit,
+		scan: func(ctx context.Context, q string, args []any, dest ...any) error {
+			return tx.QueryRow(ctx, q, args...).Scan(dest...)
+		},
+		commit:   tx.Commit,
 		rollback: tx.Rollback,
 	}, nil
 }
@@ -104,9 +108,6 @@ func (pg *PostgresDB) InitializeIngest(ctx context.Context) error {
 	}
 	return initializeIngest(ctx, tx)
 }
-
-func (db *DB) Ping(ctx context.Context) error { return db.conn.PingContext(ctx) }
-func (pg *PostgresDB) Ping(ctx context.Context) error { return pg.pool.Ping(ctx) }
 
 func (db *DB) AcceptIngest(ctx context.Context, tenant, agent string, batch IngestBatch, policy IngestPolicy) ([]IngestOutcome, error) {
 	now := time.Now().UTC()
@@ -164,7 +165,10 @@ func acceptIngest(ctx context.Context, tx ingestTx, tenant, agent string, batch 
 		// The conditional UPDATE acquires the shared row lock and checks limits
 		// in the database, not against a process-local counter. A failed write
 		// rolls back both budgets, all receipts and every event in this batch.
-		for _, quota := range []struct{ actor string; rows, bytes int64 }{{"", policy.DailyRows, policy.DailyBytes}, {agent, policy.AgentDailyRows, policy.AgentDailyBytes}} {
+		for _, quota := range []struct {
+			actor       string
+			rows, bytes int64
+		}{{"", policy.DailyRows, policy.DailyBytes}, {agent, policy.AgentDailyRows, policy.AgentDailyBytes}} {
 			if _, err := tx.exec(ctx, `INSERT INTO ingest_budgets(tenant_id,actor_id,day) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, tenant, quota.actor, day); err != nil {
 				return nil, err
 			}
@@ -197,11 +201,17 @@ func acceptIngest(ctx context.Context, tx ingestTx, tenant, agent string, batch 
 // age. Old events are rejected by NormalizeIngest, so cleanup cannot resurrect
 // an accepted event. Run with a timeout; metric/evidence retention is untouched.
 func (db *DB) CleanupIngest(ctx context.Context) error {
-	return cleanupIngest(ctx, func(ctx context.Context, q string, args ...any) error { _, err := db.conn.ExecContext(ctx, q, args...); return err })
+	return cleanupIngest(ctx, func(ctx context.Context, q string, args ...any) error {
+		_, err := db.conn.ExecContext(ctx, q, args...)
+		return err
+	})
 }
 
 func (pg *PostgresDB) CleanupIngest(ctx context.Context) error {
-	return cleanupIngest(ctx, func(ctx context.Context, q string, args ...any) error { _, err := pg.pool.Exec(ctx, q, args...); return err })
+	return cleanupIngest(ctx, func(ctx context.Context, q string, args ...any) error {
+		_, err := pg.pool.Exec(ctx, q, args...)
+		return err
+	})
 }
 
 func cleanupIngest(ctx context.Context, exec func(context.Context, string, ...any) error) error {

@@ -85,3 +85,45 @@ func TestQueryMetricsLimit(t *testing.T) {
 		t.Fatalf("limit: got %d rows", len(rows))
 	}
 }
+
+func TestQueryMetricsCursor(t *testing.T) {
+	db := testDB(t)
+	now := time.Now().Truncate(time.Second)
+	for i := 0; i < 5; i++ {
+		if err := db.InsertMetric(MetricRow{Timestamp: now.Add(time.Duration(i) * time.Second), TenantID: "t_cur", ServerID: "s", CPUPct: float64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := db.QueryMetricsQ(MetricQuery{Since: now.Add(-time.Minute), TenantID: "t_cur", Limit: 2})
+	if err != nil || len(first) != 2 {
+		t.Fatalf("first page: %v %#v", err, first)
+	}
+	rest, err := db.QueryMetricsQ(MetricQuery{Since: now.Add(-time.Minute), TenantID: "t_cur", Limit: 10, AfterUnix: first[1].Timestamp.Unix(), AfterID: first[1].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 3 {
+		t.Fatalf("remaining: got %d", len(rest))
+	}
+	if rest[0].ID == first[0].ID || rest[0].ID == first[1].ID {
+		t.Fatal("cursor replayed prior rows")
+	}
+}
+
+func TestQueryServersPage(t *testing.T) {
+	db := testDB(t)
+	now := time.Now()
+	for _, id := range []string{"a", "b", "c"} {
+		if err := db.InsertMetric(MetricRow{Timestamp: now, TenantID: "t_srv", ServerID: id, CPUPct: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := db.QueryServersPage(context.Background(), "t_srv", 2, "")
+	if err != nil || len(first) != 2 || first[0] != "a" || first[1] != "b" {
+		t.Fatalf("first: %v %v", err, first)
+	}
+	rest, err := db.QueryServersPage(context.Background(), "t_srv", 2, first[1])
+	if err != nil || len(rest) != 1 || rest[0] != "c" {
+		t.Fatalf("rest: %v %v", err, rest)
+	}
+}

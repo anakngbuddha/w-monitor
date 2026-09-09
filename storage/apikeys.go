@@ -473,6 +473,31 @@ func (db *DB) RevokeAPIKey(clientName string) (int64, error) {
 	return n, nil
 }
 
+// RevokeKeyHash revokes one credential by hash without touching sibling keys.
+func (db *DB) RevokeKeyHash(keyHash string) (int64, error) {
+	if err := db.ensureAPIKeys(); err != nil {
+		return 0, err
+	}
+	if keyHash == "" {
+		return 0, errors.New("storage: key hash is required")
+	}
+	now := time.Now().Unix()
+	res, err := db.conn.Exec("UPDATE api_keys SET revoked_at = ? WHERE key_hash = ? AND revoked_at = 0", now, keyHash)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return n, err
+	}
+	if n > 0 {
+		if err := bumpAuthEpochSQLite(db.conn, now); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
 // RevokeAgent marks a machine agent token as revoked.
 func (db *DB) RevokeAgent(tenantID, serverID string) (int64, error) {
 	if err := db.ensureAPIKeys(); err != nil {
@@ -789,6 +814,30 @@ func (pg *PostgresDB) RevokeAPIKey(clientName string) (int64, error) {
 	now := time.Now().Unix()
 	tag, err := pg.pool.Exec(ctx,
 		"UPDATE api_keys SET revoked_at = $1 WHERE client_name = $2 AND revoked_at = 0", now, clientName)
+	if err != nil {
+		return 0, err
+	}
+	n := tag.RowsAffected()
+	if n > 0 {
+		if err := bumpAuthEpochPostgres(ctx, pg, now); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+// RevokeKeyHash revokes one credential by hash without touching sibling keys.
+func (pg *PostgresDB) RevokeKeyHash(keyHash string) (int64, error) {
+	if err := pg.ensureAPIKeys(); err != nil {
+		return 0, err
+	}
+	if keyHash == "" {
+		return 0, errors.New("storage: key hash is required")
+	}
+	ctx := context.Background()
+	now := time.Now().Unix()
+	tag, err := pg.pool.Exec(ctx,
+		"UPDATE api_keys SET revoked_at = $1 WHERE key_hash = $2 AND revoked_at = 0", now, keyHash)
 	if err != nil {
 		return 0, err
 	}

@@ -91,7 +91,7 @@ For multi-site assessments where the Hub is hosted in the cloud:
 1. Create a free/starter PostgreSQL instance on [aiven.io](https://aiven.io) or [render.com](https://render.com).
 2. Copy the Service URI (DSN). Example:
    ```text
-   postgres://avnadmin:SecretPassword123@pg-service.aivencloud.com:15432/defaultdb?sslmode=require
+   postgres://avnadmin:SecretPassword123@pg-service.aivencloud.com:15432/defaultdb?sslmode=verify-full
    ```
 
 ### Option B: Local PostgreSQL in Docker
@@ -127,20 +127,26 @@ W-Monitor enforces a strict credential hierarchy to prevent secrets from leaking
 | Variable | Description | Example |
 |---|---|---|
 | `WMONITOR_DB` | Database backend | `postgres` (or `sqlite`) |
-| `WMONITOR_DB_DSN` | PostgreSQL connection string | `postgres://user:pass@host:5432/db?sslmode=require` |
+| `WMONITOR_DB_DSN` | PostgreSQL connection string | `postgres://user:pass@host:5432/db?sslmode=verify-full` |
 | `WMONITOR_MODE` | Server operating mode | `hub` |
 | `WMONITOR_PORT` | HTTP dashboard port | `8080` or `10000` |
-| `WMONITOR_API_KEY` | Hub default API key (optional) | Prefer `config.env` / env; never put this on the Windows service command line |
+| `WMONITOR_CONFIG` | Absolute protected config file | `C:\ProgramData\wmonitor\config.env` / `/etc/wmonitor/config.env` |
+| `WMONITOR_LISTEN_HOST` | Bind address | Hub may use `0.0.0.0`; standalone must be loopback |
+| `WMONITOR_DAILY_ROW_QUOTA` | Tenant accepted rows / UTC day | `20000000` |
+| `WMONITOR_DAILY_BYTE_QUOTA` | Tenant accepted bytes / UTC day | `21474836480` |
+| `WMONITOR_AGENT_DAILY_ROW_QUOTA` | Agent accepted rows / UTC day | `250000` |
+| `WMONITOR_AGENT_DAILY_BYTE_QUOTA` | Agent accepted bytes / UTC day | `268435456` |
+| `WMONITOR_API_KEY` | Test-only token (optional) | Prefer `config.env` / env; never put this on the Windows service command line |
 | `WMONITOR_TRUSTED_PROXIES` | Reverse-proxy IPs or CIDRs allowed to set `X-Forwarded-Proto` | `10.0.0.0/8` (empty = never trust the header) |
 
-Remote PostgreSQL DSNs must include `sslmode=require`, `verify-ca`, or `verify-full`. Loopback hosts may use `sslmode=disable`. `-dsn` remains visible in the process list; use `WMONITOR_DB_DSN` or `-dsn-file` in production.
+Remote PostgreSQL DSNs must use verified TLS: `sslmode=verify-full`. `require` and `verify-ca` are insufficient because they do not verify the server name. Loopback hosts may use `sslmode=disable`. `-dsn` remains visible in the process list; use `WMONITOR_DB_DSN` or `-dsn-file` in production.
 
 Windows installer writes `%ProgramData%\wmonitor\config.env` with a SYSTEM + Administrators ACL. Linux installer writes `/etc/wmonitor/config.env` mode `600`. Both are loaded at process start; service arguments do not include `-api-key`, `-dsn`, or `-enroll-code`.
 
 #### Setting Environment Variables on Windows:
 ```powershell
 $env:WMONITOR_DB = "postgres"
-$env:WMONITOR_DB_DSN = "postgres://avnadmin:pass@pg-host.aivencloud.com:15432/defaultdb?sslmode=require"
+$env:WMONITOR_DB_DSN = "postgres://avnadmin:pass@pg-host.aivencloud.com:15432/defaultdb?sslmode=verify-full"
 $env:WMONITOR_MODE = "hub"
 $env:WMONITOR_PORT = "8080"
 ```
@@ -148,7 +154,7 @@ $env:WMONITOR_PORT = "8080"
 #### Setting Environment Variables on Linux:
 ```bash
 export WMONITOR_DB="postgres"
-export WMONITOR_DB_DSN="postgres://avnadmin:pass@pg-host.aivencloud.com:15432/defaultdb?sslmode=require"
+export WMONITOR_DB_DSN="postgres://avnadmin:pass@pg-host.aivencloud.com:15432/defaultdb?sslmode=verify-full"
 export WMONITOR_MODE="hub"
 export WMONITOR_PORT="8080"
 ```
@@ -200,7 +206,7 @@ Do not treat client display names as identity. Each credential has a kind (`enro
 - Only the SHA-256 hash is stored. Tokens are hashed as exact trimmed bytes; enrollment codes are normalized then hashed.
 - Duplicate `client_name` values never pick a tenant. Pass `tenant_id` when creating an enrollment code, or use unique names.
 
-Hub start does **not** auto-import `clients_registry.csv`. Use `-import-clients` explicitly; existing or revoked hashes are left unchanged. `WMONITOR_API_KEY` / `WMONITOR_ADMIN_TOKEN` are registered on first boot only when the hash is absent.
+Hub start does **not** auto-import `clients_registry.csv`. `-import-clients` is disabled pending a reviewed transactional migration; use `-add-client` and `-new-enroll-code`. `WMONITOR_API_KEY` / `WMONITOR_ADMIN_TOKEN` are registered on first boot only when the hash is absent.
 
 ### Adding a New Client Organization
 
@@ -253,6 +259,15 @@ To view all active client organizations and their last activity timestamps:
 .\wmonitor.exe -db postgres -list-clients
 ```
 
+Tenant-scoped security/business history (login, logout, enroll, client create/revoke, agent revoke/rotate) is available only to a platform admin token:
+
+```powershell
+Invoke-RestMethod -Uri "https://your-hub/api/admin/audit?tenant_id=t_<hex>" -Headers @{ "X-API-Key" = $adminToken }
+Invoke-RestMethod -Uri "https://your-hub/api/admin/agents/expected?tenant_id=t_<hex>" -Headers @{ "X-API-Key" = $adminToken }
+```
+
+`GET /api/admin/agents/expected` returns enrolled server IDs with `completeness: "not_assessed"`. It is not inferred from public `/api/health`. Read tokens receive 403. Audit rows never store tokens, hashes of secrets, or request bodies. `-add-client`, `-new-enroll-code`, `-new-admin-token`, `-revoke-client`, and `-revoke-agent` write the same ledger; if the audit insert fails the CLI exits before printing a newly issued secret.
+
 **Output:**
 ```text
 CLIENT               TENANT                                 STATUS     LAST SEEN            KEY HASH (prefix)
@@ -304,27 +319,25 @@ Run the universal builder script from the repository root:
 .\build_release.ps1
 ```
 
-This compiles:
-- `wmonitor.exe` (Windows x64 generic binary)
-- `wmonitor_linux` (Linux x64 generic binary)
+This compiles universal binaries only. `-EnrollCode` and `-ApiKey` are rejected. Record the SHA-256 of `dist\wmonitor.exe` and `dist\wmonitor_linux`; a checksum is not a publisher signature.
 
-Package these binaries alongside `install.ps1` and `install.sh` to provide to client teams.
+Package these binaries with a protected config file, `install.ps1`, and `install.sh`. Do not pass tokens as installer arguments.
 
 ---
 
 ### Windows Server Fleet Rollout
 
-Provide the following single-line command to the client's Windows administrator (runs in Administrator PowerShell):
+Provide the following command to the client's Windows administrator (Administrator PowerShell). Secrets stay in the config file:
 
 ```powershell
-.\install.ps1 -Mode agent -HubUrl "https://your-hub.onrender.com" -ApiKey "J8q7xKv9mP2LzY10aB+cdE4fGhIjKlMnOpQrStUvWxY="
+.\install.ps1 -ConfigPath C:\secure\wmonitor.env -BinaryPath .\dist\wmonitor.exe -ExpectedSHA256 "<64-hex-digest>"
 ```
 
 **What `install.ps1` does automatically:**
-1. Installs `wmonitor.exe` to `C:\Program Files\Sysmon\`.
-2. Creates and locks `%LOCALAPPDATA%\Sysmon\config.env` with Windows ACLs (SYSTEM and current admin only).
-3. Registers and starts the `wmonitor` Windows Service with startup type *Automatic*.
-4. Generates a persistent local server identifier in `%LOCALAPPDATA%\Sysmon\agent_id`.
+1. Verifies the binary digest and copies it to `C:\Program Files\W-Monitor\wmonitor.exe`.
+2. Writes `%ProgramData%\wmonitor\config.env` with SYSTEM + Administrators DACL.
+3. Validates config with `-print-config`, then `-install` and `-start`.
+4. Refuses to stop or replace an existing `wmonitor` service or config. `install_user.ps1` is disabled.
 
 ---
 
@@ -333,13 +346,13 @@ Provide the following single-line command to the client's Windows administrator 
 For Linux target servers (Ubuntu, Debian, RHEL, Rocky, CentOS, Alma):
 
 ```bash
-sudo ./install.sh --mode agent --hub-url "https://your-hub.onrender.com" --api-key "J8q7xKv9mP2LzY10aB+cdE4fGhIjKlMnOpQrStUvWxY="
+sudo ./install.sh --config /root/wmonitor.env --binary ./dist/wmonitor_linux --sha256 "<64-hex-digest>"
 ```
 
 **What `install.sh` does automatically:**
-1. Installs binary to `/usr/local/bin/wmonitor`.
-2. Writes credentials to `/etc/wmonitor/config.env` (permissions `0600` root-only).
-3. Installs and enables the `systemd` service (`wmonitor.service`).
+1. Installs the binary to `/usr/local/bin/wmonitor` after digest verification.
+2. Writes `/etc/wmonitor/config.env` (`0600` root-only). Source config must be root-owned and not group/other-readable.
+3. Installs and starts `wmonitor.service`. Existing installs are not replaced.
 
 ---
 
@@ -347,14 +360,14 @@ sudo ./install.sh --mode agent --hub-url "https://your-hub.onrender.com" --api-k
 
 #### Active Directory Group Policy (GPO Startup Script):
 ```powershell
-\\domain.local\sysvol\wmonitor\install.ps1 -Mode agent -HubUrl "https://hub.example.com" -ApiKey "J8q7x..."
+\\domain.local\sysvol\wmonitor\install.ps1 -ConfigPath \\domain.local\sysvol\wmonitor\wmonitor.env -BinaryPath \\domain.local\sysvol\wmonitor\wmonitor.exe -ExpectedSHA256 "<64-hex-digest>"
 ```
 
 #### Ansible Playbook Task:
 ```yaml
 - name: Deploy W-Monitor Agent
   win_shell: |
-    C:\Temp\install.ps1 -Mode agent -HubUrl "https://hub.example.com" -ApiKey "{{ wmonitor_api_key }}"
+    C:\Temp\install.ps1 -ConfigPath C:\Temp\wmonitor.env -BinaryPath C:\Temp\wmonitor.exe -ExpectedSHA256 "{{ wmonitor_sha256 }}"
 ```
 
 ---
@@ -440,7 +453,7 @@ export WMONITOR_TEST_ISOLATION=1
 go test ./agent ./storage ./internal/fsroot
 ```
 
-CI (`.github/workflows/ci.yml`) sets `WMONITOR_TEST_ISOLATION=1`, records `go version` / `go list -m all` / `go mod verify`, uses Go **1.26.6**, and pins `staticcheck@v0.6.1` and `govulncheck@v1.1.4` (not `@latest`). Module language version in `go.mod` remains `go 1.26.5`.
+CI (`.github/workflows/ci.yml`) sets `WMONITOR_TEST_ISOLATION=1`, records `go version` / `go list -m all` / `go mod verify`, uses Go **1.26.6** from `go.mod`, and pins `staticcheck@v0.6.1` and `govulncheck@v1.1.4` (not `@latest`).
 
 ### Retention containment (V07) — backup before any future enablement
 
@@ -448,20 +461,23 @@ Hourly **downsampling and automatic 30-day purge are disabled** until P2.03. `/a
 
 **Before any future rollout that re-enables retention:**
 1. Verify a restorable backup of SQLite/PostgreSQL.
-2. If a live secret was ever exposed (CSV auto-import, logs, process list), rotate it with an authorized operator procedure. **W-Monitor does not rotate credentials automatically.** CSV is no longer auto-imported at Hub start (P1.03).
+2. If a live secret was ever exposed (CSV auto-import, logs, process list), rotate it with an authorized operator procedure. **W-Monitor does not rotate credentials automatically.** `-import-clients` is disabled (P1.08).
 3. Do not downgrade to a build that still calls `downsampleMetrics`.
 
 ### Identity rollback (P1.03)
 
-Schema/identity changes are not a blind downgrade. After `-migrate-opaque-tenants`, restore the backup SQLite file written under `-opaque-tenant-backup-dir` rather than reintroducing plaintext tenant IDs. A revoked credential must stay revoked across restart and CSV drop.
+Schema/identity changes are not a blind downgrade. After `-migrate-opaque-tenants`, restore the backup SQLite file written under `-opaque-tenant-backup-dir` rather than reintroducing plaintext tenant IDs. A revoked credential must stay revoked across restart.
 
+### Sessions, ingest, and budgets (P1.07–P1.10)
 
-
-
-
-
-
-.\wmonitor.exe -db postgres -dsn "postgres://avnadmin:PASSWORD@pg-service.aivencloud.com:15432/defaultdb?sslmode=require" -add-client "ClientName"
-
-
-.\install.ps1 -Mode agent -HubUrl https://wmonitor-hub.onrender.com -ApiKey 3qzmUw7d+QfQIZ0MDvyloUeOxiYAnkNwVGrHhwp79g0=
+- Dashboard login uses a `wmr_` read token and an HttpOnly `wmonitor_session` cookie (`POST /api/session`). Sessions are replica-local.
+- Agents send `POST /api/v1/ingest/batches`. Upgrade the Hub before agents.
+- Remote PostgreSQL example (verified TLS):
+  ```powershell
+  .\wmonitor.exe -db postgres -dsn "postgres://avnadmin:PASSWORD@pg-service.aivencloud.com:15432/defaultdb?sslmode=verify-full" -add-client "ClientName"
+  ```
+- Fresh Windows install (no secrets in arguments):
+  ```powershell
+  .\install.ps1 -ConfigPath C:\secure\wmonitor.env -BinaryPath .\dist\wmonitor.exe -ExpectedSHA256 "<64-hex-digest>"
+  ```
+- G1 native OS service/ACL, live PostgreSQL, real-browser, and scanner gates remain **NOT RUN** until recorded on a disposable runner. Phase 1 is not complete.

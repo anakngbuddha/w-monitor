@@ -19,12 +19,14 @@ var ErrTenantRequired = errors.New("storage: tenant scope is required")
 
 // MetricQuery is a bounded, tenant-scoped metrics read.
 type MetricQuery struct {
-	Ctx      context.Context
-	Since    time.Time
-	Until    time.Time // zero = no upper bound
-	TenantID string
-	ServerID string
-	Limit    int
+	Ctx       context.Context
+	Since     time.Time
+	Until     time.Time // zero = no upper bound
+	TenantID  string
+	ServerID  string
+	Limit     int
+	AfterUnix int64 // exclusive keyset cursor timestamp (with AfterID)
+	AfterID   int64 // exclusive keyset cursor row id
 }
 
 // AllTenantsQuerier is the privileged read used by health and alert evaluation.
@@ -49,10 +51,7 @@ func queryContext(ctx context.Context) context.Context {
 }
 
 func queryLimit(limit int) int {
-	if limit > 0 {
-		return limit
-	}
-	return DefaultQueryLimit
+	return boundedLimit(limit)
 }
 
 func normalizeInsertTenant(id string) string {

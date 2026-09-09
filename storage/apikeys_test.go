@@ -368,6 +368,30 @@ func TestRevokeAgentAndListAgents(t *testing.T) {
 	}
 }
 
+func TestRevokeKeyHashLeavesSibling(t *testing.T) {
+	db := testDB(t)
+	first, _ := GenerateToken(KindRead)
+	second, _ := GenerateToken(KindRead)
+	for _, token := range []string{first, second} {
+		if err := db.UpsertAPIKey(APIKeyRecord{
+			KeyHash: HashAPIKey(token), TenantID: "t_hash", ClientName: "SiblingCo",
+			Kind: KindRead, Scope: ScopeRead, KeyPrefix: ExtractKeyPrefix(token),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := db.RevokeKeyHash(HashAPIKey(first))
+	if err != nil || n != 1 {
+		t.Fatalf("RevokeKeyHash: n=%d err=%v", n, err)
+	}
+	if _, err := db.ResolveAPIKey(HashAPIKey(first)); !errors.Is(err, ErrAPIKeyNotFound) {
+		t.Fatalf("revoked hash still resolved: %v", err)
+	}
+	if _, err := db.ResolveAPIKey(HashAPIKey(second)); err != nil {
+		t.Fatalf("sibling revoked: %v", err)
+	}
+}
+
 func TestMigrateTenantID(t *testing.T) {
 	db := testDB(t)
 

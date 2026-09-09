@@ -12,40 +12,40 @@ import (
 )
 
 const (
-	IngestSchema = "zeus.ingest.v1"
+	IngestSchema   = "zeus.ingest.v1"
 	MaxBatchEvents = 64
-	MaxBatchBytes = 256 << 10
-	MaxEventAge = 30 * 24 * time.Hour
+	MaxBatchBytes  = 256 << 10
+	MaxEventAge    = 30 * 24 * time.Hour
 )
 
 var (
-	ErrEventConflict = errors.New("ingest: event identity already has different content")
+	ErrEventConflict  = errors.New("ingest: event identity already has different content")
 	ErrAcceptedBudget = errors.New("ingest: accepted-data budget exhausted")
-	eventIdentifier = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,128}$`)
+	eventIdentifier   = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,128}$`)
 )
 
 type IngestEvent struct {
-	EventID string `json:"event_id"`
-	BootID string `json:"boot_id"`
-	Sequence uint64 `json:"sequence"`
-	Metric *MetricRow `json:"metric,omitempty"`
-	Process *ProcessRow `json:"process,omitempty"`
+	EventID  string      `json:"event_id"`
+	BootID   string      `json:"boot_id"`
+	Sequence uint64      `json:"sequence"`
+	Metric   *MetricRow  `json:"metric,omitempty"`
+	Process  *ProcessRow `json:"process,omitempty"`
 }
 
 type IngestBatch struct {
-	SchemaVersion string `json:"schema_version"`
-	Events []IngestEvent `json:"events"`
+	SchemaVersion string        `json:"schema_version"`
+	Events        []IngestEvent `json:"events"`
 }
 
 type IngestOutcome struct {
 	EventID string `json:"event_id"`
-	Status string `json:"status"`
+	Status  string `json:"status"`
 }
 
 type IngestPolicy struct {
-	DailyRows int64
-	DailyBytes int64
-	AgentDailyRows int64
+	DailyRows       int64
+	DailyBytes      int64
+	AgentDailyRows  int64
 	AgentDailyBytes int64
 }
 

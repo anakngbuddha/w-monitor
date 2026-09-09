@@ -28,8 +28,8 @@ const defaultUserWindow = 60 * time.Second
 // SYN_RECV is included: the handshake is mid-flight but a real client is on the
 // other end, and excluding it would undercount during connection bursts.
 var activeConnStates = map[string]bool{
-	"ESTABLISHED": true,
-	"SYN_RECV":    true,
+	"ESTABLISHED":  true,
+	"SYN_RECV":     true,
 	"SYN_RECEIVED": true, // some platforms spell it out
 }
 
@@ -42,27 +42,27 @@ var activeConnStates = map[string]bool{
 // user.
 var defaultExcludedPorts = map[uint32]bool{
 	// Databases and caches
-	5432: true, // postgres
-	3306: true, // mysql
-	6379: true, // redis
+	5432:  true, // postgres
+	3306:  true, // mysql
+	6379:  true, // redis
 	27017: true, // mongodb
-	1433: true, // sql server
-	1521: true, // oracle
-	9200: true, // elasticsearch http
-	9300: true, // elasticsearch transport
-	9042: true, // cassandra
+	1433:  true, // sql server
+	1521:  true, // oracle
+	9200:  true, // elasticsearch http
+	9300:  true, // elasticsearch transport
+	9042:  true, // cassandra
 	11211: true, // memcached
-	5672: true, // rabbitmq
+	5672:  true, // rabbitmq
 	// Remote administration and file sharing — these are operators, not users
-	22: true, // ssh
-	23: true, // telnet
+	22:   true, // ssh
+	23:   true, // telnet
 	3389: true, // rdp
-	445: true, // smb
-	139: true, // netbios session
-	135: true, // msrpc / dcom endpoint mapper
+	445:  true, // smb
+	139:  true, // netbios session
+	135:  true, // msrpc / dcom endpoint mapper
 	5985: true, // winrm http
 	5986: true, // winrm https
-	111: true, // rpcbind
+	111:  true, // rpcbind
 	2049: true, // nfs
 }
 

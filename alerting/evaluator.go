@@ -37,8 +37,8 @@ type Evaluator struct {
 	notifiers []Notifier
 	interval  time.Duration
 
-	mu     sync.RWMutex
-	states map[string]*ruleState
+	mu      sync.RWMutex
+	states  map[string]*ruleState
 	history []Alert
 }
 

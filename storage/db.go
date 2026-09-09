@@ -215,6 +215,17 @@ CREATE TABLE IF NOT EXISTS processes (
     cpu_pct   REAL    NOT NULL,
     mem_mb    REAL    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           INTEGER NOT NULL,
+    tenant_id    TEXT    NOT NULL,
+    actor_kind   TEXT    NOT NULL,
+    actor_prefix TEXT    NOT NULL,
+    action       TEXT    NOT NULL,
+    target_type  TEXT    NOT NULL DEFAULT '',
+    target_id    TEXT    NOT NULL DEFAULT ''
+);
 `
 	if _, err := db.conn.Exec(tables); err != nil {
 		return err
@@ -250,6 +261,7 @@ CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_metrics_server ON metrics(server_id);
 CREATE INDEX IF NOT EXISTS idx_metrics_tenant ON metrics(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_tenant_ts ON audit_events(tenant_id, ts);
 `
 	if _, err := db.conn.Exec(indexes); err != nil {
 		return err
@@ -288,7 +300,7 @@ func (db *DB) QueryMetrics(since time.Time, tenantID string) ([]MetricRow, error
 
 // QueryMetricsAllTenants is a privileged health/alerting read. Not a customer export.
 func (db *DB) QueryMetricsAllTenants(ctx context.Context, since time.Time, limit int) ([]MetricRow, error) {
-	return db.queryMetrics(queryContext(ctx), since, time.Time{}, "", "", queryLimit(limit), true)
+	return db.queryMetrics(queryContext(ctx), since, time.Time{}, "", "", queryLimit(limit), true, 0, 0)
 }
 
 // QueryMetricsQ applies SQL-side tenant/server/time bounds, a limit, and ctx cancellation.
@@ -296,10 +308,10 @@ func (db *DB) QueryMetricsQ(q MetricQuery) ([]MetricRow, error) {
 	if err := RequireTenant(q.TenantID); err != nil {
 		return nil, err
 	}
-	return db.queryMetrics(queryContext(q.Ctx), q.Since, q.Until, q.TenantID, q.ServerID, queryLimit(q.Limit), false)
+	return db.queryMetrics(queryContext(q.Ctx), q.Since, q.Until, q.TenantID, q.ServerID, queryLimit(q.Limit), false, q.AfterUnix, q.AfterID)
 }
 
-func (db *DB) queryMetrics(ctx context.Context, since, until time.Time, tenantID, serverID string, limit int, allTenants bool) ([]MetricRow, error) {
+func (db *DB) queryMetrics(ctx context.Context, since, until time.Time, tenantID, serverID string, limit int, allTenants bool, afterUnix, afterID int64) ([]MetricRow, error) {
 	q := `SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
 		 FROM metrics WHERE timestamp >= ?`
 	args := []any{since.Unix()}
@@ -315,7 +327,11 @@ func (db *DB) queryMetrics(ctx context.Context, since, until time.Time, tenantID
 		q += ` AND server_id = ?`
 		args = append(args, serverID)
 	}
-	q += ` ORDER BY timestamp ASC LIMIT ?`
+	if afterID > 0 {
+		q += ` AND (timestamp > ? OR (timestamp = ? AND id > ?))`
+		args = append(args, afterUnix, afterUnix, afterID)
+	}
+	q += ` ORDER BY timestamp ASC, id ASC LIMIT ?`
 	args = append(args, limit)
 
 	rows, err := db.conn.QueryContext(ctx, q, args...)
@@ -392,26 +408,7 @@ func (db *DB) CountProcesses() (int, error) {
 // If tenantID is non-empty, only servers for that tenant are returned.
 // QueryServers returns distinct server_id values for one tenant.
 func (db *DB) QueryServers(tenantID string) ([]string, error) {
-	if err := RequireTenant(tenantID); err != nil {
-		return nil, err
-	}
-	rows, err := db.conn.Query(
-		"SELECT DISTINCT server_id FROM metrics WHERE server_id != '' AND tenant_id = ? ORDER BY server_id",
-		tenantID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var servers []string
-	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
-			return nil, err
-		}
-		servers = append(servers, s)
-	}
-	return servers, rows.Err()
+	return db.QueryServersContext(context.Background(), tenantID, DefaultQueryLimit)
 }
 
 // Conn exposes the underlying *sql.DB for use by other packages (retention, etc.).

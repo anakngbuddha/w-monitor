@@ -4,6 +4,87 @@ All notable changes, architectural updates, CLI modifications, and documentation
 
 ---
 
+## [2026-09-08] - P1.10 audit trail, expected-agent inventory, and keyset reads (G1 OPEN)
+
+### Summary
+Credential and session administration now writes tenant-scoped append-only audit events. Browser login fails closed if the audit insert fails. `GET /api/admin/audit` and `GET /api/admin/agents/expected` require `ScopeAdmin`; public `/api/health` still does not expose agent inventory or completeness. Metric, process, server, and CSV reads advertise `complete` plus a `unix:id` cursor (CSV uses `X-Next-Cursor`). CLI `-add-client`, `-new-enroll-code`, `-new-admin-token`, `-revoke-client`, and `-revoke-agent` write the same ledger before printing a secret. V07 remains contained. Phase 1 / G1 are **not** complete.
+
+### Affected Components
+- [`storage/audit.go:L52`](file:///c:/Users/markmv/Desktop/Zeus/storage/audit.go#L52): `AppendAudit` / `ListAudit` on SQLite and PostgreSQL; `audit_events` in [`storage/db.go`](file:///c:/Users/markmv/Desktop/Zeus/storage/db.go) and [`storage/postgres.go`](file:///c:/Users/markmv/Desktop/Zeus/storage/postgres.go).
+- [`server/audit.go:L42`](file:///c:/Users/markmv/Desktop/Zeus/server/audit.go#L42): `handleAdminAudit`; [`server/audit.go:L88`](file:///c:/Users/markmv/Desktop/Zeus/server/audit.go#L88): `handleExpectedAgents` always returns `completeness: "not_assessed"`.
+- [`server/session.go`](file:///c:/Users/markmv/Desktop/Zeus/server/session.go): `session.login` / `session.logout`.
+- [`server/enroll.go`](file:///c:/Users/markmv/Desktop/Zeus/server/enroll.go): `enroll.completed`, `enroll.code_issued`, `client.created`, `agent.revoked`, `agent.rotated`.
+- [`client_admin.go:L25`](file:///c:/Users/markmv/Desktop/Zeus/client_admin.go#L25): `recordCLIAudit` for CLI credential mutations (`admin.token_issued`, `client.revoked`).
+- [`server/read_page.go:L18`](file:///c:/Users/markmv/Desktop/Zeus/server/read_page.go#L18): `limit` (1..100000) and `cursor=unix:id` for `/api/metrics`, `/api/processes`, `/api/export/csv`.
+- [`storage/query.go`](file:///c:/Users/markmv/Desktop/Zeus/storage/query.go): `MetricQuery.AfterUnix` / `AfterID`; query limits capped at `DefaultQueryLimit`.
+- [`server/p107_session_test.go`](file:///c:/Users/markmv/Desktop/Zeus/server/p107_session_test.go): loopback TCP cookie-jar login, CSRF logout rejection, revocation.
+
+### Added / Modified CLI Flags & Environment Variables
+| Flag / Env Var | Type | Default | Description |
+|---|---|---|---|
+| (none) | — | — | No new flags. CLI credential commands now refuse to print a newly issued secret if `AppendAudit` fails. |
+
+### API & Protocol Changes
+- `GET /api/admin/audit?tenant_id=`: admin only; JSON `{events, complete}`. Tokens, hashes, and request bodies are not stored.
+- `GET /api/admin/agents/expected?tenant_id=`: admin only; inventory with `completeness: "not_assessed"` (no campaign contract).
+- `GET /api/metrics`, `/api/processes`, `/api/export/csv`: `limit`, `cursor=unix:id`; response `complete` and `next_cursor` (CSV: `X-Result-Complete`, `X-Next-Cursor`).
+- `GET /api/servers`: `limit` (1..1000), `cursor=<server_id>`; JSON `complete` / `next_cursor`.
+
+### Operational & Migration Notes
+- `audit_events` is additive. Back up before rollout. Audit is replica-local with the session store; it is not a shared cluster log.
+- If audit insert fails after a mutation, HTTP returns 503 and does not return newly minted secrets. Newly issued enroll codes, read tokens, and non-recovered agent tokens are revoked by hash so they cannot be used unaudited.
+- **G1 not closed.** `go test -race` still cannot compile (`gcc` not on PATH). Live PostgreSQL, real-browser cookie/CSRF, native install/ACL, power-loss spool, and signed scanners remain required.
+
+---
+
+## [2026-09-08] - P1.07–P1.10: Sessions, lifecycle, spool, and budgets (G1 OPEN)
+
+### Summary
+P1.07–P1.10 source is present and locally compile-checked. Browser login uses opaque HttpOnly/SameSite cookies with exact origin/scheme checks, HTTPS for remote login, credential revalidation, and self-hosted Chart.js. Service-control flags run before workload dispatch. Fresh installers require an explicit protected config plus an independently verified SHA-256; they refuse to replace an existing install. Agents drain sealed spool segments as bounded `POST /api/v1/ingest/batches` with durable receipts. Accepted-data budgets are transactional and do not debit malformed, duplicate, or rolled-back events. `/api/health` is liveness only; `/api/ready` checks storage; Hub `/metrics` requires a real admin principal. V07 remains contained. Phase 1 / G1 are **not** complete.
+
+### Affected Components
+- [`server/session.go`](file:///c:/Users/markmv/Desktop/Zeus/server/session.go#L154): `handleSession`, `lookupSession`, `originOK`, bounded `sessionStore`.
+- [`dashboard/dashboard.go`](file:///c:/Users/markmv/Desktop/Zeus/dashboard/dashboard.go#L20): fail-closed HTML/JS transformation; CRLF-normalized patch anchors; local `/dashboard.js` and `/chart.umd.min.js`.
+- [`dashboard/static/session.js`](file:///c:/Users/markmv/Desktop/Zeus/dashboard/static/session.js#L1): no URL/localStorage bearer reuse; abort/generation guards; logout clears charts.
+- [`main.go`](file:///c:/Users/markmv/Desktop/Zeus/main.go#L68) / [`runtime.go`](file:///c:/Users/markmv/Desktop/Zeus/runtime.go#L43): service control before `loadConfigEnv`; joined collector/retention/HTTP shutdown.
+- [`config.go`](file:///c:/Users/markmv/Desktop/Zeus/config.go#L36): absolute `-config` / `WMONITOR_CONFIG` / machine `config.env`; remote PostgreSQL `sslmode=verify-full`.
+- [`install.ps1`](file:///c:/Users/markmv/Desktop/Zeus/install.ps1) / [`install.sh`](file:///c:/Users/markmv/Desktop/Zeus/install.sh): explicit config + binary digest; no secret arguments.
+- [`install_user.ps1`](file:///c:/Users/markmv/Desktop/Zeus/install_user.ps1): per-user hidden install throws and changes nothing.
+- [`build_release.ps1`](file:///c:/Users/markmv/Desktop/Zeus/build_release.ps1): refuses `-EnrollCode`/`-ApiKey` embedding.
+- [`agent/spool.go`](file:///c:/Users/markmv/Desktop/Zeus/agent/spool.go) / [`agent/spool_batch.go`](file:///c:/Users/markmv/Desktop/Zeus/agent/spool_batch.go#L17): exclusive lock, sealed segments, `DrainBatches`.
+- [`storage/ingest.go`](file:///c:/Users/markmv/Desktop/Zeus/storage/ingest.go#L111) / [`storage/ingest_contract.go`](file:///c:/Users/markmv/Desktop/Zeus/storage/ingest_contract.go#L14): receipts, conflicts, 30-day window, tenant/agent budgets.
+- [`server/server.go`](file:///c:/Users/markmv/Desktop/Zeus/server/server.go#L469): `handleHealth`, `handleReady`, admin-gated Hub `/metrics`.
+- [`agent/path_safety_test.go`](file:///c:/Users/markmv/Desktop/Zeus/agent/path_safety_test.go): `DataDir()` remains blocked except in dedicated `storage/datadir_test.go` isolation tests.
+- [`agent/p109_spool_fault_test.go`](file:///c:/Users/markmv/Desktop/Zeus/agent/p109_spool_fault_test.go): full-queue append returns `ErrSpoolFull`, keeps queued evidence, and records `overflow`.
+
+### Added / Modified CLI Flags & Environment Variables
+| Flag / Env Var | Type | Default | Description |
+|---|---|---|---|
+| `-config` | string | machine `config.env` | Absolute protected config. Precedence: explicit flag > `WMONITOR_CONFIG` > `%ProgramData%\wmonitor\config.env` or `/etc/wmonitor/config.env`. No cwd/exe-dir search. |
+| `WMONITOR_CONFIG` | string | machine path | Absolute config path when `-config` is omitted. |
+| `WMONITOR_LISTEN_HOST` | string | Hub `0.0.0.0`; otherwise `127.0.0.1` | Standalone/unauthenticated listeners must remain loopback. |
+| `WMONITOR_DAILY_ROW_QUOTA` | int64 | `20000000` | Shared tenant accepted-row budget per UTC day. |
+| `WMONITOR_DAILY_BYTE_QUOTA` | int64 | `21474836480` (20 GiB) | Shared tenant accepted-byte budget per UTC day. |
+| `WMONITOR_AGENT_DAILY_ROW_QUOTA` | int64 | `250000` | Per-agent accepted-row budget per UTC day. |
+| `WMONITOR_AGENT_DAILY_BYTE_QUOTA` | int64 | `268435456` (256 MiB) | Per-agent accepted-byte budget per UTC day. |
+| `-show-key` | bool | `false` | Prints that secret recovery is disabled; does not print a token. |
+| `-import-clients` | string | `""` | Disabled: returns a reviewed-migration error. Use `-add-client` / `-new-enroll-code`. |
+
+### API & Protocol Changes
+- `POST /api/session`: same-origin, remote HTTPS, throttled before DB, opaque `wmonitor_session` cookie. `DELETE` logs out.
+- `POST /api/v1/ingest/batches`: agent batch ingest. Legacy `POST /api/ingest` accepts bound machine tokens only.
+- `GET /api/health`: constant-time liveness; no tenant freshness. `GET /api/ready`: dependency ping.
+- Hub `GET /metrics`: `ScopeAdmin` even behind a loopback proxy.
+
+### Operational & Migration Notes
+- Upgrade Hub before agents. Duplicate event IDs with changed content conflict; identical replay is `duplicate` and does not consume accepted-data allowance.
+- Remote PostgreSQL must use verified TLS (`sslmode=verify-full`). `require` / `verify-ca` are insufficient.
+- Fresh installers will not stop or replace an existing service. `install_user.ps1` is disabled.
+- Sessions are replica-local; restart or another replica requires login again until a reviewed shared-session store exists.
+- **G1 not closed.** Native install/reboot/ACL, live PostgreSQL (unless `WMONITOR_PHASE1_PG_FIXTURE=1`), real-browser cookie/CSRF, power-loss spool injection, race suite, and selected-module/binary scans remain required. Do not re-enable `downsampleMetrics`.
+
+---
+
 ## [2026-09-08] - P1.06: Transport, destination, and secret-file boundaries
 
 ### Summary

@@ -81,6 +81,17 @@ CREATE TABLE IF NOT EXISTS processes (
     cpu_pct   DOUBLE PRECISION NOT NULL,
     mem_mb    DOUBLE PRECISION NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id           BIGSERIAL PRIMARY KEY,
+    ts           BIGINT NOT NULL,
+    tenant_id    TEXT NOT NULL,
+    actor_kind   TEXT NOT NULL,
+    actor_prefix TEXT NOT NULL,
+    action       TEXT NOT NULL,
+    target_type  TEXT NOT NULL DEFAULT '',
+    target_id    TEXT NOT NULL DEFAULT ''
+);
 `
 	ctx := context.Background()
 	if _, err := pg.pool.Exec(ctx, tables); err != nil {
@@ -117,6 +128,7 @@ CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_metrics_server ON metrics(server_id);
 CREATE INDEX IF NOT EXISTS idx_metrics_tenant ON metrics(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_processes_ts ON processes(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_tenant_ts ON audit_events(tenant_id, ts);
 `
 	if _, err := pg.pool.Exec(ctx, indexes); err != nil {
 		return err
@@ -158,17 +170,17 @@ func (pg *PostgresDB) QueryMetrics(since time.Time, tenantID string) ([]MetricRo
 }
 
 func (pg *PostgresDB) QueryMetricsAllTenants(ctx context.Context, since time.Time, limit int) ([]MetricRow, error) {
-	return pg.queryMetrics(queryContext(ctx), since, time.Time{}, "", "", queryLimit(limit), true)
+	return pg.queryMetrics(queryContext(ctx), since, time.Time{}, "", "", queryLimit(limit), true, 0, 0)
 }
 
 func (pg *PostgresDB) QueryMetricsQ(q MetricQuery) ([]MetricRow, error) {
 	if err := RequireTenant(q.TenantID); err != nil {
 		return nil, err
 	}
-	return pg.queryMetrics(queryContext(q.Ctx), q.Since, q.Until, q.TenantID, q.ServerID, queryLimit(q.Limit), false)
+	return pg.queryMetrics(queryContext(q.Ctx), q.Since, q.Until, q.TenantID, q.ServerID, queryLimit(q.Limit), false, q.AfterUnix, q.AfterID)
 }
 
-func (pg *PostgresDB) queryMetrics(ctx context.Context, since, until time.Time, tenantID, serverID string, limit int, allTenants bool) ([]MetricRow, error) {
+func (pg *PostgresDB) queryMetrics(ctx context.Context, since, until time.Time, tenantID, serverID string, limit int, allTenants bool, afterUnix, afterID int64) ([]MetricRow, error) {
 	query := `SELECT id, timestamp, tenant_id, server_id, hostname, cpu_pct, mem_pct, disk_free_gb, net_sent_bytes, net_recv_bytes, cpu_cores, mem_total_gb, disk_total_gb, disk_read_ops, disk_write_ops, disk_iops, net_mbps, concurrent_users, net_sent_external, net_recv_external, net_sent_internal, net_recv_internal
 		 FROM metrics WHERE timestamp >= $1`
 	args := []interface{}{since.Unix()}
@@ -188,7 +200,12 @@ func (pg *PostgresDB) queryMetrics(ctx context.Context, since, until time.Time, 
 		args = append(args, serverID)
 		n++
 	}
-	query += fmt.Sprintf(` ORDER BY timestamp ASC LIMIT $%d`, n)
+	if afterID > 0 {
+		query += fmt.Sprintf(` AND (timestamp > $%d OR (timestamp = $%d AND id > $%d))`, n, n+1, n+2)
+		args = append(args, afterUnix, afterUnix, afterID)
+		n += 3
+	}
+	query += fmt.Sprintf(` ORDER BY timestamp ASC, id ASC LIMIT $%d`, n)
 	args = append(args, limit)
 
 	rows, err := pg.pool.Query(ctx, query, args...)
@@ -272,26 +289,7 @@ func (pg *PostgresDB) CountProcesses() (int, error) {
 // QueryServers returns distinct server_id values seen in the metrics table.
 // If tenantID is non-empty, only servers for that tenant are returned.
 func (pg *PostgresDB) QueryServers(tenantID string) ([]string, error) {
-	if err := RequireTenant(tenantID); err != nil {
-		return nil, err
-	}
-	rows, err := pg.pool.Query(context.Background(),
-		"SELECT DISTINCT server_id FROM metrics WHERE server_id != '' AND tenant_id = $1 ORDER BY server_id",
-		tenantID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var servers []string
-	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
-			return nil, err
-		}
-		servers = append(servers, s)
-	}
-	return servers, rows.Err()
+	return pg.QueryServersContext(context.Background(), tenantID, DefaultQueryLimit)
 }
 
 // PurgeOld deletes metric and process rows older than cutoff timestamp.

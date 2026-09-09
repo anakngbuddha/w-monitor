@@ -130,11 +130,11 @@ func BenchmarkInsertMetric(b *testing.B) {
 	defer db.Close()
 
 	m := storage.MetricRow{
-		Timestamp:   time.Now(),
-		ServerID:    "bench-srv",
-		CPUPct:      42.0,
-		MemPct:      55.0,
-		DiskFreeGB:  100.0,
+		Timestamp:    time.Now(),
+		ServerID:     "bench-srv",
+		CPUPct:       42.0,
+		MemPct:       55.0,
+		DiskFreeGB:   100.0,
 		NetSentBytes: 1024,
 		NetRecvBytes: 2048,
 	}

@@ -43,8 +43,8 @@ W-Monitor is built around the **Universal Generic Binary + Organization API Key*
 │    └────────┬─────────┘    └────────┬─────────┘    └────────┬────────┘  │
 │             │                       │                       │           │
 │             └───────────────────────┼───────────────────────┘           │
-│                                     │ HTTPS POST /api/ingest            │
-│                                     │ Header: X-API-Key: <Acme_Key>     │
+│                                     │ HTTPS POST /api/v1/ingest/batches │
+│                                     │ Header: X-API-Key: <wma_ token>    │
 │                                     │ (Outbound ONLY — 0 inbound ports) │
 └─────────────────────────────────────┼───────────────────────────────────┘
                                       │
@@ -96,9 +96,11 @@ Run the builder script in PowerShell:
 .\build_release.ps1
 ```
 
-This compiles two clean, generic binaries with zero hardcoded credentials:
-* `wmonitor.exe` (Windows 64-bit universal binary)
-* `wmonitor_linux` (Linux 64-bit universal binary)
+This compiles two clean, generic binaries with zero hardcoded credentials. Passing `-EnrollCode` or `-ApiKey` is rejected:
+* `dist\wmonitor.exe` (Windows 64-bit universal binary)
+* `dist\wmonitor_linux` (Linux 64-bit universal binary)
+
+A SHA-256 of those files is an integrity check, not a publisher signature.
 
 ---
 
@@ -125,16 +127,15 @@ On your Hub machine, run these commands (the hub doesn't need to be running for 
 ```
 The enrollment code is a handshake secret only. It cannot be sent as `X-API-Key` to `/api/ingest` or dashboard routes. Duplicate client display names are rejected; pass a unique name or create the code with an explicit tenant after listing clients.
 
-**D. Build a client binary with the enrollment code baked in:**
-```powershell
-.\build_release.ps1 -ClientName "AcmeCorp" -HubUrl "https://wmonitor-hub.onrender.com" -EnrollCode "WM-XXXX-XXXX-XXXX"
-# Output: dist\AcmeCorp\wmonitor_AcmeCorp.exe  (Windows)
-#         dist\AcmeCorp\wmonitor_AcmeCorp_linux (Linux)
-#         .\wmonitor.exe (copy to root for install.ps1)
+**D. Provision a protected machine config** (UTF-8, no BOM). Do not bake codes into the binary:
+
+```text
+WMONITOR_MODE=agent
+WMONITOR_AGENT_HUB=https://wmonitor-hub.onrender.com
+WMONITOR_ENROLL_CODE=WM-XXXX-XXXX-XXXX
 ```
 
-Distribute the built binary (`wmonitor_AcmeCorp.exe` / `wmonitor_AcmeCorp_linux`) to AcmeCorp's servers.
-No API key or secret needs to be shared — the enrollment code is embedded in the binary and consumed on first run.
+Distribute the universal binary, `install.ps1` / `install.sh`, and this config file. Existing installs are not replaced by the fresh-install scripts.
 
 ---
 
@@ -146,17 +147,18 @@ Package `wmonitor.exe` and `install.ps1` and provide them to the client's Window
 Run in **PowerShell as Administrator**:
 
 ```powershell
-# No API key needed -- the binary auto-enrolls on first start
-.\install.ps1 -Mode agent -HubUrl "https://wmonitor-hub.onrender.com"
+# Run as Administrator. Secrets stay in ConfigPath; they are never service arguments.
+Get-FileHash .\dist\wmonitor.exe -Algorithm SHA256
+.\install.ps1 -ConfigPath C:\secure\wmonitor.env -BinaryPath .\dist\wmonitor.exe -ExpectedSHA256 "<64-hex-digest>"
 ```
 
-*(Note: `-HubUrl` automatically defaults to `https://wmonitor-hub.onrender.com`. You only need to pass `-HubUrl` if using a custom domain.)*
-
 **What this does automatically:**
-1. Installs binary to `C:\Program Files\W-Monitor\wmonitor.exe`.
-2. Registers and starts the `wmonitor` Windows Service with startup type *Automatic*.
-3. On first start, the agent calls `POST /api/enroll` with the baked enrollment code.
-4. The Hub returns a scoped `wma_` ingest token, saved to `%ProgramData%\wmonitor\token.dat` (DPAPI-encrypted, SYSTEM + Administrators only).
+1. Verifies the binary digest, then copies it to `C:\Program Files\W-Monitor\wmonitor.exe`.
+2. Writes `%ProgramData%\wmonitor\config.env` with a SYSTEM + Administrators DACL.
+3. Runs `wmonitor -config ... -print-config` then `-install` and `-start`.
+4. On first start, the agent calls `POST /api/enroll` using `WMONITOR_ENROLL_CODE` from that file.
+5. The Hub returns a scoped `wma_` ingest token, saved under `%ProgramData%\wmonitor` (DPAPI, SYSTEM + Administrators).
+6. If `wmonitor` already exists as a service or config, the script exits without stopping or replacing it.
 5. Subsequent runs load the token from the credential store — no re-enrollment needed.
 6. Replacing a machine token requires proving the current token (`current_token` in the enroll JSON) or an operator `POST /api/admin/agents/rotate`. A lost first reply is recovered automatically for five minutes.
 7. Production agents require an `https://` hub URL (loopback HTTP is allowed only for local tests). Changing the hub URL does **not** send the old token or the old spool backlog; re-enroll at the new hub.
@@ -178,20 +180,19 @@ Package `wmonitor_linux` and `install.sh` and transfer them to the target Linux 
 Run in terminal as `root`:
 
 ```bash
-chmod +x install.sh
-# No API key needed -- the binary auto-enrolls on first start
-sudo ./install.sh --mode agent --hub-url https://wmonitor-hub.onrender.com
+sha256sum dist/wmonitor_linux
+sudo ./install.sh --config /root/wmonitor.env --binary ./dist/wmonitor_linux --sha256 "<64-hex-digest>"
 ```
 
-*(Note: `--hub-url` automatically defaults to `https://wmonitor-hub.onrender.com`.)*
+*(Secrets are never command-line arguments. The source config must be an absolute, root-owned, mode `600` regular file.)*
 
 **What this does automatically:**
-1. Copies binary to `/usr/local/bin/wmonitor`.
-2. Registers, enables, and starts `wmonitor.service` via `systemd`.
-3. On first start, the agent calls `POST /api/enroll` with the baked enrollment code.
-4. The Hub returns a scoped `wma_` ingest token, saved to `/etc/wmonitor/token.json` (`0600`, root-only).
-5. Subsequent runs load the token from the credential file -- no re-enrollment needed.
-6. Replacing a machine token requires `current_token` or operator `POST /api/admin/agents/rotate`. A lost first reply is recovered for five minutes.
+1. Copies the binary to `/usr/local/bin/wmonitor` after digest check.
+2. Installs `/etc/wmonitor/config.env` mode `0600` root-only.
+3. Registers and starts `wmonitor.service` via `systemd` using `-config /etc/wmonitor/config.env`.
+4. On first start, the agent calls `POST /api/enroll` using `WMONITOR_ENROLL_CODE` from that file.
+5. The Hub returns a scoped `wma_` ingest token, saved to `/etc/wmonitor` (`0600`, root-only).
+6. If `wmonitor.service` or `/etc/wmonitor/config.env` already exists, the script exits without stopping or replacing it.
 
 #### B. Interactive Foreground Run (Testing Only)
 ```bash
@@ -208,17 +209,20 @@ chmod +x wmonitor_linux
    ```text
    https://wmonitor-hub.onrender.com
    ```
-2. **Organization Key Authentication:**
+2. **Read-token session authentication:**
    * An authentication modal will appear: `🔐 W-Monitor Client Access`.
-   * Paste your client's **Organization API Key** and click **Access Dashboard**.
-   * The dashboard saves your key in browser storage and activates your isolated tenant session.
+   * Paste a dashboard **read token** (`wmr_…`) issued by `-add-client`. Agent (`wma_`) tokens cannot sign in.
+   * Login is `POST /api/session` over HTTPS (loopback HTTP is allowed only on 127.0.0.1). The token is never stored in the URL, `localStorage`, or request headers after login.
+   * The Hub sets an HttpOnly, SameSite=Strict `wmonitor_session` cookie. Logout is `DELETE /api/session` and clears charts.
+   * Status labels report `Recent samples`, `Stale data (over 2 minutes)`, or `Result limit reached (incomplete)` when `complete` is false. Chart gaps are shown (`spanGaps: false`).
+   * Metric and process APIs are keyset-paginated: `GET /api/metrics?range=24h&limit=100000&cursor=<unix>:<id>`. Follow `next_cursor` until `complete` is true. The default cap is 100000 rows. CSV export uses the same `limit`/`cursor` query parameters and returns `X-Result-Complete` / `X-Next-Cursor`.
+   * Server lists are paginated separately: `GET /api/servers?limit=1000&cursor=<server_id>`.
 3. **Filtering by Server:**
    * Look at the top navigation bar for the **Server Dropdown** (`All Servers`).
    * Choose **All Servers** to view aggregated fleet metrics.
    * Or click the dropdown to select a specific server (e.g. `WIN-SRV01`, `LINUX-DB-02`) to view that machine's isolated utilization.
 4. **Time Window Ranges:**
-   * Click **24h** for real-time 10-second metric resolution.
-   * Click **7d** or **30d** for historical trends with automatic hourly downsampling.
+   * Click **24h**, **7d**, or **30d**. Destructive hourly downsampling remains disabled (V07 contained until P2.03). Incomplete or gapped series stay visible.
 5. **Observed Metrics:**
    * **CPU Usage:** Average vs. Peak utilization.
    * **Memory Usage:** Average vs. Peak RAM consumed.
@@ -235,8 +239,9 @@ chmod +x wmonitor_linux
 For offline, single-machine evaluations where no central Hub is needed:
 
 ```powershell
-# Windows:
-.\wmonitor.exe
+# Windows (loopback-only unauthenticated listener):
+.\wmonitor.exe -config C:\secure\standalone.env
+```
 
 # Linux:
 ./wmonitor_linux
@@ -344,16 +349,18 @@ sudo /usr/local/bin/wmonitor -uninstall
 ## 9. CLI Flags & Environment Variables Reference
 
 W-Monitor enforces a strict configuration precedence:
-`CLI Flag` > `Environment Variable` > `config.env file` > `Build-time default (-ldflags)` > `Built-in default`.
+`CLI Flag` > `Environment Variable` > one absolute protected config file (`-config` / `WMONITOR_CONFIG` / machine `config.env`) > `Built-in default`. Embedded `-ldflags` credentials are rejected at startup. There is no current-directory or executable-directory config search.
 
 | Flag | Env Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-agent <url>` | `WMONITOR_AGENT_HUB` | `""` | Run in Agent mode, forwarding metrics to this Hub URL |
-| `-api-key <key>` | `WMONITOR_API_KEY` | `""` | Organization API key for authentication |
-| `-hub` | `WMONITOR_MODE=hub` | `false` | Enable Hub ingest endpoint (`POST /api/ingest`) |
-| `-port <port>` | `WMONITOR_PORT` / `PORT` | `8080` | HTTP port for the web dashboard |
+| `-config <path>` | `WMONITOR_CONFIG` | `%ProgramData%\wmonitor\config.env` / `/etc/wmonitor/config.env` | Absolute protected UTF-8 config. Windows machine config ACLs: SYSTEM + Administrators. Linux: not group/other-readable. |
+| `-agent <url>` | `WMONITOR_AGENT_HUB` | `""` | Agent mode. Production destination must be an `https://` origin with no credentials, path, query, or fragment. |
+| `-api-key <key>` | `WMONITOR_API_KEY` | `""` | Test-only token. Prefer protected config. Visible in process lists if passed as a flag. |
+| `-hub` | `WMONITOR_MODE=hub` | `false` | Enable authenticated Hub. Agents post `POST /api/v1/ingest/batches`. |
+| `-port <port>` | `WMONITOR_PORT` / `PORT` | `8080` | HTTP port. Standalone listens on `127.0.0.1` unless `WMONITOR_LISTEN_HOST` is a loopback address. Hub may bind `0.0.0.0`. |
 | `-db <type>` | `WMONITOR_DB` | `sqlite` | Database backend (`sqlite` or `postgres`) |
-| `-dsn <dsn>` | `WMONITOR_DB_DSN` | `""` | PostgreSQL connection string |
+| `-dsn <dsn>` | `WMONITOR_DB_DSN` | `""` | Test-only DSN. Remote PostgreSQL requires `sslmode=verify-full`. Prefer `-dsn-file` or env. |
+| `-dsn-file` | — | `""` | Protected DSN file (same ownership rules as config). |
 | `-app-port <p>` | `WMONITOR_APP_PORT` | `""` | Ports to monitor for concurrent active users (e.g. `80,443,3000`) |
 | `-external-iface`| `WMONITOR_EXTERNAL_IFACE`| `""` | Override network interface for cloud egress tracking |
 | `-assessment-report`| — | `""` | Generate HTML cloud assessment report and exit |
@@ -363,19 +370,27 @@ W-Monitor enforces a strict configuration precedence:
 | `-add-client <name>`| — | `""` | Generate a dashboard **read** token and opaque `t_<hex>` tenant for a new unique client name (Hub only). Duplicate names are refused. |
 | `-list-clients` | — | `false` | Audit all registered clients and activity timestamps |
 | `-revoke-client` | — | `""` | Revoke all API keys for a client organization |
-| `-import-clients <csv>` | — | `""` | Explicit CSV import of client keys. Skips hashes that already exist (including revoked). Does **not** run at Hub start. |
+| `-import-clients <csv>` | — | `""` | Disabled pending a reviewed migration. Use `-add-client` and `-new-enroll-code`. |
 | `-new-enroll-code <name>` | — | `""` | Issue a handshake-only enrollment code. Ambiguous display names fail. First `POST /api/enroll` for a new `server_id` consumes one use. Replacement needs `current_token` or operator rotate. |
 | `-new-admin-token` | — | `false` | Issue a platform admin token (`wmk_`, `kind=admin`, `scope=admin`). |
 | `-migrate-opaque-tenants` | — | `false` | SQLite-only: remap plaintext `tenant_id` values to `t_<hex>` after writing a backup. |
 | `-opaque-tenant-backup-dir` | — | `""` | Required backup directory for `-migrate-opaque-tenants`. |
 | `-print-config` | — | `false` | Print resolved runtime config. Secrets are shown as `(set)` / `(not set)`, never as a prefix of the value. |
-| `-show-key` | — | `false` | Display configured API key and exit (operator console only; not written to the service log). |
+| `-show-key` | — | `false` | Secret recovery is disabled. Request a new scoped credential. |
+| `-install` / `-start` / `-stop` / `-uninstall` | — | `false` | Service control. Stop/uninstall still work if workload config is broken. Choose exactly one control action. |
+| — | `WMONITOR_LISTEN_HOST` | Hub `0.0.0.0`; else `127.0.0.1` | Unauthenticated non-loopback binds are rejected. |
+| — | `WMONITOR_DAILY_ROW_QUOTA` | `20000000` | Shared tenant accepted rows per UTC day. |
+| — | `WMONITOR_DAILY_BYTE_QUOTA` | `21474836480` | Shared tenant accepted bytes per UTC day (20 GiB). |
+| — | `WMONITOR_AGENT_DAILY_ROW_QUOTA` | `250000` | Per-agent accepted rows per UTC day. |
+| — | `WMONITOR_AGENT_DAILY_BYTE_QUOTA` | `268435456` | Per-agent accepted bytes per UTC day (256 MiB). |
 | — | `WMONITOR_CREDENTIAL_DIR` | OS default (`%PROGRAMDATA%\wmonitor` on Windows; `/etc/wmonitor` as root or `~/.local/share/sysmon` otherwise) | Directory that stores the machine enrollment token. Used by tests and disposable runners so production token files are never overwritten. |
-| — | `WMONITOR_DATA_DIR` | OS default (`%LOCALAPPDATA%\sysmon` / `~/.local/share/sysmon`) | Data directory for spool, `agent_id`, and local SQLite. |
+| — | `WMONITOR_DATA_DIR` | Service: `%ProgramData%\wmonitor\data` / `/var/lib/wmonitor`; interactive OS default | Data directory for spool, `agent_id`, and local SQLite. |
 | — | `WMONITOR_DISK_BUDGET_BYTES` | `10737418240` (10 GiB) | Maximum size of the SQLite data file. When exceeded, retention reports disk pressure and does not delete or downsample rows. `0` disables the check. |
 | — | `WMONITOR_TRUSTED_PROXIES` | `""` | Comma-separated proxy IPs or CIDRs. Only these peers may set `X-Forwarded-Proto` for HTTPS detection. Empty means the header is never trusted. |
 
 Precedence for credential/data directories: in-process test override (`SetCredentialDir` / `SetDataDir`) > environment variable > OS default. There is no CLI flag for these paths.
+
+Liveness is `GET /api/health` (no tenant freshness or expected-agent inventory). Readiness is `GET /api/ready`. Hub Prometheus `GET /metrics` requires an admin credential even when the peer is loopback. Tenant audit history is `GET /api/admin/audit?tenant_id=` (admin token only). Expected-agent inventory is `GET /api/admin/agents/expected?tenant_id=` and always reports `completeness: "not_assessed"` until a reviewed campaign contract exists.
 
 ---
 
