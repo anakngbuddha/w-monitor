@@ -14,5 +14,7 @@ services:
         value: postgres
       - key: WMONITOR_DB_DSN
         sync: false
+      - key: WMONITOR_DB_CA_CERT
+        sync: false
       - key: WMONITOR_API_KEY
         generateValue: true
